@@ -38,6 +38,7 @@ from .const import (ATTR_AREA_CREATE, ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE,
                     DOMAIN, DOMAIN_DEVICES, ERROR_VALUE, EVENT, LOXONE_PLATFORMS,
                     SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
 from .coordinator import LoxoneCoordinator
+from .device_sync import async_sync_device_names
 from .helpers import get_miniserver_type
 from .miniserver import MiniServer, get_miniserver_from_hass
 from .pyloxone_api.connection import LoxoneConnection
@@ -315,6 +316,15 @@ async def async_setup_entry(hass, config_entry):
 
     if setup_tasks:
         await asyncio.wait(setup_tasks)
+
+    updated_device_names = async_sync_device_names(
+        hass, config_entry, coordinator.miniserver.lox_config.json
+    )
+    if updated_device_names:
+        _LOGGER.info(
+            "Updated %s device name(s) from the Loxone configuration",
+            updated_device_names,
+        )
 
     async def _reload_after_delay(delay: float = 1.0) -> None:
         await coordinator.api.close()
