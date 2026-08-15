@@ -224,6 +224,30 @@ def test_audit_only_mode_never_removes_confirmed_devices(monkeypatch):
     assert "audit only" in notifications[-1][0]
 
 
+def test_cleanup_defaults_to_audit_only_when_option_is_absent(monkeypatch):
+    """Existing entries without the new option must never delete by default."""
+    FakeStore.data = {
+        "missing_observations": {"stale-uuid": 7},
+        "loxone_rooms": [],
+    }
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, entity_registry, notifications, _ = _install_registry_fakes(
+        monkeypatch, [stale], [_entity("switch.old", "stale-device")]
+    )
+
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(), SimpleNamespace(entry_id="entry-id", options={}), _lox_config()
+        )
+    )
+
+    assert result.audit_only is True
+    assert result.removed == ()
+    assert device_registry.removed == []
+    assert entity_registry.removed == []
+    assert "automatic deletion is disabled" in notifications[-1][0]
+
+
 def test_time_mode_waits_for_elapsed_time_and_a_new_structure_load(monkeypatch):
     """Time mode removes only after time elapsed and another successful load."""
     FakeStore.data = None
