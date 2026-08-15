@@ -15,7 +15,7 @@ from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import entity_sources
 
 from .const import DOMAIN
-from .device_sync import device_rooms_from_lox_config
+from .device_sync import control_identifiers_from_lox_config, device_rooms_from_lox_config
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -49,27 +49,6 @@ class AreaChangeImpact:
     old_area: str
     new_area: str
     references: Mapping[ItemType, tuple[str, ...]]
-
-
-def control_identifiers_from_lox_config(
-    lox_config: Mapping[str, Any],
-) -> set[str]:
-    """Return action UUIDs for top-level and nested Loxone controls."""
-    identifiers: set[str] = set()
-
-    def collect(controls: Any) -> None:
-        if not isinstance(controls, Mapping):
-            return
-        for control_uuid, control in controls.items():
-            if not isinstance(control, Mapping):
-                continue
-            identifier = control.get("uuidAction", control_uuid)
-            if isinstance(identifier, str) and identifier:
-                identifiers.add(identifier)
-            collect(control.get("subControls"))
-
-    collect(lox_config.get("controls", {}))
-    return identifiers
 
 
 def _relevant_references(

@@ -37,7 +37,12 @@ from .const import (ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE, ATTR_UUID, ATTR_VALUE,
                     SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
 from .config_impact import async_warn_about_config_impacts
 from .coordinator import LoxoneCoordinator
-from .device_sync import async_sync_device_areas, async_sync_device_names
+from .device_sync import (
+    async_cleanup_stale_devices,
+    async_migrate_version_sensor_unique_id,
+    async_sync_device_areas,
+    async_sync_device_names,
+)
 from .helpers import get_miniserver_type
 from .miniserver import MiniServer, get_miniserver_from_hass
 from .pyloxone_api.connection import LoxoneConnection
@@ -304,6 +309,15 @@ async def async_setup_entry(hass, config_entry):
 
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = coordinator
 
+    migrated_version_sensors = async_migrate_version_sensor_unique_id(
+        hass, config_entry, coordinator.miniserver.serial
+    )
+    if migrated_version_sensors:
+        _LOGGER.info(
+            "Migrated %s Loxone software-version sensor registry entry/entries",
+            migrated_version_sensors,
+        )
+
     setup_tasks = []
     await hass.config_entries.async_forward_entry_setups(config_entry, LOXONE_PLATFORMS)
     for platform in LOXONE_PLATFORMS:
@@ -323,6 +337,16 @@ async def async_setup_entry(hass, config_entry):
         _LOGGER.warning(
             "Detected %s Loxone configuration change(s) affecting Home Assistant",
             config_impacts,
+        )
+
+    removed_devices, removed_entities = async_cleanup_stale_devices(
+        hass, config_entry, coordinator.miniserver.lox_config.json
+    )
+    if removed_devices or removed_entities:
+        _LOGGER.info(
+            "Removed %s stale Loxone device(s) and %s stale entity registry entry/entries",
+            removed_devices,
+            removed_entities,
         )
 
     updated_device_names = async_sync_device_names(
