@@ -31,18 +31,23 @@ from homeassistant.setup import async_setup_component
 
 from .const import (ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE, ATTR_UUID, ATTR_VALUE,
                     CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, CONF_SCENE_GEN,
-                    CONF_SCENE_GEN_DELAY, CONF_VERIFY_SSL, DEFAULT,
+                    CONF_SCENE_GEN_DELAY,
+                    CONF_STALE_DEVICE_AUTO_CLEANUP,
+                    CONF_STALE_DEVICE_GRACE_OBSERVATIONS, CONF_VERIFY_SSL,
+                    DEFAULT,
                     DEFAULT_DELAY_SCENE, DEFAULT_PORT, DEFAULT_VERIFY_SSL,
+                    DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+                    DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
                     DOMAIN, DOMAIN_DEVICES, ERROR_VALUE, EVENT, LOXONE_PLATFORMS,
                     SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
 from .config_impact import async_warn_about_config_impacts
 from .coordinator import LoxoneCoordinator
 from .device_sync import (
-    async_cleanup_stale_devices,
     async_migrate_version_sensor_unique_id,
     async_sync_device_areas,
     async_sync_device_names,
 )
+from .registry_maintenance import async_run_registry_maintenance
 from .helpers import get_miniserver_type
 from .miniserver import MiniServer, get_miniserver_from_hass
 from .pyloxone_api.connection import LoxoneConnection
@@ -71,6 +76,14 @@ CONFIG_SCHEMA = vol.Schema(
                 vol.Optional(CONF_SCENE_GEN, default=True): cv.boolean,
                 vol.Optional(
                     CONF_SCENE_GEN_DELAY, default=DEFAULT_DELAY_SCENE
+                ): cv.positive_int,
+                vol.Optional(
+                    CONF_STALE_DEVICE_AUTO_CLEANUP,
+                    default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+                ): cv.boolean,
+                vol.Optional(
+                    CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
+                    default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
                 ): cv.positive_int,
                 vol.Required(CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, default=False): bool,
             }
@@ -195,6 +208,14 @@ async def async_set_options(hass, config_entry):
         CONF_SCENE_GEN_DELAY: options_in.pop(CONF_SCENE_GEN_DELAY, DEFAULT_DELAY_SCENE),
         CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN: options_in.pop(
             CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, ""
+        ),
+        CONF_STALE_DEVICE_AUTO_CLEANUP: options_in.pop(
+            CONF_STALE_DEVICE_AUTO_CLEANUP,
+            DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+        ),
+        CONF_STALE_DEVICE_GRACE_OBSERVATIONS: options_in.pop(
+            CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
+            DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
         ),
     }
     hass.config_entries.async_update_entry(
@@ -339,16 +360,6 @@ async def async_setup_entry(hass, config_entry):
             config_impacts,
         )
 
-    removed_devices, removed_entities = async_cleanup_stale_devices(
-        hass, config_entry, coordinator.miniserver.lox_config.json
-    )
-    if removed_devices or removed_entities:
-        _LOGGER.info(
-            "Removed %s stale Loxone device(s) and %s stale entity registry entry/entries",
-            removed_devices,
-            removed_entities,
-        )
-
     updated_device_names = async_sync_device_names(
         hass, config_entry, coordinator.miniserver.lox_config.json
     )
@@ -365,6 +376,20 @@ async def async_setup_entry(hass, config_entry):
         _LOGGER.info(
             "Updated %s device area assignment(s) from the Loxone configuration",
             updated_device_areas,
+        )
+
+    maintenance = await async_run_registry_maintenance(
+        hass, config_entry, coordinator.miniserver.lox_config.json
+    )
+    if maintenance.skipped:
+        _LOGGER.warning(
+            "Skipped Loxone registry maintenance because the structure contained no controls"
+        )
+    elif maintenance.removed_devices or maintenance.removed_entities:
+        _LOGGER.info(
+            "Removed %s stale Loxone device(s) and %s stale entity registry entry/entries after the grace period",
+            maintenance.removed_devices,
+            maintenance.removed_entities,
         )
 
     async def _reload_after_delay(delay: float = 1.0) -> None:

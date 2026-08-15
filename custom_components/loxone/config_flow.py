@@ -20,8 +20,12 @@ from homeassistant.helpers.selector import (BooleanSelector, NumberSelector,
                                             TextSelectorType)
 
 from .const import (CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, CONF_SCENE_GEN,
-                    CONF_SCENE_GEN_DELAY, CONF_VERIFY_SSL,
+                    CONF_SCENE_GEN_DELAY,
+                    CONF_STALE_DEVICE_AUTO_CLEANUP,
+                    CONF_STALE_DEVICE_GRACE_OBSERVATIONS, CONF_VERIFY_SSL,
                     DEFAULT_DELAY_SCENE, DEFAULT_IP, DEFAULT_PORT,
+                    DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+                    DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
                     DEFAULT_VERIFY_SSL, DOMAIN)
 
 
@@ -51,6 +55,10 @@ async def validate_loxone_setup(
         user_input[CONF_PORT] = int(user_input[CONF_PORT])
     if CONF_SCENE_GEN_DELAY in user_input:
         user_input[CONF_SCENE_GEN_DELAY] = int(user_input[CONF_SCENE_GEN_DELAY])
+    if CONF_STALE_DEVICE_GRACE_OBSERVATIONS in user_input:
+        user_input[CONF_STALE_DEVICE_GRACE_OBSERVATIONS] = int(
+            user_input[CONF_STALE_DEVICE_GRACE_OBSERVATIONS]
+        )
 
     return user_input
 
@@ -77,6 +85,16 @@ DATA_SCHEMA_SETUP = vol.Schema(
         vol.Required(
             CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, default=False
         ): BooleanSelector(),
+        vol.Required(
+            CONF_STALE_DEVICE_AUTO_CLEANUP,
+            default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+        ): BooleanSelector(),
+        vol.Required(
+            CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
+            default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
+        ): NumberSelector(
+            NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=10)
+        ),
     }
 )
 
@@ -102,6 +120,16 @@ DATA_SCHEMA_OPTIONS = vol.Schema(
         vol.Required(
             CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, default=False
         ): BooleanSelector(),
+        vol.Required(
+            CONF_STALE_DEVICE_AUTO_CLEANUP,
+            default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+        ): BooleanSelector(),
+        vol.Required(
+            CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
+            default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
+        ): NumberSelector(
+            NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=10)
+        ),
     }
 )
 

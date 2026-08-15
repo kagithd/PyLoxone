@@ -209,6 +209,7 @@ def async_cleanup_stale_devices(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     lox_config: Mapping[str, Any],
+    identifiers_to_remove: set[str] | None = None,
 ) -> tuple[int, int]:
     """Remove registry devices that no longer exist in the Loxone structure."""
     active_identifiers = control_identifiers_from_lox_config(lox_config)
@@ -235,6 +236,11 @@ def async_cleanup_stale_devices(
             continue
         if loxone_identifiers & active_identifiers:
             continue
+        if (
+            identifiers_to_remove is not None
+            and not loxone_identifiers & identifiers_to_remove
+        ):
+            continue
 
         for entity in list(er.async_entries_for_device(entity_registry, device.id)):
             if (
@@ -247,5 +253,9 @@ def async_cleanup_stale_devices(
         if device.config_entries == {config_entry.entry_id}:
             device_registry.async_remove_device(device.id)
             removed_devices += 1
+        else:
+            device_registry.async_update_device(
+                device.id, remove_config_entry_id=config_entry.entry_id
+            )
 
     return removed_devices, removed_entities
