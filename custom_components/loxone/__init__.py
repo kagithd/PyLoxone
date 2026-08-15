@@ -35,6 +35,7 @@ from .const import (ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE, ATTR_UUID, ATTR_VALUE,
                     DEFAULT_DELAY_SCENE, DEFAULT_PORT, DEFAULT_VERIFY_SSL,
                     DOMAIN, DOMAIN_DEVICES, ERROR_VALUE, EVENT, LOXONE_PLATFORMS,
                     SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
+from .config_impact import async_warn_about_config_impacts
 from .coordinator import LoxoneCoordinator
 from .device_sync import async_sync_device_areas, async_sync_device_names
 from .helpers import get_miniserver_type
@@ -314,6 +315,15 @@ async def async_setup_entry(hass, config_entry):
 
     if setup_tasks:
         await asyncio.wait(setup_tasks)
+
+    config_impacts = async_warn_about_config_impacts(
+        hass, config_entry, coordinator.miniserver.lox_config.json
+    )
+    if config_impacts:
+        _LOGGER.warning(
+            "Detected %s Loxone configuration change(s) affecting Home Assistant",
+            config_impacts,
+        )
 
     updated_device_names = async_sync_device_names(
         hass, config_entry, coordinator.miniserver.lox_config.json
