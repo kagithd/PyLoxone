@@ -144,12 +144,19 @@ def _entity(entity_id, device_id, area_id=None):
     )
 
 
-def _config_entry(auto_cleanup=True, grace=2):
+def _config_entry(
+    auto_cleanup=True,
+    grace=2,
+    mode="observations",
+    hours=24,
+):
     return SimpleNamespace(
         entry_id="entry-id",
         options={
             "stale_device_auto_cleanup": auto_cleanup,
+            "stale_device_grace_mode": mode,
             "stale_device_grace_observations": grace,
+            "stale_device_grace_hours": hours,
         },
     )
 
@@ -217,6 +224,69 @@ def test_audit_only_mode_never_removes_confirmed_devices(monkeypatch):
     assert "audit only" in notifications[-1][0]
 
 
+def test_time_mode_waits_for_elapsed_time_and_a_new_structure_load(monkeypatch):
+    """Time mode removes only after time elapsed and another successful load."""
+    FakeStore.data = None
+    now = 1_000.0
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance._utc_timestamp",
+        lambda: now,
+    )
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, notifications, _ = _install_registry_fakes(
+        monkeypatch, [stale]
+    )
+    config_entry = _config_entry(mode="time", hours=1)
+
+    first = asyncio.run(
+        async_run_registry_maintenance(object(), config_entry, _lox_config())
+    )
+    assert first.pending[0].missing_since == 1_000.0
+
+    now = 4_599.0
+    second = asyncio.run(
+        async_run_registry_maintenance(object(), config_entry, _lox_config())
+    )
+    assert second.removed == ()
+    assert device_registry.removed == []
+
+    now = 4_600.0
+    third = asyncio.run(
+        async_run_registry_maintenance(object(), config_entry, _lox_config())
+    )
+    assert third.removed[0].identifier == "stale-uuid"
+    assert device_registry.removed == ["stale-device"]
+    assert "1 elapsed hours" in notifications[-1][0]
+
+
+def test_combined_mode_requires_observations_and_elapsed_time(monkeypatch):
+    """Combined mode uses an AND rule for both independently tracked limits."""
+    FakeStore.data = None
+    now = 1_000.0
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance._utc_timestamp",
+        lambda: now,
+    )
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, _, _ = _install_registry_fakes(monkeypatch, [stale])
+    config_entry = _config_entry(mode="combined", grace=2, hours=1)
+
+    asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
+    now = 2_000.0
+    second = asyncio.run(
+        async_run_registry_maintenance(object(), config_entry, _lox_config())
+    )
+    assert second.pending[0].observations == 2
+    assert device_registry.removed == []
+
+    now = 4_600.0
+    third = asyncio.run(
+        async_run_registry_maintenance(object(), config_entry, _lox_config())
+    )
+    assert third.removed[0].identifier == "stale-uuid"
+    assert device_registry.removed == ["stale-device"]
+
+
 def test_empty_structure_skips_storage_notifications_and_cleanup(monkeypatch):
     """An empty structure is never considered an authoritative deletion."""
     FakeStore.data = {"missing_observations": {"stale-uuid": 1}}
@@ -259,6 +329,7 @@ def test_reappearing_uuid_clears_its_missing_observation(monkeypatch):
     assert result.removed == ()
     assert device_registry.removed == []
     assert FakeStore.data["missing_observations"] == {}
+    assert FakeStore.data["missing_since"] == {}
     assert notifications == []
     assert dismissed == ["loxone_registry_maintenance_entry-id"]
 
