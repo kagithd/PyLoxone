@@ -17,7 +17,9 @@
           "generate_lightcontroller_subcontrols": "LightControllerV2-Subcontrols standardmäßig aktivieren",
           "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)",
           "stale_device_auto_cleanup": "Veraltete Loxone-Geräte nach der Karenzzeit automatisch entfernen",
-          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts"
+          "stale_device_grace_mode": "Regel für die Karenzzeit",
+          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts",
+          "stale_device_grace_hours": "Stunden ohne Loxone-Gerät vor dessen Entfernung"
         }
       }
     }
@@ -35,10 +37,21 @@
           "generate_lightcontroller_subcontrols": "LightControllerV2-Subcontrols standardmäßig aktivieren",
           "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)",
           "stale_device_auto_cleanup": "Veraltete Loxone-Geräte nach der Karenzzeit automatisch entfernen",
-          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts"
+          "stale_device_grace_mode": "Regel für die Karenzzeit",
+          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts",
+          "stale_device_grace_hours": "Stunden ohne Loxone-Gerät vor dessen Entfernung"
         },
         "description": "PyLoxone Einstellungen editieren:",
         "title": "PyLoxone Einstellungen"
+      }
+    }
+  },
+  "selector": {
+    "stale_device_grace_mode": {
+      "options": {
+        "observations": "Erfolgreiche Strukturabrufe",
+        "time": "Verstrichene Zeit",
+        "combined": "Beide Grenzen"
       }
     }
   },

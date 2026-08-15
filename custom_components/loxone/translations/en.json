@@ -17,7 +17,9 @@
           "generate_lightcontroller_subcontrols": "Enable LightControllerV2 subcontrols by default",
           "generate_scenes_delay": "Delay for the scene generation if enabled",
           "stale_device_auto_cleanup": "Automatically remove stale Loxone devices after the grace period",
-          "stale_device_grace_observations": "Successful structure loads required before removing a stale device"
+          "stale_device_grace_mode": "Grace period rule",
+          "stale_device_grace_observations": "Successful structure loads required before removing a stale device",
+          "stale_device_grace_hours": "Hours missing before removing a stale device"
         }
       }
     }
@@ -35,10 +37,21 @@
           "generate_lightcontroller_subcontrols": "Enable LightControllerV2 subcontrols by default",
           "generate_scenes_delay": "Delay for the scene generation if enabled",
           "stale_device_auto_cleanup": "Automatically remove stale Loxone devices after the grace period",
-          "stale_device_grace_observations": "Successful structure loads required before removing a stale device"
+          "stale_device_grace_mode": "Grace period rule",
+          "stale_device_grace_observations": "Successful structure loads required before removing a stale device",
+          "stale_device_grace_hours": "Hours missing before removing a stale device"
         },
         "description": "PyLoxone edit settings:",
         "title": "PyLoxone settings"
+      }
+    }
+  },
+  "selector": {
+    "stale_device_grace_mode": {
+      "options": {
+        "observations": "Successful structure loads",
+        "time": "Elapsed time",
+        "combined": "Both limits"
       }
     }
   },

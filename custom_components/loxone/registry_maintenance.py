@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from homeassistant.components import automation, persistent_notification, script
@@ -14,8 +15,12 @@ from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_STALE_DEVICE_AUTO_CLEANUP,
+    CONF_STALE_DEVICE_GRACE_HOURS,
+    CONF_STALE_DEVICE_GRACE_MODE,
     CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
     DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+    DEFAULT_STALE_DEVICE_GRACE_HOURS,
+    DEFAULT_STALE_DEVICE_GRACE_MODE,
     DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
     DOMAIN,
 )
@@ -41,6 +46,7 @@ class StaleDevice:
     identifier: str
     entity_ids: tuple[str, ...]
     observations: int
+    missing_since: float
 
 
 @dataclass(frozen=True)
@@ -85,6 +91,7 @@ def _stale_devices(
     config_entry: ConfigEntry,
     lox_config: Mapping[str, Any],
     observations: Mapping[str, int],
+    missing_since: Mapping[str, float],
 ) -> list[StaleDevice]:
     """Return registry devices absent from the current Loxone structure."""
     active_identifiers = control_identifiers_from_lox_config(lox_config)
@@ -121,6 +128,7 @@ def _stale_devices(
                     )
                 ),
                 observations=observations.get(identifier, 0),
+                missing_since=missing_since.get(identifier, 0.0),
             )
         )
 
@@ -161,13 +169,26 @@ def _orphan_rooms(
 
 def format_registry_maintenance_message(
     result: RegistryMaintenanceResult,
+    grace_mode: str,
     grace_observations: int,
+    grace_hours: int,
 ) -> str:
     """Format a complete registry audit notification."""
-    mode = "audit only; automatic deletion is disabled" if result.audit_only else (
-        f"automatic cleanup after {grace_observations} consecutive observations"
+    grace_description = {
+        "observations": f"{grace_observations} consecutive observations",
+        "time": f"{grace_hours} elapsed hours",
+        "combined": (
+            f"both {grace_observations} consecutive observations and "
+            f"{grace_hours} elapsed hours"
+        ),
+    }[grace_mode]
+    mode = (
+        f"audit only; automatic deletion is disabled (configured grace: {grace_description})"
+        if result.audit_only
+        else f"automatic cleanup after {grace_description}"
     )
     sections = [f"Mode: **{mode}**."]
+    now = _utc_timestamp()
 
     if result.pending:
         lines = ["## Missing Loxone devices pending review"]
@@ -177,9 +198,18 @@ def format_registry_maintenance_message(
                 (
                     f"- **{device.name}** (`{device.identifier}`)",
                     f"  - Entities: {entities}",
-                    f"  - Confirmed in {device.observations}/{grace_observations} successful structure loads",
                 )
             )
+            if grace_mode in {"observations", "combined"}:
+                lines.append(
+                    "  - Confirmed in "
+                    f"{device.observations}/{grace_observations} successful structure loads"
+                )
+            if grace_mode in {"time", "combined"}:
+                missing_hours = max(0.0, (now - device.missing_since) / 3600)
+                lines.append(
+                    f"  - Missing for {missing_hours:.1f}/{grace_hours} hours"
+                )
         sections.append("\n".join(lines))
 
     if result.removed:
@@ -219,6 +249,29 @@ def format_registry_maintenance_message(
     return "\n\n".join(sections)
 
 
+def _utc_timestamp() -> float:
+    """Return the current UTC timestamp for persistent grace tracking."""
+    return datetime.now(UTC).timestamp()
+
+
+def _grace_reached(
+    mode: str,
+    observations: int,
+    missing_since: float,
+    now: float,
+    grace_observations: int,
+    grace_hours: int,
+) -> bool:
+    """Return whether the selected grace rule has been met."""
+    observations_reached = observations >= grace_observations
+    time_reached = now - missing_since >= grace_hours * 3600
+    if mode == "time":
+        return time_reached
+    if mode == "combined":
+        return observations_reached and time_reached
+    return observations_reached
+
+
 async def async_run_registry_maintenance(
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -249,6 +302,21 @@ async def async_run_registry_maintenance(
         )
     )
     grace_observations = max(1, grace_observations)
+    grace_mode = config_entry.options.get(
+        CONF_STALE_DEVICE_GRACE_MODE,
+        DEFAULT_STALE_DEVICE_GRACE_MODE,
+    )
+    if grace_mode not in {"observations", "time", "combined"}:
+        grace_mode = DEFAULT_STALE_DEVICE_GRACE_MODE
+    grace_hours = max(
+        1,
+        int(
+            config_entry.options.get(
+                CONF_STALE_DEVICE_GRACE_HOURS,
+                DEFAULT_STALE_DEVICE_GRACE_HOURS,
+            )
+        ),
+    )
     store: Store[dict[str, Any]] = Store(
         hass,
         STORAGE_VERSION,
@@ -260,15 +328,28 @@ async def async_run_registry_maintenance(
         str(identifier): int(count)
         for identifier, count in stored.get("missing_observations", {}).items()
     }
+    previous_missing_since = {
+        str(identifier): float(timestamp)
+        for identifier, timestamp in stored.get("missing_since", {}).items()
+    }
     stale_before = _stale_devices(
-        hass, config_entry, lox_config, previous_observations
+        hass,
+        config_entry,
+        lox_config,
+        previous_observations,
+        previous_missing_since,
     )
     current_stale_ids = {device.identifier for device in stale_before}
+    now = _utc_timestamp()
     observations = {
         identifier: min(
             previous_observations.get(identifier, 0) + 1,
             grace_observations,
         )
+        for identifier in current_stale_ids
+    }
+    missing_since = {
+        identifier: previous_missing_since.get(identifier, now)
         for identifier in current_stale_ids
     }
     stale_confirmed = tuple(
@@ -277,6 +358,7 @@ async def async_run_registry_maintenance(
             identifier=device.identifier,
             entity_ids=device.entity_ids,
             observations=observations[device.identifier],
+            missing_since=missing_since[device.identifier],
         )
         for device in stale_before
     )
@@ -284,7 +366,15 @@ async def async_run_registry_maintenance(
     removable_ids = {
         device.identifier
         for device in stale_confirmed
-        if auto_cleanup and device.observations >= grace_observations
+        if auto_cleanup
+        and _grace_reached(
+            grace_mode,
+            device.observations,
+            device.missing_since,
+            now,
+            grace_observations,
+            grace_hours,
+        )
     }
     removed = tuple(
         device for device in stale_confirmed if device.identifier in removable_ids
@@ -303,6 +393,7 @@ async def async_run_registry_maintenance(
         )
         for identifier in removable_ids:
             observations.pop(identifier, None)
+            missing_since.pop(identifier, None)
 
     current_rooms = room_names_from_lox_config(lox_config)
     previous_rooms = set(stored.get("loxone_rooms", []))
@@ -310,6 +401,7 @@ async def async_run_registry_maintenance(
     await store.async_save(
         {
             "missing_observations": observations,
+            "missing_since": missing_since,
             "loxone_rooms": sorted(current_rooms),
         }
     )
@@ -326,7 +418,12 @@ async def async_run_registry_maintenance(
     if pending or removed or orphan_rooms:
         persistent_notification.async_create(
             hass,
-            format_registry_maintenance_message(result, grace_observations),
+            format_registry_maintenance_message(
+                result,
+                grace_mode,
+                grace_observations,
+                grace_hours,
+            ),
             title="PyLoxone registry audit",
             notification_id=notification_id,
         )

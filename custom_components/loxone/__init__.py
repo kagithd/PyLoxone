@@ -33,13 +33,18 @@ from .const import (ATTR_CODE, ATTR_COMMAND, ATTR_DEVICE, ATTR_UUID, ATTR_VALUE,
                     CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, CONF_SCENE_GEN,
                     CONF_SCENE_GEN_DELAY,
                     CONF_STALE_DEVICE_AUTO_CLEANUP,
+                    CONF_STALE_DEVICE_GRACE_HOURS,
+                    CONF_STALE_DEVICE_GRACE_MODE,
                     CONF_STALE_DEVICE_GRACE_OBSERVATIONS, CONF_VERIFY_SSL,
                     DEFAULT,
                     DEFAULT_DELAY_SCENE, DEFAULT_PORT, DEFAULT_VERIFY_SSL,
                     DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+                    DEFAULT_STALE_DEVICE_GRACE_HOURS,
+                    DEFAULT_STALE_DEVICE_GRACE_MODE,
                     DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
                     DOMAIN, DOMAIN_DEVICES, ERROR_VALUE, EVENT, LOXONE_PLATFORMS,
-                    SECUREDSENDDOMAIN, SENDDOMAIN, cfmt)
+                    SECUREDSENDDOMAIN, SENDDOMAIN, STALE_DEVICE_GRACE_MODES,
+                    cfmt)
 from .config_impact import async_warn_about_config_impacts
 from .coordinator import LoxoneCoordinator
 from .device_sync import (
@@ -82,8 +87,16 @@ CONFIG_SCHEMA = vol.Schema(
                     default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
                 ): cv.boolean,
                 vol.Optional(
+                    CONF_STALE_DEVICE_GRACE_MODE,
+                    default=DEFAULT_STALE_DEVICE_GRACE_MODE,
+                ): vol.In(STALE_DEVICE_GRACE_MODES),
+                vol.Optional(
                     CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
                     default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
+                ): cv.positive_int,
+                vol.Optional(
+                    CONF_STALE_DEVICE_GRACE_HOURS,
+                    default=DEFAULT_STALE_DEVICE_GRACE_HOURS,
                 ): cv.positive_int,
                 vol.Required(CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, default=False): bool,
             }
@@ -213,9 +226,17 @@ async def async_set_options(hass, config_entry):
             CONF_STALE_DEVICE_AUTO_CLEANUP,
             DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
         ),
+        CONF_STALE_DEVICE_GRACE_MODE: options_in.pop(
+            CONF_STALE_DEVICE_GRACE_MODE,
+            DEFAULT_STALE_DEVICE_GRACE_MODE,
+        ),
         CONF_STALE_DEVICE_GRACE_OBSERVATIONS: options_in.pop(
             CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
             DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
+        ),
+        CONF_STALE_DEVICE_GRACE_HOURS: options_in.pop(
+            CONF_STALE_DEVICE_GRACE_HOURS,
+            DEFAULT_STALE_DEVICE_GRACE_HOURS,
         ),
     }
     hass.config_entries.async_update_entry(

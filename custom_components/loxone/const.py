@@ -57,9 +57,14 @@ CONF_SCENE_GEN_DELAY = "generate_scenes_delay"
 CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN = "generate_lightcontroller_subcontrols"
 CONF_VERIFY_SSL = "verify_ssl"
 CONF_STALE_DEVICE_AUTO_CLEANUP = "stale_device_auto_cleanup"
+CONF_STALE_DEVICE_GRACE_MODE = "stale_device_grace_mode"
 CONF_STALE_DEVICE_GRACE_OBSERVATIONS = "stale_device_grace_observations"
+CONF_STALE_DEVICE_GRACE_HOURS = "stale_device_grace_hours"
 DEFAULT_STALE_DEVICE_AUTO_CLEANUP = True
+DEFAULT_STALE_DEVICE_GRACE_MODE = "observations"
 DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS = 2
+DEFAULT_STALE_DEVICE_GRACE_HOURS = 24
+STALE_DEVICE_GRACE_MODES = ("observations", "time", "combined")
 DEFAULT_FORCE_UPDATE = False
 
 SUPPORT_SUN_AUTOMATION = 1024

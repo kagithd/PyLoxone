@@ -5,7 +5,7 @@ For more details about this component, please refer to the documentation at
 https://github.com/JoDehli/PyLoxone
 """
 
-from typing import Any, Mapping, cast
+from typing import Any, Mapping
 
 import voluptuous as vol
 from homeassistant.const import (CONF_HOST, CONF_PASSWORD, CONF_PORT,
@@ -15,18 +15,23 @@ from homeassistant.helpers.schema_config_entry_flow import (
     SchemaFlowFormStep)
 from homeassistant.helpers.selector import (BooleanSelector, NumberSelector,
                                             NumberSelectorConfig,
-                                            NumberSelectorMode, TextSelector,
+                                            NumberSelectorMode, SelectSelector,
+                                            SelectSelectorConfig, TextSelector,
                                             TextSelectorConfig,
                                             TextSelectorType)
 
 from .const import (CONF_LIGHTCONTROLLER_SUBCONTROLS_GEN, CONF_SCENE_GEN,
                     CONF_SCENE_GEN_DELAY,
                     CONF_STALE_DEVICE_AUTO_CLEANUP,
+                    CONF_STALE_DEVICE_GRACE_HOURS,
+                    CONF_STALE_DEVICE_GRACE_MODE,
                     CONF_STALE_DEVICE_GRACE_OBSERVATIONS, CONF_VERIFY_SSL,
                     DEFAULT_DELAY_SCENE, DEFAULT_IP, DEFAULT_PORT,
                     DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+                    DEFAULT_STALE_DEVICE_GRACE_HOURS,
+                    DEFAULT_STALE_DEVICE_GRACE_MODE,
                     DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
-                    DEFAULT_VERIFY_SSL, DOMAIN)
+                    DEFAULT_VERIFY_SSL, DOMAIN, STALE_DEVICE_GRACE_MODES)
 
 
 async def validate_loxone_setup(
@@ -59,6 +64,10 @@ async def validate_loxone_setup(
         user_input[CONF_STALE_DEVICE_GRACE_OBSERVATIONS] = int(
             user_input[CONF_STALE_DEVICE_GRACE_OBSERVATIONS]
         )
+    if CONF_STALE_DEVICE_GRACE_HOURS in user_input:
+        user_input[CONF_STALE_DEVICE_GRACE_HOURS] = int(
+            user_input[CONF_STALE_DEVICE_GRACE_HOURS]
+        )
 
     return user_input
 
@@ -90,10 +99,25 @@ DATA_SCHEMA_SETUP = vol.Schema(
             default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
         ): BooleanSelector(),
         vol.Required(
+            CONF_STALE_DEVICE_GRACE_MODE,
+            default=DEFAULT_STALE_DEVICE_GRACE_MODE,
+        ): SelectSelector(
+            SelectSelectorConfig(
+                options=list(STALE_DEVICE_GRACE_MODES),
+                translation_key=CONF_STALE_DEVICE_GRACE_MODE,
+            )
+        ),
+        vol.Required(
             CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
             default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
         ): NumberSelector(
             NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=10)
+        ),
+        vol.Required(
+            CONF_STALE_DEVICE_GRACE_HOURS,
+            default=DEFAULT_STALE_DEVICE_GRACE_HOURS,
+        ): NumberSelector(
+            NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=8760)
         ),
     }
 )
@@ -125,10 +149,25 @@ DATA_SCHEMA_OPTIONS = vol.Schema(
             default=DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
         ): BooleanSelector(),
         vol.Required(
+            CONF_STALE_DEVICE_GRACE_MODE,
+            default=DEFAULT_STALE_DEVICE_GRACE_MODE,
+        ): SelectSelector(
+            SelectSelectorConfig(
+                options=list(STALE_DEVICE_GRACE_MODES),
+                translation_key=CONF_STALE_DEVICE_GRACE_MODE,
+            )
+        ),
+        vol.Required(
             CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
             default=DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
         ): NumberSelector(
             NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=10)
+        ),
+        vol.Required(
+            CONF_STALE_DEVICE_GRACE_HOURS,
+            default=DEFAULT_STALE_DEVICE_GRACE_HOURS,
+        ): NumberSelector(
+            NumberSelectorConfig(mode=NumberSelectorMode.BOX, min=1, max=8760)
         ),
     }
 )
