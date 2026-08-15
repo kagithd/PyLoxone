@@ -15,7 +15,9 @@
           "verify_ssl": "TLS-Zertifikat des Miniservers prüfen",
           "generate_scenes": "Scenen generieren",
           "generate_lightcontroller_subcontrols": "LightControllerV2-Subcontrols standardmäßig aktivieren",
-          "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)"
+          "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)",
+          "stale_device_auto_cleanup": "Veraltete Loxone-Geräte nach der Karenzzeit automatisch entfernen",
+          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts"
         }
       }
     }
@@ -31,7 +33,9 @@
           "verify_ssl": "TLS-Zertifikat des Miniservers prüfen",
           "generate_scenes": "Scenen generieren",
           "generate_lightcontroller_subcontrols": "LightControllerV2-Subcontrols standardmäßig aktivieren",
-          "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)"
+          "generate_scenes_delay": "Verzögerung beim erstellen der Scenen (wenn aktiviert)",
+          "stale_device_auto_cleanup": "Veraltete Loxone-Geräte nach der Karenzzeit automatisch entfernen",
+          "stale_device_grace_observations": "Erfolgreiche Strukturabrufe vor dem Entfernen eines veralteten Geräts"
         },
         "description": "PyLoxone Einstellungen editieren:",
         "title": "PyLoxone Einstellungen"
