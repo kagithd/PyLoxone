@@ -1,11 +1,13 @@
-"""Tests for synchronizing Loxone device names."""
+"""Tests for synchronizing Loxone device metadata."""
 
 from types import SimpleNamespace
 
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.device_sync import (
+    async_sync_device_areas,
     async_sync_device_names,
     device_names_from_lox_config,
+    device_rooms_from_lox_config,
 )
 
 
@@ -28,6 +30,37 @@ class FakeDeviceRegistry:
             setattr(device, key, value)
 
 
+class FakeAreaRegistry:
+    """Minimal area registry used by the synchronization tests."""
+
+    def __init__(self, areas=()):
+        self.areas = {area.name: area for area in areas}
+        self.created = []
+
+    def async_get_area_by_name(self, name):
+        return self.areas.get(name)
+
+    def async_get_or_create(self, name):
+        area = SimpleNamespace(id=name.lower().replace(" ", "_"), name=name)
+        self.areas[name] = area
+        self.created.append(name)
+        return area
+
+
+class FakeEntityRegistry:
+    """Minimal entity registry used by the synchronization tests."""
+
+    def __init__(self, entities=()):
+        self.entities = list(entities)
+        self.updates = []
+
+    def async_update_entity(self, entity_id, **changes):
+        self.updates.append((entity_id, changes))
+        entity = next(entity for entity in self.entities if entity.entity_id == entity_id)
+        for key, value in changes.items():
+            setattr(entity, key, value)
+
+
 def test_device_names_from_lox_config_uses_action_uuid_and_control_key():
     """Only usable names and identifiers are included."""
     lox_config = {
@@ -43,6 +76,24 @@ def test_device_names_from_lox_config_uses_action_uuid_and_control_key():
     assert device_names_from_lox_config(lox_config) == {
         "fallback-uuid": "ST-F01",
         "action-uuid": "ST-F02",
+    }
+
+
+def test_device_rooms_from_lox_config_resolves_room_uuid_and_name():
+    """Raw room UUIDs and platform-resolved room names are supported."""
+    lox_config = {
+        "rooms": {"room-uuid": {"name": "Wohnzimmer"}},
+        "controls": {
+            "raw": {"uuidAction": "raw-action", "room": "room-uuid"},
+            "resolved": {"room": "B\u00fcro"},
+            "unassigned": {"room": ""},
+            "invalid-control": None,
+        },
+    }
+
+    assert device_rooms_from_lox_config(lox_config) == {
+        "raw-action": "Wohnzimmer",
+        "resolved": "B\u00fcro",
     }
 
 
@@ -95,3 +146,90 @@ def test_sync_ignores_unchanged_and_not_yet_registered_devices(monkeypatch):
 
     assert updated == 0
     assert registry.updates == []
+
+
+def test_sync_areas_moves_existing_device_and_creates_missing_area(monkeypatch):
+    """Loxone rooms override stale Home Assistant device assignments."""
+    device = SimpleNamespace(id="device-id", name="ST-F07", area_id="burro")
+    device_registry = FakeDeviceRegistry({(DOMAIN, "socket-uuid"): device})
+    area_registry = FakeAreaRegistry()
+    entity = SimpleNamespace(
+        entity_id="switch.st_f07",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        area_id="burro",
+        device_id="device-id",
+    )
+    entity_registry = FakeEntityRegistry([entity])
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_get",
+        lambda hass: device_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.ar.async_get",
+        lambda hass: area_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_device",
+        lambda registry, device_id: [entry for entry in registry.entities if entry.device_id == device_id],
+    )
+
+    updated = async_sync_device_areas(
+        object(),
+        SimpleNamespace(entry_id="entry-id"),
+        {
+            "controls": {
+                "socket-uuid": {"name": "ST-F07", "room": "B\u00fcro"},
+            }
+        },
+    )
+
+    assert updated == 1
+    assert area_registry.created == ["B\u00fcro"]
+    assert device.area_id == "b\u00fcro"
+    assert device_registry.updates == [("device-id", {"area_id": "b\u00fcro"})]
+    assert entity.area_id is None
+    assert entity_registry.updates == [("switch.st_f07", {"area_id": None})]
+
+
+def test_sync_areas_ignores_unchanged_and_unknown_devices(monkeypatch):
+    """Only registered devices assigned to a different area are updated."""
+    device = SimpleNamespace(id="device-id", name="ST-F01", area_id="wohnzimmer")
+    device_registry = FakeDeviceRegistry({(DOMAIN, "existing-uuid"): device})
+    area_registry = FakeAreaRegistry([SimpleNamespace(id="wohnzimmer", name="Wohnzimmer")])
+    entity_registry = FakeEntityRegistry()
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_get",
+        lambda hass: device_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.ar.async_get",
+        lambda hass: area_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_device",
+        lambda registry, device_id: [],
+    )
+
+    updated = async_sync_device_areas(
+        object(),
+        SimpleNamespace(entry_id="entry-id"),
+        {
+            "controls": {
+                "existing-uuid": {"room": "Wohnzimmer"},
+                "not-registered": {"room": "K\u00fcche"},
+            }
+        },
+    )
+
+    assert updated == 0
+    assert area_registry.created == []
+    assert device_registry.updates == []
