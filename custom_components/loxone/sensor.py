@@ -351,7 +351,7 @@ class LoxoneVersionSensor(LoxoneEntity, SensorEntity):
     @cached_property
     def unique_id(self) -> str:
         """Return a unique ID."""
-        return f"{self._miniserver_serial}-{self._attr_native_value}"
+        return f"{self._miniserver_serial}-{self._attr_unique_id}"
 
 
 class LoxoneTextSensor(LoxoneEntity, SensorEntity):

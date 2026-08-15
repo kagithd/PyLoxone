@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.device_sync import (
+    async_cleanup_stale_devices,
+    async_migrate_version_sensor_unique_id,
     async_sync_device_areas,
     async_sync_device_names,
     device_names_from_lox_config,
@@ -18,6 +20,7 @@ class FakeDeviceRegistry:
         self.devices = devices
         self.lookups = []
         self.updates = []
+        self.removed = []
 
     def async_get_device_by_identifier(self, identifier, config_entry_id):
         self.lookups.append((identifier, config_entry_id))
@@ -28,6 +31,9 @@ class FakeDeviceRegistry:
         device = next(device for device in self.devices.values() if device.id == device_id)
         for key, value in changes.items():
             setattr(device, key, value)
+
+    def async_remove_device(self, device_id):
+        self.removed.append(device_id)
 
 
 class FakeAreaRegistry:
@@ -53,12 +59,17 @@ class FakeEntityRegistry:
     def __init__(self, entities=()):
         self.entities = list(entities)
         self.updates = []
+        self.removed = []
 
     def async_update_entity(self, entity_id, **changes):
         self.updates.append((entity_id, changes))
         entity = next(entity for entity in self.entities if entity.entity_id == entity_id)
         for key, value in changes.items():
-            setattr(entity, key, value)
+            setattr(entity, "unique_id" if key == "new_unique_id" else key, value)
+
+    def async_remove(self, entity_id):
+        self.removed.append(entity_id)
+        self.entities = [entity for entity in self.entities if entity.entity_id != entity_id]
 
 
 def test_device_names_from_lox_config_uses_action_uuid_and_control_key():
@@ -233,3 +244,122 @@ def test_sync_areas_ignores_unchanged_and_unknown_devices(monkeypatch):
     assert updated == 0
     assert area_registry.created == []
     assert device_registry.updates == []
+
+
+def test_cleanup_removes_only_devices_absent_from_current_loxone(monkeypatch):
+    """Stale Loxone registry devices and their entities are removed safely."""
+    active = SimpleNamespace(
+        id="active-device",
+        identifiers={(DOMAIN, "active-uuid")},
+        config_entries={"entry-id"},
+        model="Switch",
+    )
+    stale = SimpleNamespace(
+        id="stale-device",
+        identifiers={(DOMAIN, "stale-uuid")},
+        config_entries={"entry-id"},
+        model="Switch",
+    )
+    miniserver = SimpleNamespace(
+        id="miniserver-device",
+        identifiers={(DOMAIN, "serial")},
+        config_entries={"entry-id"},
+        model="Miniserver Gen. 2",
+    )
+    device_registry = FakeDeviceRegistry(
+        {
+            (DOMAIN, "active-uuid"): active,
+            (DOMAIN, "stale-uuid"): stale,
+            (DOMAIN, "serial"): miniserver,
+        }
+    )
+    active_entity = SimpleNamespace(
+        entity_id="switch.active",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        device_id="active-device",
+    )
+    stale_entity = SimpleNamespace(
+        entity_id="switch.stale",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        device_id="stale-device",
+    )
+    entity_registry = FakeEntityRegistry([active_entity, stale_entity])
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_get",
+        lambda hass: device_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_entries_for_config_entry",
+        lambda registry, entry_id: list(registry.devices.values()),
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_device",
+        lambda registry, device_id: [
+            entity for entity in registry.entities if entity.device_id == device_id
+        ],
+    )
+
+    removed = async_cleanup_stale_devices(
+        object(),
+        SimpleNamespace(entry_id="entry-id"),
+        {
+            "msInfo": {"serialNr": "serial"},
+            "controls": {"active-uuid": {"name": "Active"}},
+        },
+    )
+
+    assert removed == (1, 1)
+    assert device_registry.removed == ["stale-device"]
+    assert entity_registry.removed == ["switch.stale"]
+
+
+def test_cleanup_does_nothing_when_structure_contains_no_controls(monkeypatch):
+    """A malformed or empty structure must never trigger mass deletion."""
+    device_registry = FakeDeviceRegistry({})
+    entity_registry = FakeEntityRegistry()
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_get",
+        lambda hass: device_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+
+    assert async_cleanup_stale_devices(
+        object(), SimpleNamespace(entry_id="entry-id"), {"controls": {}}
+    ) == (0, 0)
+    assert device_registry.removed == []
+
+
+def test_version_sensor_registry_identity_is_migrated_before_setup(monkeypatch):
+    """The existing entity ID survives a Miniserver software upgrade."""
+    entity = SimpleNamespace(
+        entity_id="sensor.loxone_software_version",
+        unique_id="serial-17.1.6.30",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+    )
+    entity_registry = FakeEntityRegistry([entity])
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_config_entry",
+        lambda registry, entry_id: list(registry.entities),
+    )
+
+    migrated = async_migrate_version_sensor_unique_id(
+        object(), SimpleNamespace(entry_id="entry-id"), "serial"
+    )
+
+    assert migrated == 1
+    assert entity.entity_id == "sensor.loxone_software_version"
+    assert entity.unique_id == "serial-loxone_software_version"
