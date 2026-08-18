@@ -10,12 +10,20 @@ from homeassistant.core import HomeAssistant
 from .const import DOMAIN
 
 
-async def async_get_config_entry_diagnostics(
-    hass: HomeAssistant, config_entry: ConfigEntry
-) -> dict[str, Any]:
+async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: ConfigEntry) -> dict[str, Any]:
     """Return diagnostics for a config entry."""
-    for k, v in hass.data[DOMAIN].items():
-        return {
-            "LoxAPP3.json": v.miniserver.lox_config.json,
+    coordinator = hass.data[DOMAIN].get(config_entry.entry_id)
+    if coordinator is None:
+        return None
+
+    diagnostics: dict[str, Any] = {
+        "LoxAPP3.json": coordinator.miniserver.lox_config.json,
+    }
+    inventory = coordinator.engineering_inventory
+    if inventory is not None:
+        diagnostics["engineering_inventory"] = {
+            "summary": inventory.summary(),
+            "elements": [element.as_public_dict() for element in inventory.elements],
+            "prepared_candidates": [element.as_public_dict() for element in inventory.candidates],
         }
-    return None
+    return diagnostics

@@ -1,13 +1,13 @@
 import logging
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (CONF_HOST, CONF_PASSWORD, CONF_PORT,
-                                 CONF_USERNAME)
+from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL
+from .engineering_config import EngineeringInventory, download_engineering_inventory
 from .miniserver import MiniServer
 from .pyloxone_api.connection import LoxoneConnection, LoxoneException
 
@@ -30,13 +30,12 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self._password = config_entry.options[CONF_PASSWORD]
         self._host = config_entry.options[CONF_HOST]
         self._port = config_entry.options[CONF_PORT]
-        self._verify_ssl = config_entry.options.get(
-            CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL
-        )
+        self._verify_ssl = config_entry.options.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL)
 
         self.api: LoxoneConnection | None = None
         self.miniserver: MiniServer | None = None
         self.listeners = []
+        self.engineering_inventory: EngineeringInventory | None = None
 
     async def async_config_entry_first_refresh(self) -> None:
         _LOGGER.debug("async_config_entry_first_refresh")
@@ -71,9 +70,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Could not connect to Loxone Miniserver")
             raise e
 
-        self.miniserver = MiniServer(
-            self.hass, self.api.structure_file, self.config_entry
-        )
+        self.miniserver = MiniServer(self.hass, self.api.structure_file, self.config_entry)
 
         return None
 
@@ -85,6 +82,17 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         """
         print("_async_update_data")
         return None
+
+    async def async_refresh_engineering_inventory(self) -> EngineeringInventory:
+        """Read and parse the complete engineering config on explicit request."""
+        inventory = await self.hass.async_add_executor_job(
+            download_engineering_inventory,
+            self._host,
+            self._username,
+            self._password,
+        )
+        self.engineering_inventory = inventory
+        return inventory
 
     async def async_cleanup(self):
         """Clean up resources."""
