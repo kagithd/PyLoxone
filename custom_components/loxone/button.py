@@ -9,9 +9,12 @@ import logging
 from functools import cached_property
 from typing import final
 
+from homeassistant.components import persistent_notification
 from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
@@ -43,13 +46,60 @@ async def async_setup_entry(
     """Set up entry."""
     miniserver = get_miniserver_from_hass(hass, config_entry)
     loxconfig = miniserver.lox_config.json
-    entities = []
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
+    entities = [LoxoneEngineeringInventoryButton(config_entry, coordinator)]
 
     for button_entity in get_all(loxconfig, ["Pushbutton"]):
         button_entity = add_room_and_cat_to_value_values(loxconfig, button_entity)
         entities.append(LoxoneButton(**button_entity))
 
     async_add_entities(entities)
+
+
+class LoxoneEngineeringInventoryButton(ButtonEntity):
+    """Manually refresh the complete read-only engineering inventory."""
+
+    _attr_entity_category = EntityCategory.CONFIG
+    _attr_has_entity_name = True
+    _attr_icon = "mdi:file-tree-outline"
+    _attr_name = "Refresh engineering inventory"
+
+    def __init__(self, config_entry: ConfigEntry, coordinator) -> None:
+        self._config_entry = config_entry
+        self._coordinator = coordinator
+        serial = coordinator.miniserver.serial or config_entry.entry_id
+        self._attr_unique_id = f"{serial}-engineering-inventory-refresh"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, serial)})
+        self._attr_extra_state_attributes = {"status": "not_loaded"}
+
+    async def async_press(self) -> None:
+        """Download and parse the engineering config without modifying Loxone."""
+        self._attr_extra_state_attributes = {"status": "loading"}
+        self.async_write_ha_state()
+        try:
+            inventory = await self._coordinator.async_refresh_engineering_inventory()
+        except Exception as err:
+            self._attr_extra_state_attributes = {
+                "status": "error",
+                "error": str(err),
+            }
+            self.async_write_ha_state()
+            raise HomeAssistantError(f"Engineering inventory could not be loaded: {err}") from err
+
+        summary = inventory.summary()
+        self._attr_extra_state_attributes = {"status": "loaded", **summary}
+        self.async_write_ha_state()
+        persistent_notification.async_create(
+            self.hass,
+            (
+                f"Loaded {summary['candidate_count']} onboarding candidates from "
+                f"{summary['source_archive']}. Open the PyLoxone diagnostics download "
+                "to inspect the prepared tree data. The read used local, unencrypted "
+                "FTP and did not modify the Miniserver."
+            ),
+            title="PyLoxone engineering inventory",
+            notification_id=f"pyloxone_engineering_inventory_{self._config_entry.entry_id}",
+        )
 
 
 class LoxoneButton(LoxoneEntity, ButtonEntity):
