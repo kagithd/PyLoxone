@@ -5,6 +5,7 @@ from __future__ import annotations
 import ftplib
 import io
 import re
+import ssl
 import struct
 import zipfile
 import zlib
@@ -321,12 +322,21 @@ def download_engineering_inventory(
     *,
     ftp_port: int = 21,
     timeout: float = 30.0,
+    verify_ssl: bool = True,
 ) -> EngineeringInventory:
-    """Download the newest config through read-only FTP operations and parse it."""
+    """Download the newest config through read-only explicit FTPS and parse it."""
+    if verify_ssl:
+        tls_context = ssl.create_default_context()
+    else:
+        tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        tls_context.check_hostname = False
+        tls_context.verify_mode = ssl.CERT_NONE
+
     try:
-        with ftplib.FTP() as ftp:
+        with ftplib.FTP_TLS(context=tls_context) as ftp:
             ftp.connect(host=host, port=ftp_port, timeout=timeout)
             ftp.login(user=username, passwd=password)
+            ftp.prot_p()
             ftp.cwd("/prog")
             backups: list[tuple[str, int, datetime]] = []
             for remote_name in ftp.nlst():
@@ -353,7 +363,7 @@ def download_engineering_inventory(
     except EngineeringConfigError:
         raise
     except (OSError, ftplib.Error) as err:
-        raise EngineeringConfigError(f"Read-only FTP config download failed: {err}") from err
+        raise EngineeringConfigError(f"Read-only FTPS config download failed: {err}") from err
 
     xml = _extract_xml(bytes(archive))
     return parse_engineering_xml(

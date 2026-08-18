@@ -86,10 +86,12 @@ class LoxoneCoordinator(DataUpdateCoordinator):
     async def async_refresh_engineering_inventory(self) -> EngineeringInventory:
         """Read and parse the complete engineering config on explicit request."""
         inventory = await self.hass.async_add_executor_job(
-            download_engineering_inventory,
-            self._host,
-            self._username,
-            self._password,
+            lambda: download_engineering_inventory(
+                self._host,
+                self._username,
+                self._password,
+                verify_ssl=self._verify_ssl,
+            )
         )
         self.engineering_inventory = inventory
         return inventory

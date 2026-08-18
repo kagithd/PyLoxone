@@ -8,7 +8,7 @@ manual while real-world hardware coverage is measured.
 
 1. Home Assistant exposes **Refresh engineering inventory** as a configuration
    button on the Loxone Miniserver device.
-2. Pressing it runs blocking FTP work in Home Assistant's executor.
+2. Pressing it runs blocking explicit-FTPS work in Home Assistant's executor.
 3. The integration lists `/prog`, downloads the newest
    `sps_<version>_<timestamp>.zip`, extracts `sps0.LoxCC`, validates its header,
    size and checksum, and parses the XML.
@@ -22,11 +22,12 @@ manual while real-world hardware coverage is measured.
 
 ## Safety boundaries
 
-- The Miniserver receives only FTP `LIST` and `RETR` operations.
+- The Miniserver receives only FTPS `LIST` and `RETR` operations. `PROT P`
+  encrypts both the control and data channels.
 - No config is uploaded, activated or written back.
 - The archive and XML are not persisted by the integration.
-- FTP credentials are used only in memory. FTP itself is unencrypted and must
-  therefore remain restricted to the trusted local network.
+- FTPS credentials are used only in memory. Certificate validation follows the
+  integration's existing `verify_ssl` option.
 - Archive, compressed payload and expanded XML sizes are bounded before parsing.
 - Unknown Loxone types remain visible instead of being silently discarded.
 

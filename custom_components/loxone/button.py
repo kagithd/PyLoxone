@@ -94,8 +94,8 @@ class LoxoneEngineeringInventoryButton(ButtonEntity):
             (
                 f"Loaded {summary['candidate_count']} onboarding candidates from "
                 f"{summary['source_archive']}. Open the PyLoxone diagnostics download "
-                "to inspect the prepared tree data. The read used local, unencrypted "
-                "FTP and did not modify the Miniserver."
+                "to inspect the prepared tree data. The read used local FTPS and did "
+                "not modify the Miniserver."
             ),
             title="PyLoxone engineering inventory",
             notification_id=f"pyloxone_engineering_inventory_{self._config_entry.entry_id}",
