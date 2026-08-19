@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -23,6 +24,7 @@ ERR_RESPONSE_EMPTY = "Runtime response is empty"
 ERR_JSON_LL_MISSING = "Runtime JSON does not contain an LL response"
 ERR_XML_DECLARATIONS = "Runtime XML contains forbidden declarations"
 ERR_XML_ROOT = "Runtime XML root is not LL"
+_NUMBER_WITH_UNIT = re.compile(r"^\s*(?P<number>[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][+-]?\d+)?)\s*(?P<unit>.*?)\s*$")
 
 
 class EngineeringRuntimeError(ValueError):
@@ -41,6 +43,25 @@ class RuntimeProbeClient:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimeNumericState:
+    """One diagnostics-safe numeric state returned by an ``/all`` endpoint."""
+
+    index: int
+    state_uuid: str | None
+    numeric_value: float
+    unit: str | None
+
+    def as_public_dict(self) -> dict[str, Any]:
+        """Return the numeric state without its potentially sensitive display name."""
+        return {
+            "index": self.index,
+            "state_uuid": self.state_uuid,
+            "numeric_value": self.numeric_value,
+            "unit": self.unit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeResponse:
     """Parsed response from one read-only Miniserver runtime endpoint."""
 
@@ -48,7 +69,9 @@ class RuntimeResponse:
     control: str | None
     value_kind: str
     numeric_value: float | None
+    unit: str | None
     substate_count: int
+    numeric_states: tuple[RuntimeNumericState, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +91,9 @@ class EngineeringRuntimeBinding:
     response_control: str | None = None
     value_kind: str | None = None
     numeric_value: float | None = None
+    unit: str | None = None
     substate_count: int = 0
+    numeric_states: tuple[RuntimeNumericState, ...] = ()
     error: str | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
@@ -87,7 +112,9 @@ class EngineeringRuntimeBinding:
             "response_control": self.response_control,
             "value_kind": self.value_kind,
             "numeric_value": self.numeric_value,
+            "unit": self.unit,
             "substate_count": self.substate_count,
+            "numeric_states": [state.as_public_dict() for state in self.numeric_states],
             "error": self.error,
         }
 
@@ -114,24 +141,75 @@ class EngineeringRuntimeInventory:
         }
 
 
-def _classify_value(value: Any) -> tuple[str, float | None]:
+def _classify_value(value: Any) -> tuple[str, float | None, str | None]:
     """Classify a value without exposing arbitrary text in diagnostics."""
     if value is None or value == "":
-        kind, numeric_value = "empty", None
+        kind, numeric_value, unit = "empty", None, None
     elif isinstance(value, bool):
-        kind, numeric_value = "boolean", float(value)
+        kind, numeric_value, unit = "boolean", float(value), None
     elif isinstance(value, (int, float)):
-        kind, numeric_value = "number", float(value)
+        kind, numeric_value, unit = "number", float(value), None
     elif isinstance(value, str):
-        try:
-            kind, numeric_value = "number", float(value.replace(",", "."))
-        except ValueError:
-            kind, numeric_value = "text", None
+        match = _NUMBER_WITH_UNIT.fullmatch(value)
+        if match:
+            kind = "number"
+            numeric_value = float(match.group("number").replace(",", "."))
+            unit = match.group("unit") or None
+        else:
+            kind, numeric_value, unit = "text", None, None
     elif isinstance(value, (dict, list)):
-        kind, numeric_value = "structured", None
+        kind, numeric_value, unit = "structured", None, None
     else:
-        kind, numeric_value = "unknown", None
-    return kind, numeric_value
+        kind, numeric_value, unit = "unknown", None, None
+    return kind, numeric_value, unit
+
+
+def _numeric_state(*, index: int, state_uuid: str | None, value: Any) -> RuntimeNumericState | None:
+    """Return a safe numeric state or omit nonnumeric content."""
+    _kind, numeric_value, unit = _classify_value(value)
+    if numeric_value is None:
+        return None
+    return RuntimeNumericState(
+        index=index,
+        state_uuid=state_uuid,
+        numeric_value=numeric_value,
+        unit=unit,
+    )
+
+
+def _xml_numeric_states(root: ET.Element) -> tuple[RuntimeNumericState, ...]:
+    """Extract numeric ``vN`` values and numeric child states from an LL response."""
+    states: list[RuntimeNumericState] = []
+    seen: set[tuple[int, str | None, float]] = set()
+
+    for key, value in root.attrib.items():
+        match = re.fullmatch(r"v(?P<index>\d+)", key, flags=re.IGNORECASE)
+        if not match:
+            continue
+        index = int(match.group("index"))
+        state = _numeric_state(index=index, state_uuid=root.attrib.get(f"u{index}"), value=value)
+        if state is not None:
+            marker = (state.index, state.state_uuid, state.numeric_value)
+            seen.add(marker)
+            states.append(state)
+
+    for fallback_index, child in enumerate(root, start=1):
+        raw_index = child.attrib.get("nr") or child.attrib.get("index")
+        try:
+            index = int(raw_index) if raw_index is not None else fallback_index
+        except ValueError:
+            index = fallback_index
+        state = _numeric_state(
+            index=index,
+            state_uuid=child.attrib.get("uuid") or child.attrib.get("u") or child.attrib.get("U"),
+            value=child.attrib.get("value", child.attrib.get("v")),
+        )
+        if state is not None:
+            marker = (state.index, state.state_uuid, state.numeric_value)
+            if marker not in seen:
+                seen.add(marker)
+                states.append(state)
+    return tuple(states)
 
 
 def _parse_runtime_response(payload: bytes) -> RuntimeResponse:
@@ -149,14 +227,16 @@ def _parse_runtime_response(payload: bytes) -> RuntimeResponse:
             raise EngineeringRuntimeError(ERR_JSON_LL_MISSING)
         code = int(ll.get("Code", ll.get("code", 0)))
         value = ll.get("value")
-        value_kind, numeric_value = _classify_value(value)
+        value_kind, numeric_value, unit = _classify_value(value)
         substates = value if isinstance(value, dict) else ll.get("data")
         return RuntimeResponse(
             code=code,
             control=ll.get("control"),
             value_kind=value_kind,
             numeric_value=numeric_value,
+            unit=unit,
             substate_count=len(substates) if isinstance(substates, dict) else 0,
+            numeric_states=(),
         )
 
     lowered_prefix = stripped[:4096].lower()
@@ -166,13 +246,19 @@ def _parse_runtime_response(payload: bytes) -> RuntimeResponse:
     if root.tag != "LL":
         raise EngineeringRuntimeError(ERR_XML_ROOT)
     code = int(root.attrib.get("Code", root.attrib.get("code", "0")))
-    value_kind, numeric_value = _classify_value(root.attrib.get("value"))
+    value_kind, numeric_value, unit = _classify_value(root.attrib.get("value"))
+    numeric_states = _xml_numeric_states(root)
+    indexed_substates = {
+        key[1:] for key in root.attrib if len(key) > 1 and key[0].lower() in {"n", "u", "v"} and key[1:].isdigit()
+    }
     return RuntimeResponse(
         code=code,
         control=root.attrib.get("control"),
         value_kind=value_kind,
         numeric_value=numeric_value,
-        substate_count=sum(1 for _ in root.iter()) - 1,
+        unit=unit,
+        substate_count=max(len(indexed_substates), sum(1 for _ in root.iter()) - 1),
+        numeric_states=numeric_states,
     )
 
 
@@ -245,7 +331,9 @@ async def _probe_element(
                     response_control=parsed.control,
                     value_kind=parsed.value_kind,
                     numeric_value=parsed.numeric_value,
+                    unit=parsed.unit,
                     substate_count=parsed.substate_count,
+                    numeric_states=parsed.numeric_states,
                 )
             except (aiohttp.ClientError, TimeoutError) as err:
                 last_error = type(err).__name__
