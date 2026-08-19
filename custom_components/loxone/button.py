@@ -87,13 +87,20 @@ class LoxoneEngineeringInventoryButton(ButtonEntity):
             raise HomeAssistantError(f"Engineering inventory could not be loaded: {err}") from err
 
         summary = inventory.summary()
-        self._attr_extra_state_attributes = {"status": "loaded", **summary}
+        runtime_summary = self._coordinator.engineering_runtime.summary()
+        self._attr_extra_state_attributes = {
+            "status": "loaded",
+            **summary,
+            "runtime": runtime_summary,
+        }
         self.async_write_ha_state()
         persistent_notification.async_create(
             self.hass,
             (
                 f"Loaded {summary['candidate_count']} onboarding candidates from "
-                f"{summary['source_archive']}. Open the PyLoxone diagnostics download "
+                f"{summary['source_archive']}; {runtime_summary['bound_count']} of "
+                f"{runtime_summary['probed_count']} direct channels were reachable at runtime. "
+                "Open the PyLoxone diagnostics download "
                 "to inspect the prepared tree data. The read used local FTPS and did "
                 "not modify the Miniserver."
             ),

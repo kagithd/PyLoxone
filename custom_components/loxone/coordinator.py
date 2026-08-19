@@ -1,4 +1,7 @@
+import asyncio
 import logging
+
+import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
@@ -8,6 +11,12 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL
 from .engineering_config import EngineeringInventory, download_engineering_inventory
+from .engineering_runtime import (
+    RUNTIME_PROBE_CONCURRENCY,
+    EngineeringRuntimeInventory,
+    RuntimeProbeClient,
+    async_probe_engineering_runtime,
+)
 from .miniserver import MiniServer
 from .pyloxone_api.connection import LoxoneConnection, LoxoneException
 
@@ -36,6 +45,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self.miniserver: MiniServer | None = None
         self.listeners = []
         self.engineering_inventory: EngineeringInventory | None = None
+        self.engineering_runtime: EngineeringRuntimeInventory | None = None
 
     async def async_config_entry_first_refresh(self) -> None:
         _LOGGER.debug("async_config_entry_first_refresh")
@@ -94,6 +104,18 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             )
         )
         self.engineering_inventory = inventory
+        session = async_get_clientsession(self.hass)
+        runtime_client = RuntimeProbeClient(
+            session=session,
+            base_url=f"{self.api.scheme}://{self.api.url}",
+            auth=aiohttp.BasicAuth(self._username, self._password, encoding="utf-8"),
+            verify_ssl=self._verify_ssl,
+            semaphore=asyncio.Semaphore(RUNTIME_PROBE_CONCURRENCY),
+        )
+        self.engineering_runtime = await async_probe_engineering_runtime(
+            inventory,
+            client=runtime_client,
+        )
         return inventory
 
     async def async_cleanup(self):
