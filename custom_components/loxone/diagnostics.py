@@ -26,4 +26,10 @@ async def async_get_config_entry_diagnostics(hass: HomeAssistant, config_entry: 
             "elements": [element.as_public_dict() for element in inventory.elements],
             "prepared_candidates": [element.as_public_dict() for element in inventory.candidates],
         }
+    runtime = coordinator.engineering_runtime
+    if runtime is not None:
+        diagnostics["engineering_runtime"] = {
+            "summary": runtime.summary(),
+            "bindings": [binding.as_public_dict() for binding in runtime.bindings],
+        }
     return diagnostics
