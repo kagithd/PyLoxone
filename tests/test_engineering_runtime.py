@@ -45,18 +45,25 @@ def test_runtime_probe_does_not_fallback_to_ambiguous_io_name():
 
 
 @pytest.mark.parametrize(
-    ("payload", "numeric_value", "substate_count"),
+    ("payload", "numeric_value", "unit", "substate_count"),
     [
-        (b'<LL control="dev/sps/io/AWI1/state" value="21.75" Code="200"/>', 21.75, 0),
-        (b'{"LL":{"control":"dev/sps/io/AWI1/state","value":"21,75","Code":"200"}}', 21.75, 0),
-        (b'<LL control="dev/sps/io/x/all" value="0" Code="200"><S value="1"/></LL>', 0.0, 1),
+        (b'<LL control="dev/sps/io/AWI1/state" value="21.75" Code="200"/>', 21.75, None, 0),
+        (b'{"LL":{"control":"dev/sps/io/AWI1/state","value":"21,75","Code":"200"}}', 21.75, None, 0),
+        (b'<LL control="dev/sps/io/x/all" value="0" Code="200"><S value="1"/></LL>', 0.0, None, 1),
+        (
+            '<LL control="dev/sps/io/AWI1/state" value="21,75 \\N{DEGREE SIGN}C" Code="200"/>'.encode(),
+            21.75,
+            "\\N{DEGREE SIGN}C",
+            0,
+        ),
     ],
 )
-def test_runtime_response_parses_xml_and_json(payload, numeric_value, substate_count):
+def test_runtime_response_parses_xml_and_json(payload, numeric_value, unit, substate_count):
     """Both documented XML and JSON LL response forms are accepted."""
     parsed = _parse_runtime_response(payload)
     assert parsed.code == 200
     assert parsed.numeric_value == numeric_value
+    assert parsed.unit == unit
     assert parsed.substate_count == substate_count
 
 
@@ -65,6 +72,20 @@ def test_runtime_response_does_not_expose_text_as_numeric_value():
     parsed = _parse_runtime_response(b'<LL control="dev/sps/io/name/state" value="private text" Code="200"/>')
     assert parsed.value_kind == "text"
     assert parsed.numeric_value is None
+
+
+def test_runtime_response_extracts_numeric_all_states_without_names():
+    """Numeric output states retain stable UUIDs but omit arbitrary display names."""
+    parsed = _parse_runtime_response(
+        b'<LL control="dev/sps/io/x/all" value="2" Code="200" '
+        b'n1="Temperature" u1="state-temp" v1="20.5 C" '
+        b'n2="Private text" u2="state-text" v2="not numeric"/>'
+    )
+    assert parsed.substate_count == 2
+    assert len(parsed.numeric_states) == 1
+    assert parsed.numeric_states[0].state_uuid == "state-temp"
+    assert parsed.numeric_states[0].numeric_value == 20.5
+    assert parsed.numeric_states[0].unit == "C"
 
 
 def test_runtime_response_rejects_entity_declarations():
