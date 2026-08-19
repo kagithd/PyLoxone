@@ -34,6 +34,13 @@ from . import LoxoneEntity, MiniServer
 from .const import CONF_ACTIONID, DOMAIN, SENDDOMAIN, THROTTLE_KEEP_ALIVE_TIME
 from .helpers import (add_room_and_cat_to_value_values, clean_unit, get_all,
                       get_or_create_device)
+from .engineering_entities import (
+    EngineeringSensorSpec,
+    async_sync_engineering_sensor_registry,
+    build_engineering_sensor_specs,
+    engineering_inventory_updated_signal,
+    normalize_engineering_unit,
+)
 from .miniserver import get_miniserver_from_hass
 
 NEW_SENSOR = "sensors"
@@ -201,6 +208,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up entry."""
     miniserver = get_miniserver_from_hass(hass, config_entry)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
 
     loxconfig = miniserver.lox_config.json
     entities: list[Any] = [LoxoneKeepAliveSensor(miniserver.serial)]
@@ -253,7 +261,150 @@ async def async_setup_entry(
         )
     )
 
+    standard_sensor_uuids = {
+        sensor["uuidAction"]
+        for sensor_type in ("InfoOnlyAnalog", "TextInput")
+        for sensor in get_all(loxconfig, sensor_type)
+        if sensor.get("uuidAction")
+    }
+    standard_sensor_uuids.update(
+        state_uuid
+        for meter in get_all(loxconfig, "Meter")
+        for state_uuid in meter.get("states", {}).values()
+        if state_uuid
+    )
+    prepared_entities: dict[str, LoxoneEngineeringSensor] = {}
+
+    @callback
+    def async_refresh_engineering_sensors() -> None:
+        inventory = coordinator.engineering_inventory
+        runtime = coordinator.engineering_runtime
+        if inventory is None or runtime is None:
+            return
+
+        specs = tuple(
+            spec
+            for spec in build_engineering_sensor_specs(inventory, runtime)
+            if spec.element.uuid not in standard_sensor_uuids
+        )
+        current_specs = {spec.element.uuid: spec for spec in specs if spec.element.uuid}
+        for engineering_uuid, entity in prepared_entities.items():
+            if spec := current_specs.get(engineering_uuid):
+                entity.update_spec(spec)
+            else:
+                entity.mark_unavailable()
+
+        new_entities: list[LoxoneEngineeringSensor] = []
+        for spec in specs:
+            engineering_uuid = spec.element.uuid
+            if (
+                engineering_uuid is None
+                or engineering_uuid in prepared_entities
+            ):
+                continue
+            entity = LoxoneEngineeringSensor(
+                spec,
+                miniserver.serial or config_entry.entry_id,
+            )
+            prepared_entities[engineering_uuid] = entity
+            new_entities.append(entity)
+        if new_entities:
+            async_add_entities(new_entities)
+        async_sync_engineering_sensor_registry(
+            hass,
+            config_entry.entry_id,
+            miniserver.serial or config_entry.entry_id,
+            specs,
+        )
+
+    miniserver.listeners.append(
+        async_dispatcher_connect(
+            hass,
+            engineering_inventory_updated_signal(config_entry.entry_id),
+            async_refresh_engineering_sensors,
+        )
+    )
+
     async_add_entities(entities, update_before_add=True)
+    async_refresh_engineering_sensors()
+
+
+class LoxoneEngineeringSensor(SensorEntity):
+    """A read-only sensor prepared from a verified engineering channel."""
+
+    _attr_entity_registry_enabled_default = False
+    _attr_should_poll = False
+
+    def __init__(self, spec: EngineeringSensorSpec, miniserver_serial: str) -> None:
+        """Initialize the prepared engineering sensor."""
+        self._spec = spec
+        self._attr_unique_id = spec.element.uuid
+        self._attr_name = spec.element.title or spec.element.io_name or spec.element.uuid
+        self._attr_native_value = spec.binding.numeric_value
+        self._attr_native_unit_of_measurement = normalize_engineering_unit(
+            spec.binding.unit,
+            title=spec.element.title,
+            loxone_type=spec.element.loxone_type,
+        )
+        description = match_sensor_description(
+            self._attr_native_unit_of_measurement or "",
+            self._attr_name or "",
+            spec.element.category or "",
+        )
+        if description:
+            self.entity_description = description
+        else:
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+        self._attr_available = True
+        self._set_device_info(spec, miniserver_serial)
+        self._update_attributes(spec)
+
+    def _set_device_info(self, spec: EngineeringSensorSpec, miniserver_serial: str) -> None:
+        device = spec.device or spec.element
+        device_uuid = device.uuid or spec.element.uuid
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, device_uuid)},
+            name=device.title or device.io_name or self._attr_name,
+            manufacturer="Loxone",
+            model=device.loxone_type or "Engineering device",
+            suggested_area=spec.element.room,
+            via_device=(DOMAIN, miniserver_serial),
+        )
+
+    def _update_attributes(self, spec: EngineeringSensorSpec) -> None:
+        self._attr_extra_state_attributes = {
+            "uuid": spec.element.uuid,
+            "io_name": spec.element.io_name,
+            "loxone_type": spec.element.loxone_type,
+            "room": spec.element.room,
+            "category": spec.element.category,
+            "engineering_config_version": spec.config_version,
+            "runtime_binding": spec.binding.binding_method,
+            "runtime_substate_count": spec.binding.substate_count,
+        }
+
+    @callback
+    def update_spec(self, spec: EngineeringSensorSpec) -> None:
+        """Apply the newest manually refreshed engineering snapshot."""
+        self._spec = spec
+        self._attr_name = spec.element.title or spec.element.io_name or spec.element.uuid
+        self._attr_native_value = spec.binding.numeric_value
+        self._attr_native_unit_of_measurement = normalize_engineering_unit(
+            spec.binding.unit,
+            title=spec.element.title,
+            loxone_type=spec.element.loxone_type,
+        )
+        self._attr_available = True
+        self._update_attributes(spec)
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def mark_unavailable(self) -> None:
+        """Mark a previously prepared channel unavailable after a refresh."""
+        self._attr_available = False
+        if self.hass is not None:
+            self.async_write_ha_state()
 
 
 class LoxoneCustomSensor(LoxoneEntity, SensorEntity):

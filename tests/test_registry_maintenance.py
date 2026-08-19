@@ -63,8 +63,16 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
     notifications = []
     dismissed = []
 
+    async def load_engineering_metadata(hass, entry_id):
+        del hass, entry_id
+        return set(), set()
+
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.Store", FakeStore
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
+        load_engineering_metadata,
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.dr.async_get",
@@ -222,6 +230,35 @@ def test_audit_only_mode_never_removes_confirmed_devices(monkeypatch):
     assert device_registry.removed == []
     assert entity_registry.removed == []
     assert "audit only" in notifications[-1][0]
+
+
+def test_confirmed_engineering_device_is_not_reported_as_stale(monkeypatch):
+    """A persisted engineering UUID supplements the public structure safely."""
+    FakeStore.data = None
+    engineering = _device("engineering-device", "engineering-uuid")
+    _, _, notifications, dismissed = _install_registry_fakes(
+        monkeypatch, [engineering]
+    )
+
+    async def load_engineering_metadata(hass, entry_id):
+        del hass, entry_id
+        return {"engineering-uuid"}, {"Keller"}
+
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
+        load_engineering_metadata,
+    )
+
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(), _config_entry(), _lox_config()
+        )
+    )
+
+    assert result.pending == ()
+    assert result.removed == ()
+    assert notifications == []
+    assert dismissed
 
 
 def test_cleanup_defaults_to_audit_only_when_option_is_absent(monkeypatch):
