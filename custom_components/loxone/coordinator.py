@@ -7,10 +7,16 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_HOST, CONF_PASSWORD, CONF_PORT, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL
 from .engineering_config import EngineeringInventory, download_engineering_inventory
+from .engineering_entities import (
+    async_store_engineering_registry_metadata,
+    build_engineering_sensor_specs,
+    engineering_inventory_updated_signal,
+)
 from .engineering_runtime import (
     RUNTIME_PROBE_CONCURRENCY,
     EngineeringRuntimeInventory,
@@ -115,6 +121,15 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self.engineering_runtime = await async_probe_engineering_runtime(
             inventory,
             client=runtime_client,
+        )
+        await async_store_engineering_registry_metadata(
+            self.hass,
+            self.config_entry.entry_id,
+            build_engineering_sensor_specs(inventory, self.engineering_runtime),
+        )
+        async_dispatcher_send(
+            self.hass,
+            engineering_inventory_updated_signal(self.config_entry.entry_id),
         )
         return inventory
 

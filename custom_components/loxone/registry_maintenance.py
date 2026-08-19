@@ -28,6 +28,7 @@ from .device_sync import (
     async_cleanup_stale_devices,
     control_identifiers_from_lox_config,
 )
+from .engineering_entities import async_load_engineering_registry_metadata
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -92,9 +93,11 @@ def _stale_devices(
     lox_config: Mapping[str, Any],
     observations: Mapping[str, int],
     missing_since: Mapping[str, float],
+    additional_active_identifiers: set[str] | None = None,
 ) -> list[StaleDevice]:
     """Return registry devices absent from the current Loxone structure."""
     active_identifiers = control_identifiers_from_lox_config(lox_config)
+    active_identifiers.update(additional_active_identifiers or set())
     miniserver_serial = lox_config.get("msInfo", {}).get("serialNr")
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
@@ -278,7 +281,11 @@ async def async_run_registry_maintenance(
     lox_config: Mapping[str, Any],
 ) -> RegistryMaintenanceResult:
     """Audit and optionally clean registry entries after a grace period."""
+    engineering_identifiers, engineering_rooms = (
+        await async_load_engineering_registry_metadata(hass, config_entry.entry_id)
+    )
     active_identifiers = control_identifiers_from_lox_config(lox_config)
+    active_identifiers.update(engineering_identifiers)
     if not active_identifiers:
         return RegistryMaintenanceResult(
             audit_only=not config_entry.options.get(
@@ -338,6 +345,7 @@ async def async_run_registry_maintenance(
         lox_config,
         previous_observations,
         previous_missing_since,
+        engineering_identifiers,
     )
     current_stale_ids = {device.identifier for device in stale_before}
     now = _utc_timestamp()
@@ -395,7 +403,7 @@ async def async_run_registry_maintenance(
             observations.pop(identifier, None)
             missing_since.pop(identifier, None)
 
-    current_rooms = room_names_from_lox_config(lox_config)
+    current_rooms = room_names_from_lox_config(lox_config) | engineering_rooms
     previous_rooms = set(stored.get("loxone_rooms", []))
     orphan_rooms = _orphan_rooms(hass, previous_rooms, current_rooms)
     await store.async_save(
