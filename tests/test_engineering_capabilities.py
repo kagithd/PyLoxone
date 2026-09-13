@@ -173,3 +173,17 @@ def test_cached_unitless_binding_rejects_invalid_or_changed_unit(unit):
     spec = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((live,)))[0]
     assert spec.available is False
     assert spec.native_value is None
+
+
+def test_malformed_probe_remains_distinguishable_in_capability_row():
+    binding = replace(numeric_binding("ai1", 2.4), status="malformed_response")
+    row = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("ai1", "VoltageIn"),)),
+        EngineeringRuntimeInventory((binding,)),
+    )[0]
+    assert row.capability.reason == "runtime_malformed_failure"
+
+
+def test_physical_nfc_hardware_is_not_reclassified_sensitive():
+    capability = resolve_capability(resolved_node("nfc", "NfcCodeTouch"), None)
+    assert capability.state is not CapabilityState.SENSITIVE

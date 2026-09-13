@@ -482,13 +482,14 @@ async def async_probe_engineering_runtime(
             continue
         key = element.io_name.casefold()
         io_name_counts[key] = io_name_counts.get(key, 0) + 1
+    resolved_input = hasattr(inventory, "nodes")
 
     bindings = await asyncio.gather(
         *(
             _probe_element(
                 client,
                 element,
-                unique_io_name=io_name_counts.get(element.io_name.casefold(), 0) == 1,
+                unique_io_name=not resolved_input and io_name_counts.get(element.io_name.casefold(), 0) == 1,
             )
             for element in elements
         )

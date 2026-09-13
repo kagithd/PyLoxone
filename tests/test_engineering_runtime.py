@@ -1,19 +1,23 @@
 """Tests for read-only engineering runtime binding helpers."""
 
 import asyncio
+from dataclasses import replace
 
 import aiohttp
 
 import pytest
 
 from custom_components.loxone.engineering_config import EngineeringElement
+from custom_components.loxone.engineering_topology import resolve_engineering_topology
 from custom_components.loxone.engineering_runtime import (
     _parse_runtime_response,
     _probe_targets,
     _probe_element,
     RuntimeProbeClient,
+    async_probe_engineering_runtime,
     binding_from_response,
 )
+from tests.engineering_fixtures import element, inventory_of, source
 
 
 def _element(*, uuid: str = "sensor-uuid", io_name: str = "AWI1") -> EngineeringElement:
@@ -144,6 +148,13 @@ def _probe(replies):
     return asyncio.run(_probe_element(client, _element(), unique_io_name=True)), session
 
 
+def _probe_inventory(inventory, replies=()):
+    session = _Session(replies)
+    client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
+    result = asyncio.run(async_probe_engineering_runtime(inventory, client=client))
+    return result, session
+
+
 def test_async_probe_preserves_auth_before_later_scalar_success():
     binding, session = _probe([(401, b""), (200, b'<LL Code="200" value="2"/>')])
     assert binding.status == "auth_error"
@@ -159,3 +170,38 @@ def test_async_probe_uses_explicit_all_state_tuple_not_root_value():
 def test_nonfinite_scalar_is_cleared(value):
     binding = binding_from_response("id", value)
     assert binding.numeric_value is None
+
+
+def test_raw_tag_sensitive_ancestor_is_never_probed():
+    parent = replace(element("parent", "Page", room=None), xml_element="User")
+    child = element("child", "VoltageIn", parent_uuid="parent", io_name="AI1")
+    result, session = _probe_inventory(inventory_of(parent, child))
+    assert result.bindings == ()
+    assert session.targets == []
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        (element("child", "VoltageIn", parent_key="missing", io_name="AI1"),),
+        (element("child", "VoltageIn", parent_key="child", io_name="AI1"),),
+    ],
+)
+def test_raw_unproven_ancestry_is_never_probed(items):
+    result, session = _probe_inventory(inventory_of(*items))
+    assert result.bindings == ()
+    assert session.targets == []
+
+
+def test_nonfinite_substate_is_not_emitted():
+    parsed = _parse_runtime_response(b'<LL Code="200" u1="event" v1="nan"/>')
+    assert parsed.numeric_states == ()
+
+
+def test_resolved_sensitive_collision_never_uses_name_fallback():
+    ms = element("ms", "LoxLIVE", room=None)
+    safe = element("safe", "VoltageIn", parent_uuid="ms", io_name="AI1")
+    secret = element("secret", "NfcCode", parent_uuid="ms", io_name="AI1")
+    resolved = resolve_engineering_topology(inventory_of(ms, safe, secret), source())
+    _result, session = _probe_inventory(resolved, [(404, b""), (404, b"")])
+    assert all(not target.endswith("/AI1/state") for target in session.targets)

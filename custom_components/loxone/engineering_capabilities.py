@@ -186,7 +186,11 @@ def resolve_capability(  # noqa: PLR0911
         return EngineeringCapability(
             CapabilityState.CONFIGURED_ONLY, None, ExposureStatus.INVENTORY_ONLY, "runtime_auth_failure"
         )
-    if binding is not None and binding.status in {"transport_error", "error", "malformed_response"}:
+    if binding is not None and binding.status == "malformed_response":
+        return EngineeringCapability(
+            CapabilityState.CONFIGURED_ONLY, None, ExposureStatus.INVENTORY_ONLY, "runtime_malformed_failure"
+        )
+    if binding is not None and binding.status in {"transport_error", "error"}:
         return EngineeringCapability(
             CapabilityState.CONFIGURED_ONLY, None, ExposureStatus.INVENTORY_ONLY, "runtime_transport_failure"
         )
