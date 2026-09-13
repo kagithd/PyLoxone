@@ -160,3 +160,16 @@ def test_descriptor_drops_unknown_units_and_cached_invalid_rebind_is_unavailable
     spec = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((failed,)))[0]
     assert spec.available is False
     assert spec.native_value is None
+
+
+@pytest.mark.parametrize("unit", ["invalid", "V"])
+def test_cached_unitless_binding_rejects_invalid_or_changed_unit(unit):
+    saved = numeric_binding("ai1", 2.4)
+    rows = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("ai1", "VoltageIn"),)),
+        EngineeringRuntimeInventory((saved,)),
+    )
+    live = replace(saved, unit=unit)
+    spec = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((live,)))[0]
+    assert spec.available is False
+    assert spec.native_value is None

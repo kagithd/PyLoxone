@@ -88,6 +88,30 @@ def build_engineering_entity_specs(
             and live.value_kind == binding.value_kind
             and live.numeric_value is not None
             and math.isfinite(live.numeric_value)
+            and live.unit
+            in {
+                None,
+                "%",
+                "°",
+                "°C",
+                "°F",
+                "C",
+                "F",
+                "V",
+                "A",
+                "W",
+                "kW",
+                "Wh",
+                "kWh",
+                "Hz",
+                "lx",
+                "Pa",
+                "bar",
+                "ppm",
+                "s",
+                "min",
+                "h",
+            }
             and (
                 live.unit
                 if live.unit
