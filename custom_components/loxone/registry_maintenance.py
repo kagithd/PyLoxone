@@ -11,7 +11,6 @@ from homeassistant.components import automation, persistent_notification, script
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from homeassistant.helpers.storage import Store
 
 from .const import (
     CONF_STALE_DEVICE_AUTO_CLEANUP,
@@ -29,6 +28,7 @@ from .device_sync import (
     control_identifiers_from_lox_config,
 )
 from .engineering_entities import async_load_engineering_registry_metadata
+from .engineering_snapshot import EngineeringStateStore as Store
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -87,7 +87,7 @@ def room_names_from_lox_config(lox_config: Mapping[str, Any]) -> set[str]:
     }
 
 
-def _stale_devices(
+def _stale_devices(  # noqa: PLR0913
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     lox_config: Mapping[str, Any],
@@ -257,7 +257,7 @@ def _utc_timestamp() -> float:
     return datetime.now(UTC).timestamp()
 
 
-def _grace_reached(
+def _grace_reached(  # noqa: PLR0913
     mode: str,
     observations: int,
     missing_since: float,
@@ -281,12 +281,28 @@ async def async_run_registry_maintenance(
     lox_config: Mapping[str, Any],
 ) -> RegistryMaintenanceResult:
     """Audit and optionally clean registry entries after a grace period."""
-    engineering_identifiers, engineering_rooms = (
-        await async_load_engineering_registry_metadata(hass, config_entry.entry_id)
+    engineering_metadata = await async_load_engineering_registry_metadata(
+        hass,
+        config_entry.entry_id,
     )
+    engineering_identifiers = set(engineering_metadata.active_device_identifiers)
+    engineering_rooms = set(engineering_metadata.room_names)
     active_identifiers = control_identifiers_from_lox_config(lox_config)
     active_identifiers.update(engineering_identifiers)
     if not active_identifiers:
+        return RegistryMaintenanceResult(
+            audit_only=not config_entry.options.get(
+                CONF_STALE_DEVICE_AUTO_CLEANUP,
+                DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+            ),
+            pending=(),
+            removed=(),
+            orphan_rooms=(),
+            skipped=True,
+        )
+
+    engineering_generation = engineering_metadata.applied_generation
+    if engineering_generation is None:
         return RegistryMaintenanceResult(
             audit_only=not config_entry.options.get(
                 CONF_STALE_DEVICE_AUTO_CLEANUP,
@@ -339,6 +355,8 @@ async def async_run_registry_maintenance(
         str(identifier): float(timestamp)
         for identifier, timestamp in stored.get("missing_since", {}).items()
     }
+    last_counted_generation = stored.get("last_counted_engineering_generation")
+    count_generation = last_counted_generation != engineering_generation
     stale_before = _stale_devices(
         hass,
         config_entry,
@@ -351,7 +369,7 @@ async def async_run_registry_maintenance(
     now = _utc_timestamp()
     observations = {
         identifier: min(
-            previous_observations.get(identifier, 0) + 1,
+            previous_observations.get(identifier, 0) + (1 if count_generation else 0),
             grace_observations,
         )
         for identifier in current_stale_ids
@@ -359,6 +377,7 @@ async def async_run_registry_maintenance(
     missing_since = {
         identifier: previous_missing_since.get(identifier, now)
         for identifier in current_stale_ids
+        if count_generation or identifier in previous_missing_since
     }
     stale_confirmed = tuple(
         StaleDevice(
@@ -366,7 +385,7 @@ async def async_run_registry_maintenance(
             identifier=device.identifier,
             entity_ids=device.entity_ids,
             observations=observations[device.identifier],
-            missing_since=missing_since[device.identifier],
+            missing_since=missing_since.get(device.identifier, now),
         )
         for device in stale_before
     )
@@ -375,6 +394,8 @@ async def async_run_registry_maintenance(
         device.identifier
         for device in stale_confirmed
         if auto_cleanup
+        and device.observations > 0
+        and device.identifier in missing_since
         and _grace_reached(
             grace_mode,
             device.observations,
@@ -390,6 +411,20 @@ async def async_run_registry_maintenance(
     pending = tuple(
         device for device in stale_confirmed if device.identifier not in removable_ids
     )
+    current_rooms = room_names_from_lox_config(lox_config) | engineering_rooms
+    previous_rooms = set(stored.get("loxone_rooms", []))
+    orphan_rooms = _orphan_rooms(hass, previous_rooms, current_rooms)
+    counted_state = {
+        "missing_observations": observations,
+        "missing_since": missing_since,
+        "loxone_rooms": sorted(current_rooms),
+        "last_counted_engineering_generation": (
+            engineering_generation if count_generation else last_counted_generation
+        ),
+    }
+    if count_generation or counted_state != stored:
+        await store.async_save_acknowledged(counted_state)
+
     removed_devices = 0
     removed_entities = 0
     if removable_ids:
@@ -402,17 +437,14 @@ async def async_run_registry_maintenance(
         for identifier in removable_ids:
             observations.pop(identifier, None)
             missing_since.pop(identifier, None)
-
-    current_rooms = room_names_from_lox_config(lox_config) | engineering_rooms
-    previous_rooms = set(stored.get("loxone_rooms", []))
-    orphan_rooms = _orphan_rooms(hass, previous_rooms, current_rooms)
-    await store.async_save(
-        {
-            "missing_observations": observations,
-            "missing_since": missing_since,
-            "loxone_rooms": sorted(current_rooms),
-        }
-    )
+        await store.async_save_acknowledged(
+            {
+                "missing_observations": observations,
+                "missing_since": missing_since,
+                "loxone_rooms": sorted(current_rooms),
+                "last_counted_engineering_generation": engineering_generation,
+            }
+        )
 
     result = RegistryMaintenanceResult(
         audit_only=not auto_cleanup,

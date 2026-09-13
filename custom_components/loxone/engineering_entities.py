@@ -2,24 +2,24 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
-from homeassistant.helpers.storage import Store
+from homeassistant.core import callback
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
-from homeassistant.core import callback
 
 from .const import DOMAIN
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
-    from .engineering_config import EngineeringElement, EngineeringInventory
-    from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
     from .engineering_capabilities import EngineeringInventoryRow
+    from .engineering_config import EngineeringElement, EngineeringInventory
+    from .engineering_registry import EngineeringRegistryMetadata
+    from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,10 +42,6 @@ class EngineeringEntitySpec:
     config_version: int
     runtime_binding: str | None
     enabled_by_default: bool = False
-
-
-ENGINEERING_REGISTRY_STORAGE_VERSION = 1
-ENGINEERING_REGISTRY_STORAGE_KEY = "loxone.engineering_registry"
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,40 +220,59 @@ def normalize_engineering_unit(
 async def async_store_engineering_registry_metadata(
     hass: HomeAssistant,
     entry_id: str,
-    specs: tuple[EngineeringSensorSpec, ...],
+    metadata: object,
 ) -> None:
-    """Persist only identities and rooms needed by registry reconciliation."""
-    identifiers = sorted({identifier for spec in specs if (identifier := (spec.device or spec.element).uuid)})
-    room_names = sorted({spec.element.room for spec in specs if spec.element.room})
-    store: Store[dict[str, list[str]]] = Store(
-        hass,
-        ENGINEERING_REGISTRY_STORAGE_VERSION,
-        f"{ENGINEERING_REGISTRY_STORAGE_KEY}.{entry_id}",
-        private=True,
+    """Compatibility adapter storing only fully applied Task 4 metadata."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    from .engineering_registry import EngineeringRegistryMetadata  # noqa: PLC0415
+    from .engineering_snapshot import (  # noqa: PLC0415
+        async_load_engineering_state,
+        async_store_engineering_state,
     )
-    await store.async_save(
-        {
-            "active_device_identifiers": identifiers,
-            "room_names": room_names,
-        }
+
+    if not isinstance(metadata, EngineeringRegistryMetadata):
+        return
+    state = await async_load_engineering_state(hass, entry_id)
+    if (
+        state.snapshot is None
+        or metadata.applied_generation != state.snapshot.generation_id
+    ):
+        return
+    await async_store_engineering_state(
+        hass,
+        replace(
+            state,
+            registry_applied_generation=metadata.applied_generation,
+            managed_area_ids=metadata.managed_area_ids,
+        ),
     )
 
 
 async def async_load_engineering_registry_metadata(
     hass: HomeAssistant,
     entry_id: str,
-) -> tuple[set[str], set[str]]:
-    """Load the last confirmed engineering registry identities and rooms."""
-    store: Store[dict[str, list[str]]] = Store(
-        hass,
-        ENGINEERING_REGISTRY_STORAGE_VERSION,
-        f"{ENGINEERING_REGISTRY_STORAGE_KEY}.{entry_id}",
-        private=True,
+) -> EngineeringRegistryMetadata:
+    """Reconstruct applied registry metadata from the private Task 4 envelope."""
+    from .engineering_registry import (  # noqa: PLC0415
+        EngineeringRegistryMetadata,
+        registry_metadata_from_snapshot,
     )
-    stored = await store.async_load() or {}
-    identifiers = {item for item in stored.get("active_device_identifiers", []) if isinstance(item, str) and item}
-    room_names = {item for item in stored.get("room_names", []) if isinstance(item, str) and item}
-    return identifiers, room_names
+    from .engineering_snapshot import async_load_engineering_state  # noqa: PLC0415
+
+    state = await async_load_engineering_state(hass, entry_id)
+    if state.snapshot is None:
+        return EngineeringRegistryMetadata.empty()
+    applied = (
+        state.snapshot.generation_id
+        if state.registry_applied_generation == state.snapshot.generation_id
+        else None
+    )
+    return registry_metadata_from_snapshot(
+        state.snapshot,
+        managed_area_ids=state.managed_area_ids,
+        applied_generation=applied,
+    )
 
 
 @callback

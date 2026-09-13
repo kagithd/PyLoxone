@@ -1,9 +1,13 @@
 """Tests for guarded Loxone registry maintenance."""
 
 import asyncio
+from copy import deepcopy
 from types import SimpleNamespace
 
+import pytest
+
 from custom_components.loxone.const import DOMAIN
+from custom_components.loxone.engineering_registry import EngineeringRegistryMetadata
 from custom_components.loxone.registry_maintenance import (
     async_run_registry_maintenance,
 )
@@ -13,6 +17,10 @@ class FakeStore:
     """In-memory replacement for Home Assistant storage."""
 
     data = None
+    engineering_generation = "generation-a"
+    fail_save = False
+    fail_save_attempt = None
+    save_attempts = 0
 
     def __init__(self, *args, **kwargs):
         pass
@@ -21,7 +29,13 @@ class FakeStore:
         return self.__class__.data
 
     async def async_save(self, data):
-        self.__class__.data = data
+        self.__class__.save_attempts += 1
+        if self.__class__.fail_save or (self.__class__.fail_save_attempt == self.__class__.save_attempts):
+            raise RuntimeError("injected maintenance store failure")
+        self.__class__.data = deepcopy(data)
+
+    async def async_save_acknowledged(self, data):
+        await self.async_save(data)
 
 
 class FakeDeviceRegistry:
@@ -65,7 +79,12 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
 
     async def load_engineering_metadata(hass, entry_id):
         del hass, entry_id
-        return set(), set()
+        return EngineeringRegistryMetadata(
+            frozenset(),
+            frozenset(),
+            {},
+            FakeStore.engineering_generation,
+        )
 
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.Store", FakeStore
@@ -127,6 +146,15 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
         lambda hass, area_id: {"script.old_room"},
     )
     return device_registry, entity_registry, notifications, dismissed
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_store():
+    FakeStore.data = None
+    FakeStore.engineering_generation = "generation-a"
+    FakeStore.fail_save = False
+    FakeStore.fail_save_attempt = None
+    FakeStore.save_attempts = 0
 
 
 def _device(device_id, identifier, name="Device", area_id=None):
@@ -197,6 +225,15 @@ def test_cleanup_requires_two_consecutive_successful_structure_loads(monkeypatch
     assert device_registry.removed == []
     assert "1/2" in notifications[-1][0]
 
+    same_generation = asyncio.run(
+        async_run_registry_maintenance(
+            object(), _config_entry(), _lox_config()
+        )
+    )
+    assert same_generation.pending[0].observations == 1
+    assert device_registry.removed == []
+
+    FakeStore.engineering_generation = "generation-b"
     second = asyncio.run(
         async_run_registry_maintenance(
             object(), _config_entry(), _lox_config()
@@ -242,7 +279,12 @@ def test_confirmed_engineering_device_is_not_reported_as_stale(monkeypatch):
 
     async def load_engineering_metadata(hass, entry_id):
         del hass, entry_id
-        return {"engineering-uuid"}, {"Keller"}
+        return EngineeringRegistryMetadata(
+            frozenset({"engineering-uuid"}),
+            frozenset({"Keller"}),
+            {},
+            FakeStore.engineering_generation,
+        )
 
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
@@ -333,6 +375,7 @@ def test_combined_mode_requires_observations_and_elapsed_time(monkeypatch):
     config_entry = _config_entry(mode="combined", grace=2, hours=1)
 
     asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
+    FakeStore.engineering_generation = "generation-b"
     now = 2_000.0
     second = asyncio.run(
         async_run_registry_maintenance(object(), config_entry, _lox_config())
@@ -346,6 +389,127 @@ def test_combined_mode_requires_observations_and_elapsed_time(monkeypatch):
     )
     assert third.removed[0].identifier == "stale-uuid"
     assert device_registry.removed == ["stale-device"]
+
+
+def test_pending_engineering_generation_does_not_advance_grace(monkeypatch):
+    """A snapshot whose registry phase is pending must not count as an observation."""
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, notifications, dismissed = _install_registry_fakes(
+        monkeypatch, [stale]
+    )
+
+    async def load_pending_metadata(hass, entry_id):
+        del hass, entry_id
+        return EngineeringRegistryMetadata.empty()
+
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
+        load_pending_metadata,
+    )
+
+    result = asyncio.run(
+        async_run_registry_maintenance(object(), _config_entry(), _lox_config())
+    )
+
+    assert result.skipped is True
+    assert device_registry.removed == []
+    assert FakeStore.data is None
+    assert notifications == []
+    assert dismissed == []
+
+
+def test_counter_store_failure_prevents_cleanup(monkeypatch):
+    """Deletion before the counted-token save would make replay double-count or lose work."""
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, _, _ = _install_registry_fakes(monkeypatch, [stale])
+    FakeStore.fail_save = True
+
+    with pytest.raises(RuntimeError, match="injected maintenance store failure"):
+        asyncio.run(
+            async_run_registry_maintenance(
+                object(),
+                _config_entry(auto_cleanup=True, grace=1),
+                _lox_config(),
+            )
+        )
+
+    assert device_registry.removed == []
+    assert FakeStore.data is None
+
+
+def test_cleanup_replays_after_counted_token_was_saved(monkeypatch):
+    """A cleanup failure after the atomic counter save must retry without another count."""
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, _, _ = _install_registry_fakes(monkeypatch, [stale])
+    attempts = 0
+
+    def flaky_cleanup(hass, config_entry, lox_config, identifiers_to_remove):
+        nonlocal attempts
+        del hass, config_entry, lox_config
+        attempts += 1
+        assert FakeStore.data["last_counted_engineering_generation"] == "generation-a"
+        assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+        if attempts == 1:
+            raise RuntimeError("injected cleanup failure")
+        assert identifiers_to_remove == {"stale-uuid"}
+        device_registry.async_remove_device("stale-device")
+        return (1, 0)
+
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_cleanup_stale_devices",
+        flaky_cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="injected cleanup failure"):
+        asyncio.run(
+            async_run_registry_maintenance(
+                object(),
+                _config_entry(auto_cleanup=True, grace=1),
+                _lox_config(),
+            )
+        )
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1),
+            _lox_config(),
+        )
+    )
+    assert result.removed[0].observations == 1
+    assert attempts == 2
+
+
+def test_restart_prunes_counted_state_after_post_cleanup_save_failure(monkeypatch):
+    """A crash after deletion must not leave an already-removed device pending forever."""
+    stale = _device("stale-device", "stale-uuid")
+    device_registry, _, _, _ = _install_registry_fakes(monkeypatch, [stale])
+    FakeStore.fail_save_attempt = 2
+
+    with pytest.raises(RuntimeError, match="injected maintenance store failure"):
+        asyncio.run(
+            async_run_registry_maintenance(
+                object(),
+                _config_entry(auto_cleanup=True, grace=1),
+                _lox_config(),
+            )
+        )
+    assert device_registry.removed == ["stale-device"]
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+
+    FakeStore.fail_save_attempt = None
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1),
+            _lox_config(),
+        )
+    )
+
+    assert result.pending == ()
+    assert result.removed == ()
+    assert FakeStore.data["missing_observations"] == {}
 
 
 def test_empty_structure_skips_storage_notifications_and_cleanup(monkeypatch):
