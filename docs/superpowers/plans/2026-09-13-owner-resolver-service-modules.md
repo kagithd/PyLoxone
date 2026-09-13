@@ -71,7 +71,9 @@ before commit so intermediate commits remain usable.
    entities and topology: opaque key/parent key, UUID, technical type, safe
    presentation name/room, kind, owner/via identifiers, sanitized path,
    resolution/capability/exposure reasons, semantic platform, safe unit,
-   `io_name`, stable `state_uuid`, and binding method. It never persists runtime
+   `io_name`, optional proven `state_uuid`, and binding method. A safe binding
+   descriptor distinguishes event-capable bindings from bounded rebind-only
+   scalar reads. It never persists runtime
    values, endpoints, raw attributes, host/URL data, credentials, provider
    titles, project titles, user/location fields, or access metadata.
 7. **Exact registry APIs and two passes.** Use the installed Home Assistant API:
@@ -84,27 +86,50 @@ before commit so intermediate commits remain usable.
 8. **Committed generation and idempotent replay.** Candidate construction,
    validation, diffing, and impact discovery are pure and use the previous
    snapshot plus pre-mutation registry state. Store the validated snapshot as
-   the new committed data generation before registry application. Then swap
+   the new committed application generation before registry application. The
+   same private envelope stores its sanitized pending impact plan plus separate
+   registry-applied and impact-published cursors. Then swap
    coordinator memory and apply a deterministic registry plan idempotently. If
    snapshot storage fails, old memory and registries remain untouched. If
    registry application fails or is cancelled after a partial mutation, retain
    the committed candidate, mark its registry generation pending, publish no
    entity signal/impact warning/stale observation, and replay it at startup or
    retry. This is a recovery boundary, not a transactional rollback claim.
+   Home Assistant registries persist on their own delayed schedule, so an
+   integration cursor is not proof of external durability. Every process
+   startup reconciles the committed desired topology against the freshly loaded
+   registries even when the cursor matches; private HA save methods are never
+   called. Any still-applicable warning is likewise recreated from the sanitized
+   pending plan because persistent notifications are process-local. A manual
+   dismissal lasts for the current process and the warning returns after restart
+   only if the recorded problem still applies.
 9. **Topology freshness and runtime liveness are separate.** An unchanged
    `lastModified` causes zero FTPS downloads but still rebinds cached safe
-   channels by `state_uuid`. Prepared entities subscribe to normal Loxone
-   websocket events and accept only verified finite numeric or boolean values.
+   channels through their safe binding descriptors. Prepared entities subscribe
+   only when an explicit state mapping is proven, through an internal signal
+   keyed by `(config_entry_id, state_uuid)`, and accept only verified finite
+   numeric or boolean values. A scalar response does not prove that its
+   engineering UUID is an event UUID.
    A transport/authentication failure keeps cached topology and marks live
    bindings unavailable.
-10. **Exactly-once maintenance and post-apply publication.** Every complete
-    snapshot has a deterministic generation token based on provider identity
-    and configuration revision. Registry metadata stores committed,
-    registry-applied, and last-observed generation tokens plus integration-
-    managed areas. Warnings are published/dismissed and stale grace counters
-    advance only after successful registry application, at most once per
-    generation. Runtime-only rebind, restart, retry, or a repeated manual read
-    of the same configuration cannot double-count an observation.
+10. **Exactly-once maintenance and post-apply publication.** Each committed
+    complete read allocates a persisted monotonic read sequence. Its application
+    token combines provider scope, normalized configuration revision, canonical
+    safe-content digest, and that sequence. A new forced complete read is a new
+    observation even if the reported revision is unchanged; replay of the same
+    committed read is not. Missing revisions fall back to archive configuration
+    version and configuration timestamp, never capture time. Registry metadata
+    stores committed, registry-applied, impact-published, and last-counted
+    tokens plus integration-managed areas. Warnings are published/dismissed and
+    stale grace counters advance only after successful registry application, at
+    most once per token. Reprocessing the same token may reevaluate elapsed-time
+    eligibility without incrementing counters, preserving time and combined
+    grace modes. Runtime-only rebind, restart, or retry cannot double-count.
+    Under the per-entry refresh lock, all pending phases of the current
+    committed generation are drained before the unchanged-revision path and
+    before a newer complete read may commit. A drain failure retains the old
+    pending envelope and blocks replacement. Maintenance state is consulted even
+    when registry and publication cursors match.
 11. **Privacy fixture gate.** Synthetic fixtures are created by hand or through
     an explicit input validator that rejects forbidden identity, location,
     coordinate, URL, address, credential, and access-control fields before
@@ -625,7 +650,7 @@ git commit -m "feat: resolve engineering device owners"
 
 **Interfaces:**
 - Consumes: `ResolvedEngineeringInventory` and `EngineeringRuntimeInventory`.
-- Produces: `CapabilityState`, `ExposureStatus`, `EngineeringCapability`, `EngineeringInventoryRow`, `select_runtime_probe_candidates(resolved)`, `resolve_engineering_capabilities(resolved, runtime)`, `EngineeringEntitySpec`, and `build_engineering_entity_specs(rows, runtime | None)`.
+- Produces: `CapabilityState`, `ExposureStatus`, `EngineeringCapability`, `SafeRuntimeBindingDescriptor`, `EngineeringInventoryRow`, `select_runtime_probe_candidates(resolved)`, `resolve_engineering_capabilities(resolved, runtime)`, `EngineeringEntitySpec`, and `build_engineering_entity_specs(rows, runtime | None)`.
 - Guarantees: readable does not imply writable; sensitive and arbitrary text channels never become entity specs; outputs remain inventory-only.
 
 - [ ] **Step 1: Write failing capability and entity-policy tests**
@@ -791,6 +816,37 @@ def test_numeric_prefix_with_unknown_suffix_is_text_not_a_unit():
     binding = binding_from_response("ai1", "12.4 private-label")
     assert binding.value_kind == "text"
     assert binding.numeric_value is None
+
+
+def test_explicit_runtime_state_uuid_may_differ_from_engineering_uuid():
+    binding = numeric_binding("engineering-ai1", 2.4)
+    binding = replace(binding, state_uuid="event-state-ai1")
+    row = resolve_capability(
+        resolved_node("engineering-ai1", "VoltageIn"), binding
+    )
+    spec = build_engineering_entity_specs((row,), EngineeringRuntimeInventory((binding,)))[0]
+    assert spec.unique_id == "engineering-ai1"
+    assert spec.state_uuid == "event-state-ai1"
+
+
+def test_scalar_response_without_explicit_state_mapping_is_rebind_only():
+    binding = replace(numeric_binding("ai1", 2.4), state_uuid=None)
+    row = resolve_capability(resolved_node("ai1", "VoltageIn"), binding)
+    assert row.binding.event_binding_proven is False
+    assert row.capability.exposure is ExposureStatus.INVENTORY_ONLY
+    assert row.capability.reason == "readable_rebind_only"
+
+
+def test_status_boolean_and_unknown_channel_are_explicitly_classified():
+    online = resolve_capability(
+        resolved_node("online", "Online"),
+        replace(numeric_binding("online", 1.0, "Online"), state_uuid="online-state"),
+    )
+    unknown = resolve_capability(resolved_node("unknown", "FutureChannel"), None)
+    assert online.platform == "binary_sensor"
+    assert online.exposure is ExposureStatus.PREPARED_DISABLED
+    assert unknown.state in {CapabilityState.CONFIGURED_ONLY, CapabilityState.UNSUPPORTED}
+    assert unknown.exposure is ExposureStatus.INVENTORY_ONLY
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm the capability API is missing**
@@ -831,9 +887,19 @@ class EngineeringCapability:
 class EngineeringInventoryRow:
     node: ResolvedEngineeringNode
     capability: EngineeringCapability
+    binding: SafeRuntimeBindingDescriptor | None
+
+
+@dataclass(frozen=True, slots=True)
+class SafeRuntimeBindingDescriptor:
+    binding_method: str
+    value_kind: Literal["number", "boolean"]
+    safe_unit: str | None
+    state_uuid: str | None
+    event_binding_proven: bool
 ```
 
-Use exact type sets for WeatherData, SysVar, DigitalIn, VoltageIn, Online/status, Actor/relay outputs, and analog outputs. Treat a bound finite numeric value as readable, a missing binding as configured-only, a non-numeric arbitrary text response as suppressed, and an unknown typed channel as unsupported. `select_runtime_probe_candidates()` must use these same exact type sets, ignore the legacy `suggested_platform` hint, and omit sensitive descendants before an endpoint is constructed. Define `SENSITIVE_TYPES` for access-code, NFC-tag, credential, user, and permission child records without marking the physical `TreeDevice` container sensitive. Do not define a writable whitelist in this change. Keep authentication and transport failures distinct from an ordinary unbound value so they cannot downgrade the stored last-good capability.
+Use exact type sets for WeatherData, SysVar, DigitalIn, VoltageIn, Online/status, Actor/relay outputs, and analog outputs. Treat a bound finite numeric value as readable, a missing binding as configured-only, a non-numeric arbitrary text response as suppressed, and an unknown typed channel as unsupported. `select_runtime_probe_candidates()` must use these same exact type sets, ignore the legacy `suggested_platform` hint, and omit sensitive descendants before an endpoint is constructed. Define `SENSITIVE_TYPES` for access-code, NFC-tag, credential, user, and permission child records without marking the physical `TreeDevice` container sensitive. Do not define a writable whitelist in this change. Keep authentication and transport failures distinct from an ordinary unbound value so they cannot downgrade the stored last-good capability. Extend runtime bindings with `state_uuid: str | None`; set it only from an explicit matching `uN`/child UUID in `/all` or a proven LoxAPP3 mapping. A scalar `/state` result alone creates a `SafeRuntimeBindingDescriptor(event_binding_proven=False)` and remains inventory-only with `readable_rebind_only`; never copy `engineering_uuid` into `state_uuid` by assumption.
 
 Replace permissive unit parsing with an explicit map of safe engineering units
 to Home Assistant units. Accept a bare finite number or a finite number followed
@@ -866,7 +932,7 @@ class EngineeringEntitySpec:
     enabled_by_default: bool = False
 ```
 
-`build_engineering_entity_specs()` must emit only `PREPARED_DISABLED` rows with stable engineering UUIDs and a proven `state_uuid`. When runtime is `None` during cache restore, emit the remembered safe spec with `available=False`, `native_value=None`, and no runtime endpoint. `owner_name` and `owner_model` are presentation data for registry planning only; the platform entity will later put only `owner_identifier` in `DeviceInfo`. Keep a compatibility wrapper for the previous sensor-only builder until all callers move to this model. Keep `normalize_engineering_unit()` as the explicit safe-unit map and delete `_nearest_device()` only after its callers move to the resolver.
+`build_engineering_entity_specs()` must emit only `PREPARED_DISABLED` rows with stable engineering UUIDs and a proven non-empty event `state_uuid`. When runtime is `None` during cache restore, emit the remembered safe spec with `available=False`, `native_value=None`, and no runtime endpoint. A rebind-only scalar row remains visible in inventory but does not become a prepared entity. `owner_name` and `owner_model` are presentation data for registry planning only; the platform entity will later put only `owner_identifier` in `DeviceInfo`. Keep a compatibility wrapper for the previous sensor-only builder until all callers move to this model. Keep `normalize_engineering_unit()` as the explicit safe-unit map and delete `_nearest_device()` only after its callers move to the resolver.
 
 - [ ] **Step 5: Run capability, runtime, and entity tests**
 
@@ -892,7 +958,7 @@ git commit -m "feat: classify engineering capabilities"
 
 **Interfaces:**
 - Consumes: `ResolvedEngineeringInventory` and `EngineeringInventoryRow`.
-- Produces: `EngineeringSnapshot`, `StoredEngineeringState`, `EngineeringNodeChange`, `EngineeringChangeSet`, `async_load_engineering_state(hass, entry_id)`, `async_store_engineering_state(hass, state)`, `snapshot_to_dict(snapshot)`, `snapshot_from_dict(data)`, and `diff_engineering_snapshots(previous, current)`.
+- Produces: `EngineeringSnapshot`, `StoredEngineeringState`, `EngineeringNodeChange`, `EngineeringChangeSet`, `EngineeringEntityImpact`, `EngineeringImpactPlan`, `async_load_engineering_state(hass, entry_id)`, `async_store_engineering_state(hass, state)`, `snapshot_to_dict(snapshot)`, `snapshot_from_dict(data)`, and `diff_engineering_snapshots(previous, current)`.
 - Storage key: `loxone.engineering_snapshot.<entry_id>`, version `2`, `private=True`; the loader migrates the previous private snapshot shape without publishing it.
 
 - [ ] **Step 1: Write failing round-trip, rejection, and UUID-diff tests**
@@ -926,7 +992,12 @@ def make_snapshot(
         source=context,
         nodes=resolved.nodes,
         rows=rows,
-        generation_id=engineering_generation_id(context),
+        configuration_revision_id=engineering_configuration_revision_id(context),
+        safe_content_digest=engineering_safe_content_digest(context, resolved.nodes, rows),
+        read_sequence=1,
+        generation_id=engineering_generation_id(
+            context, resolved.nodes, rows, read_sequence=1
+        ),
         captured_at=datetime(2026, 9, 13, 12, tzinfo=UTC),
     )
 ```
@@ -1038,6 +1109,9 @@ class EngineeringSnapshot:
     source: EngineeringSourceContext
     nodes: tuple[ResolvedEngineeringNode, ...]
     rows: tuple[EngineeringInventoryRow, ...]
+    configuration_revision_id: str
+    safe_content_digest: str
+    read_sequence: int
     generation_id: str
     captured_at: datetime
 
@@ -1046,6 +1120,8 @@ class EngineeringSnapshot:
 class StoredEngineeringState:
     snapshot: EngineeringSnapshot | None
     registry_applied_generation: str | None = None
+    pending_impact_plan: EngineeringImpactPlan | None = None
+    impact_published_generation: str | None = None
     managed_area_ids: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -1053,7 +1129,7 @@ class EngineeringSnapshotError(ValueError):
     """Raised when a candidate or stored snapshot is unsafe or incomplete."""
 ```
 
-Compute `generation_id` deterministically from the source provider identity and normalized scalar configuration revision; timestamps must not affect it. Serialize only the safe reconstruction fields named in binding ruling 6: opaque node key and parent key, technical type, UUID, safe name and room, node kind, owner/via identifiers, bus kind, sanitized topology path, resolution/capability/exposure reasons, semantic platform, safe unit, `io_name`, stable `state_uuid`, and binding method. Persist the committed snapshot, registry-applied token, and integration-managed area IDs in one versioned private envelope. Do not serialize `parent_uuid` when `parent_key` is sufficient, raw XML attributes, category values, runtime values, endpoint URLs, arbitrary error strings, credentials, host data, or Miniserver/provider/project/user/location titles. `snapshot_from_dict()` must validate enum values, list/string shapes, source entry ID, serial scope, duplicate stable UUIDs, opaque-key uniqueness, parent cycles, allowed units, finite-safe metadata, and completeness before returning an immutable snapshot.
+Compute `configuration_revision_id` from provider identity plus normalized scalar `lastModified`, falling back to archive configuration version and configuration timestamp when the scalar is missing; capture/download time must not affect it. Compute `safe_content_digest` from canonical serialization of the sanitized topology/capability/binding fields. Allocate `read_sequence = previous.read_sequence + 1` only when a new complete download is committed. `generation_id` combines provider scope, configuration revision, content digest, and read sequence; replay retains it while a later forced complete read receives a new sequence even if revision/content are unchanged. Serialize only the safe reconstruction fields named in binding ruling 6: opaque node key and parent key, technical type, UUID, safe name and room, node kind, owner/via identifiers, bus kind, sanitized topology path, resolution/capability/exposure reasons, semantic platform, safe unit, `io_name`, optional proven `state_uuid`, event-binding proof flag, and binding method. Persist the committed snapshot, registry-applied token, sanitized pending impact plan, impact-published token, and integration-managed area IDs in one versioned private envelope. Do not serialize `parent_uuid` when `parent_key` is sufficient, raw XML attributes, category values, runtime values, endpoint URLs, arbitrary error strings, credentials, host data, or Miniserver/provider/project/user/location titles. `snapshot_from_dict()` must validate enum values, list/string shapes, source entry ID, serial scope, duplicate stable UUIDs, opaque-key uniqueness, parent cycles, allowed units, finite-safe metadata, monotonic sequence shape, digest/token consistency, and completeness before returning an immutable snapshot.
 
 - [ ] **Step 4: Implement source-scoped UUID diffing**
 
@@ -1082,6 +1158,20 @@ class EngineeringChangeSet:
     @property
     def is_empty(self) -> bool:
         return not any(astuple(self))
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringEntityImpact:
+    unique_id: str
+    entity_ids: tuple[str, ...]
+    change_kind: Literal["removed", "platform_changed"]
+    references: Mapping[str, tuple[str, ...]]
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringImpactPlan:
+    generation_id: str
+    impacts: tuple[EngineeringEntityImpact, ...]
 ```
 
 Compare only nodes with a stable engineering UUID and include the source provider in each lookup key. A name, room, owner/via identifier, or semantic-platform change must never be represented as remove-plus-add. Each change contains enough previous and candidate metadata for Task 8 to discover impacts before any Home Assistant registry mutation. `semantic_platform` records the resolver's meaning independently from whether an entity was suppressed by a cross-entry collision, so collision/load order cannot manufacture a false platform change.
@@ -1307,7 +1397,7 @@ For each entity spec, use global `async_get_entity_id(platform, DOMAIN, engineer
 
 - [ ] **Step 5: Change stale metadata consumers to use scoped identifiers**
 
-Store registry metadata through the Task 4 private `StoredEngineeringState` envelope. After a plan is fully applied, persist its `managed_area_ids` and `applied_generation`. In `async_run_registry_maintenance()`, merge `metadata.active_device_identifiers` into the public LoxAPP3 identifiers, merge `metadata.room_names` into current rooms, and leave observation counters unchanged on absent, incomplete, pending, or already-observed engineering generations. Preserve the existing default-off cleanup option and all three grace modes.
+Store registry metadata through the Task 4 private `StoredEngineeringState` envelope. After a plan is fully applied, persist its `managed_area_ids` and `applied_generation`. In `async_run_registry_maintenance()`, merge `metadata.active_device_identifiers` into the public LoxAPP3 identifiers and `metadata.room_names` into current rooms. Its own maintenance store writes the last counted engineering generation atomically with updated missing counters before any optional idempotent deletion attempt. An absent, incomplete, pending, or already-counted generation never increments observations; an already-counted complete snapshot may still run a read-only elapsed-time eligibility audit so time and combined grace modes can mature. Preserve the existing default-off cleanup option and all three grace modes. Add tests for same-generation time passage, repeated audit, failure around the counter-store write, replay after the store write, and default-off cleanup.
 
 - [ ] **Step 6: Run registry and maintenance tests**
 
@@ -1334,7 +1424,7 @@ git commit -m "feat: register engineering device topology"
 **Interfaces:**
 - Consumes: `build_engineering_entity_specs(snapshot.rows, runtime)` and the config-entry-scoped `engineering_inventory_updated_signal(entry_id)`.
 - Produces: `filter_existing_loxapp_entities(specs, existing_uuids)`, updated `LoxoneEngineeringSensor`, and new `LoxoneEngineeringBinarySensor`, both preserving `unique_id == engineering UUID`, attaching to `(DOMAIN, owner_identifier)`, and subscribing to verified `state_uuid` events.
-- Guarantees: existing LoxAPP3 entities and cross-entry registry owners win UUID deduplication; cached entities start unavailable but can rebind without an FTPS refresh; removed prepared entities become unavailable rather than being deleted immediately.
+- Guarantees: existing LoxAPP3 entities and cross-entry registry owners win UUID deduplication; cached entities start unavailable but can rebind without an FTPS refresh; events are source-scoped; removed prepared entities become unavailable rather than being deleted immediately.
 
 - [ ] **Step 1: Write failing platform tests**
 
@@ -1421,6 +1511,20 @@ async def test_non_finite_or_text_events_do_not_replace_last_good_value(entity_p
     entity_platform.fire_loxone_event("weather-value", "18.5 private-label")
 
     assert entity.native_value == 18.5
+
+
+async def test_same_state_uuid_from_other_config_entry_is_ignored(entity_platform):
+    entity = entity_platform.add(entity_spec(value=18.5, available=True))
+    entity_platform.fire_engineering_event("entry-b", "weather-value", 21.0)
+    entity_platform.fire_engineering_event("entry-a", "weather-value", 19.0)
+    assert entity.native_value == 19.0
+
+
+async def test_entity_ownership_is_rechecked_immediately_before_add(entity_platform):
+    entity_platform.plan_specs(entity_spec(unique_id="raced-uuid"))
+    entity_platform.persist_other_entry_owner("sensor", "raced-uuid")
+    await entity_platform.add_planned_specs()
+    assert "raced-uuid" not in entity_platform.entities
 ```
 
 - [ ] **Step 2: Run platform tests and confirm binary engineering support is absent**
@@ -1474,13 +1578,19 @@ class LoxoneEngineeringBinarySensor(BinarySensorEntity):
             self.async_write_ha_state()
 ```
 
-Both engineering entity classes subscribe through the integration's ordinary
-Loxone websocket/event path using `spec.state_uuid`. A bounded reconnect rebind
+Both engineering entity classes subscribe through a new internal dispatcher
+path keyed by `(config_entry_id, spec.state_uuid)`. The existing public
+`loxone_event` bus event remains unchanged for compatibility, but the websocket
+callback also forwards the value through the scoped internal path. A bounded reconnect rebind
 reads the currently known value without an engineering download. Accept only
 finite values already classified for the platform (`0/1` for binary sensors;
 finite number with the stored allowlisted unit for sensors). Transport or auth
 failure marks the binding unavailable while retaining the cached topology and
 last safe value. Unsubscribe callbacks are registered with the entity lifecycle.
+Immediately before `async_add_entities()` and before any reassociation, repeat
+Task 5's global entity-registry ownership check to close the planning/setup race.
+Test two config entries with the same state UUID, including a source whose entity
+was suppressed by the collision rule; its event must not affect the owner.
 
 - [ ] **Step 5: Run platform and existing sensor tests**
 
@@ -1501,12 +1611,14 @@ git commit -m "feat: expose resolved read-only channels"
 - Modify: `custom_components/loxone/coordinator.py:32-141`
 - Modify: `custom_components/loxone/__init__.py:288-430`
 - Modify: `custom_components/loxone/button.py:59-110`
+- Modify: `custom_components/loxone/config_impact.py:22-216`
 - Test: `tests/test_engineering_coordinator.py`
 - Test: `tests/test_engineering_snapshot.py`
+- Test: `tests/test_engineering_impacts.py`
 
 **Interfaces:**
 - Consumes: private stored state, topology resolver, capability resolver, mutation-free registry planning, idempotent registry application, runtime probe/rebind, and LoxAPP3 `lastModified`.
-- Produces: `extract_loxapp_last_modified(lox_config)`, `LoxoneCoordinator._async_download_engineering_inventory()`, `async_restore_engineering_snapshot()`, `async_schedule_engineering_refresh()`, `async_refresh_engineering_inventory(force=False)`, `async_rebind_engineering_runtime()`, and committed/applied generation state.
+- Produces: `extract_loxapp_last_modified(lox_config)`, `LoxoneCoordinator._async_download_engineering_inventory()`, `async_restore_engineering_snapshot()`, `async_schedule_engineering_refresh()`, `async_refresh_engineering_inventory(force=False)`, `async_rebind_engineering_runtime()`, `async_drain_committed_engineering_state(startup=False)`, mutation-free `async_find_engineering_change_impacts(...)`, the minimal real idempotent `async_publish_engineering_impact_plan(...)`, and committed/applied/published generation state.
 - Guarantees: unchanged revisions do not download FTPS but do rebind cached channels; changed revisions queue one debounced refresh; manual refresh bypasses comparison; pre-commit failure leaves old state untouched; post-commit registry failure retains a replayable pending generation and publishes no signals, impacts, or stale observation.
 
 - [ ] **Step 1: Write failing restore, debounce, unchanged, manual, and failure tests**
@@ -1610,6 +1722,67 @@ async def test_partial_registry_failure_is_committed_pending_and_replayed(
     await coordinator.async_restore_engineering_snapshot()
     assert stores.state.registry_applied_generation == pending
     assert coordinator.published_generations == [pending]
+
+
+async def test_cold_restart_finishes_post_apply_publication(coordinator_factory, stores):
+    first = coordinator_factory()
+    first.fail_after_applied_token = True
+    with pytest.raises(RuntimeError):
+        await first.async_refresh_engineering_inventory(force=True)
+
+    generation = stores.state.snapshot.generation_id
+    assert stores.state.registry_applied_generation == generation
+    assert stores.state.impact_published_generation != generation
+    assert stores.state.pending_impact_plan.generation_id == generation
+
+    restarted = coordinator_factory()
+    await restarted.async_restore_engineering_snapshot()
+    assert stores.state.impact_published_generation == generation
+    assert restarted.notifications_were_replayed_once is True
+
+
+async def test_cold_restart_reconciles_even_when_applied_cursor_matches(
+    coordinator_factory, stores, registries
+):
+    committed = stores.complete_applied_state()
+    registries.restore_older_persisted_registry()
+    registries.notifications.clear()
+
+    restarted = coordinator_factory()
+    await restarted.async_restore_engineering_snapshot()
+
+    assert registries.matches(committed.snapshot)
+    assert registries.notification_matches(committed.pending_impact_plan)
+
+
+async def test_pending_generation_must_drain_before_fast_path_or_replacement(
+    coordinator, stores
+):
+    stores.state = stores.pending_registry_state()
+    coordinator.fail_drain = True
+    coordinator._async_download_engineering_inventory = AsyncMock()
+
+    with pytest.raises(RuntimeError):
+        await coordinator.async_refresh_engineering_inventory(force=True)
+
+    coordinator._async_download_engineering_inventory.assert_not_awaited()
+    assert stores.state.snapshot.generation_id == stores.pending_generation
+
+
+async def test_forced_same_revision_allocates_new_observation_but_retry_does_not(
+    coordinator, stores
+):
+    await coordinator.async_refresh_engineering_inventory(force=True)
+    first = stores.state.snapshot
+    await coordinator.async_refresh_engineering_inventory(force=True)
+    second = stores.state.snapshot
+    assert second.configuration_revision_id == first.configuration_revision_id
+    assert second.read_sequence == first.read_sequence + 1
+    assert second.generation_id != first.generation_id
+
+    await coordinator.async_restore_engineering_snapshot()
+    assert stores.state.snapshot.generation_id == second.generation_id
+    assert coordinator.stale_observations.count(second.generation_id) == 1
 ```
 
 - [ ] **Step 2: Run coordinator tests and confirm automatic orchestration is absent**
@@ -1622,30 +1795,39 @@ Expected: tests fail on missing restore/scheduling/snapshot behavior.
 
 `async_refresh_engineering_inventory(force=False)` must execute in this order:
 
-1. Read and normalize current LoxAPP3 `lastModified`.
-2. When `force` is false and the revision equals the stored revision, perform
+1. Acquire the per-entry refresh lock and call
+   `async_drain_committed_engineering_state()`. This completes pending registry,
+   impact-publication, and maintenance phases. If it fails, keep that single
+   pending envelope and stop without reading or committing a new candidate.
+2. Read and normalize current LoxAPP3 `lastModified`.
+3. When `force` is false and the revision equals the stored revision, perform
    only `async_rebind_engineering_runtime()` and return without FTPS.
-3. Download and parse into local candidate values without replacing coordinator
+4. Download and parse into local candidate values without replacing coordinator
    fields.
-4. Reject an incomplete candidate, duplicate UUIDs, unsafe snapshot fields, or
+5. Reject an incomplete candidate, duplicate UUIDs, unsafe snapshot fields, or
    a failed auth/transport probe without mutating old state.
-5. Select safe probe candidates by technical capability, run bounded GET-only
+6. Select safe probe candidates by technical capability, run bounded GET-only
    probes, and build source, topology, capability rows, and entity specs.
-6. Build a deterministic candidate snapshot and registry plan. Compute its diff
-   and consumer impacts against the previous snapshot and pre-mutation Home
+7. Build a candidate snapshot with the next persisted read sequence and a
+   deterministic safe-content digest, plus a registry plan. Compute its diff
+   and consumer impacts through `async_find_engineering_change_impacts()`
+   against the previous snapshot and pre-mutation Home
    Assistant registry. This entire candidate phase is mutation-free.
-7. Persist the validated candidate as the committed last-known-good generation.
+8. Persist the validated candidate, sanitized `EngineeringImpactPlan`, and
+   pending registry/impact cursors together as the committed last-known-good generation.
    A failure here leaves old memory and registries untouched.
-8. Swap coordinator memory to the committed generation, then apply the registry
+9. Swap coordinator memory to the committed generation, then apply the registry
    plan idempotently. If application fails or is cancelled, retain the committed
    generation with an older `registry_applied_generation`, create one bounded
    degraded-state notification, and stop without dispatcher signals, impact
    publication/dismissal, or stale observation.
-9. After full registry success, persist the matching applied token and managed
+10. After full registry success, persist the matching applied token and managed
    area metadata. If this token write fails, treat the generation as pending and
    replay safely; do not publish it yet.
-10. Send the config-entry-scoped entity signal, publish/dismiss precomputed
-    warnings, and submit the generation token to stale maintenance exactly once.
+11. Send the config-entry-scoped entity signal, publish/dismiss the persisted
+    impact plan idempotently, save its publication cursor, and submit the
+    generation token to stale maintenance exactly once. A crash between any two
+    phases is completed from the stored cursors on cold restart.
 
 Do not put passwords, hosts, URLs, arbitrary exception messages, or downloaded XML into notification text. Use a fixed notification ID per config entry so repeat failures replace one notification rather than accumulating.
 
@@ -1659,7 +1841,7 @@ self._engineering_refresh_task: asyncio.Task[None] | None = None
 self._engineering_refresh_lock = asyncio.Lock()
 ```
 
-`async_restore_engineering_snapshot()` loads the config-entry store, validates that its source entry ID and provider identifier match the connected Miniserver, swaps in cached unavailable entity specs, and replays registry application whenever `registry_applied_generation != snapshot.generation_id`. It publishes the restored generation only after replay succeeds. It then performs a bounded runtime rebind regardless of whether the LoxAPP3 revision changed. `async_schedule_engineering_refresh(delay=5.0)` cancels only the coordinator's previous pending debounce task and schedules one background refresh. `async_cleanup()` cancels and awaits that task before closing the API. Cancellation at each await boundary follows the same pre-commit/post-commit recovery rule and is covered by fault-injection tests.
+`async_restore_engineering_snapshot()` loads the config-entry store, validates that its source entry ID and provider identifier match the connected Miniserver, swaps in cached unavailable entity specs, and calls `async_drain_committed_engineering_state(startup=True)`. Startup mode always rebuilds a fresh plan and reconciles desired topology against the loaded Home Assistant registries even when the applied cursor matches, because HA registry writes are delayed. It also recreates a still-applicable fixed-ID notification from the stored plan even when the publication cursor matches; a user dismissal therefore lasts for the current process but not across restart while the problem remains. No private registry storage method is called. The drain then consults maintenance state and completes any lagging observation. Only after this succeeds may entities be signaled and runtime rebound. `async_schedule_engineering_refresh(delay=5.0)` cancels only the coordinator's previous pending debounce task and schedules one background refresh. `async_cleanup()` cancels and awaits that task before closing the API. Cancellation at each await boundary follows the same pre-commit/post-commit recovery rule and is covered by true cold-restart fault-injection tests at candidate save, partial registry mutation, applied-token save, impact publication, and stale-observation save. Cold-restart fakes retain the integration store while restoring an older HA registry and empty notification dictionary.
 
 - [ ] **Step 5: Wire startup/reload and manual refresh**
 
@@ -1674,7 +1856,7 @@ Expected: all selected tests pass; unchanged auto checks make zero download call
 - [ ] **Step 7: Commit automatic refresh orchestration**
 
 ```powershell
-git add custom_components/loxone/coordinator.py custom_components/loxone/__init__.py custom_components/loxone/button.py tests/test_engineering_coordinator.py tests/test_engineering_snapshot.py
+git add custom_components/loxone/coordinator.py custom_components/loxone/__init__.py custom_components/loxone/button.py custom_components/loxone/config_impact.py tests/test_engineering_coordinator.py tests/test_engineering_snapshot.py tests/test_engineering_impacts.py
 git commit -m "feat: refresh engineering inventory safely"
 ```
 
@@ -1690,8 +1872,8 @@ git commit -m "feat: refresh engineering inventory safely"
 - Test: `tests/test_registry_maintenance.py`
 
 **Interfaces:**
-- Consumes: the previous and candidate snapshots, `EngineeringChangeSet`, pre-mutation entity/device registries, Home Assistant Searcher, and a successfully applied generation token.
-- Produces: `EngineeringEntityImpact`, immutable `EngineeringImpactPlan`, `async_find_engineering_change_impacts()`, `async_publish_engineering_impact_plan()`, exactly-once stale observation, and a diagnostics-safe `engineering_inventory` tree/table payload.
+- Consumes: Task 7's persisted immutable `EngineeringImpactPlan`, a successfully applied generation token, maintenance state, and `EngineeringSnapshot`.
+- Produces: richer presentation/coverage around Task 7's real idempotent publisher, exactly-once counter advancement plus same-token elapsed-time audit, and a diagnostics-safe `engineering_inventory` tree/table payload.
 - Guarantees: impact discovery precedes registry mutation; publication follows successful registry application; affected automations/scripts/scenes/groups are reported but never modified; removed nodes enter existing grace handling once per generation; sensitive rows are omitted from public diagnostics.
 
 - [ ] **Step 1: Write failing warning and diagnostics tests**
@@ -1755,20 +1937,17 @@ Run: `.\.venv\Scripts\python.exe -m pytest tests\test_engineering_impacts.py tes
 
 Expected: tests fail because engineering change impacts and sanitized snapshot diagnostics are not wired.
 
-- [ ] **Step 3: Extend impact analysis without changing consumers**
+- [ ] **Step 3: Complete idempotent impact publication without changing consumers**
 
-Define:
-
-```python
-@dataclass(frozen=True, slots=True)
-class EngineeringEntityImpact:
-    unique_id: str
-    entity_ids: tuple[str, ...]
-    change_kind: Literal["removed", "platform_changed"]
-    references: Mapping[ItemType, tuple[str, ...]]
-```
-
-`async_find_engineering_change_impacts()` accepts both snapshots and reads the current registry without mutation. Look up affected entity registry entries by unchanged engineering unique ID and use `Searcher` for the existing relevant item types. Warn only for removed or incompatible semantic-platform changes with actual references. Names and room moves update presentation/areas but do not create an impact warning unless an existing area-targeted consumer is detected by the current area-impact code. Return an immutable plan containing only sanitized entity IDs, consumer IDs, change kinds, and the candidate generation. `async_publish_engineering_impact_plan()` uses one config-entry-scoped fixed notification ID and dismisses it only when that exact generation has applied successfully with no impacts.
+Task 7 already implements mutation-free discovery, persists its sanitized
+`EngineeringImpactPlan` before registry mutation, and implements the minimal
+real publisher. In this task, extend its presentation and integration coverage:
+the publisher uses one config-entry-scoped fixed notification ID and dismisses
+it only when that exact generation has applied successfully with no impacts.
+Replaying the same plan after a crash is harmless.
+Names and room moves do not warn unless the persisted plan recorded an existing
+area-targeted consumer from the pre-mutation registry/Searcher state. No Home
+Assistant consumer configuration or service is modified.
 
 - [ ] **Step 4: Replace raw diagnostics with the sanitized tree/table model**
 
@@ -1797,7 +1976,7 @@ Each row contains the exact inventory columns from the spec and no raw `attribut
 
 - [ ] **Step 5: Verify stale observations advance only after a successful complete refresh**
 
-Add a test that invokes the coordinator failure path followed by `async_run_registry_maintenance()` and asserts `missing_observations` is unchanged. Add a successful-removal test asserting the observation increments once and respects observation/time/combined mode exactly as configured. Pass a deterministic `observation_token=snapshot.generation_id`; persist the last processed engineering token and make a second call with the same token a no-op. Runtime-only rebinds, startup replay of an already applied generation, and repeated forced downloads of the same revision must not advance the counter.
+Add a test that invokes the coordinator failure path followed by `async_run_registry_maintenance()` and asserts `missing_observations` is unchanged. Add a successful-removal test asserting the observation increments once and respects observation/time/combined mode exactly as configured. Pass `observation_token=snapshot.generation_id`; persist the last counted token and counters together before optional deletion. Replay of the identical committed token never increments, but may reevaluate elapsed-time eligibility. A later successful forced complete read has a new read sequence and increments once even if the Loxone revision is unchanged. Runtime-only rebinds, failed candidates, and retry of the same committed generation do not advance the counter. Test default-off cleanup, same-token time passage, and idempotent recovery around the maintenance-store write.
 
 - [ ] **Step 6: Run impacts, diagnostics, and maintenance tests**
 

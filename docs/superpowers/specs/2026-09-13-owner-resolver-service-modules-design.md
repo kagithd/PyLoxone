@@ -85,7 +85,7 @@ For each channel or device, the owner resolver returns an immutable resolution w
 
 Resolution follows these rules in order:
 
-1. Walk the UUID parent chain and select the nearest recognized physical device or service module.
+1. Walk the complete opaque `parent_key` chain and select the nearest recognized physical device or service module. `parent_uuid` is retained only for compatibility.
 2. Preserve recognized bus and bridge nodes in the transport path.
 3. Skip structural captions as owners, but retain useful branch labels such as `Tree Ast` in the diagnostic path.
 4. Assign document-level provider services to the source Miniserver from the source context.
@@ -158,6 +158,15 @@ must be finite. Units are exposed only when empty or in the integration's
 explicit safe-unit map; a numeric prefix followed by arbitrary text is treated
 as text and is suppressed.
 
+A safe runtime binding records the engineering UUID, value semantics, binding
+method, allowlisted unit, and an optional event `state_uuid`. The event UUID is
+present only when the runtime response supplies an explicit UUID for the exact
+selected numeric/boolean state, or when the existing LoxAPP3 structure proves
+the mapping. A scalar `/state` response does not prove that the engineering UUID
+is also the websocket UUID. Without proof, the channel may remain readable in
+inventory and participate in bounded read-only rebind, but no event-driven
+entity binding is fabricated.
+
 Initial exposure policy:
 
 - WeatherData and SysVar values: readable sensors when their runtime binding succeeds
@@ -203,6 +212,9 @@ Entities attach to the resolved owner device. Moving an entity from an old pseud
 Entity `DeviceInfo` contains only the resolved owner identifier. Device name,
 room, and `via_device_id` are synchronized centrally in two registry passes so
 platform setup cannot overwrite a newer topology with stale channel metadata.
+The global entity ownership check is repeated immediately before entity
+registration or reassociation so a race between planning and platform setup
+cannot steal an identity.
 
 New engineering entities start disabled unless the exposure policy explicitly marks a read-only diagnostic/input class safe and useful by default. Writable engineering entities are never enabled automatically.
 
@@ -231,7 +243,7 @@ An explicit refresh button remains available. The integration also evaluates an 
 Download, parse, resolve, candidate selection, runtime probe, capability
 resolution, validation, diffing, and impact discovery form a pure candidate
 phase. A validated candidate snapshot is then committed to the private store as
-the new last-known-good data generation. Device and entity registry application
+the new last-known-good application generation. Device and entity registry application
 is a separate idempotent post-commit phase. If registry application fails after
 partial Home Assistant mutations, the committed generation is retained, no
 entity refresh signal or stale observation is published, and a bounded
@@ -239,10 +251,43 @@ degraded-state notification schedules/requires replay. Startup replays any
 committed generation whose registry-applied token is older. This does not claim
 transactional rollback for Home Assistant registry calls.
 
-Prepared read-only entities subscribe to ordinary Loxone websocket events by
-their proven stable state UUID. Runtime events update finite numeric/boolean
-values only; unverified text or units never become state. Reconnect always
-rebinds cached channels even when topology is unchanged.
+The private state also stores the sanitized pre-mutation pending impact plan and
+separate cursors for registry application, impact publication, and stale
+observation. A restart completes each lagging phase in order. The fixed
+notification identity makes impact publication idempotent. The candidate commit
+allocates a monotonically increasing read sequence and includes it in the
+application generation, so a new forced complete read of the same Loxone
+revision is a new observation while replay of the same committed read is not.
+The separate configuration revision key uses scalar `lastModified`, or falls
+back to archive configuration version and configuration timestamp when absent;
+capture/download time never participates. A canonical safe-content digest
+detects a changed candidate even if the Miniserver reports the same revision.
+
+Integration cursors describe recovery progress but do not prove that Home
+Assistant's delayed registry storage or in-memory persistent notifications
+survived a process restart. Every startup therefore reconciles the committed
+desired topology against the freshly loaded entry-scoped registries even when
+the applied cursor matches, and recreates any still-applicable warning from the
+sanitized impact plan. It does not call private Home Assistant storage methods.
+A user-dismissed engineering warning stays dismissed for the current process;
+if the problem is still applicable after a Home Assistant restart, it is
+recreated. Registry reconciliation preserves current user area overrides.
+
+Before an unchanged-revision fast path or a new full read can commit, the
+per-entry refresh lock drains all pending phases of the current committed
+generation. If draining fails, that generation and its plan remain authoritative
+and no newer candidate may overwrite them. Draining always consults maintenance
+state even when registry and impact cursors match, covering a crash between
+publication and the stale-observation store. The minimal real idempotent impact
+publisher belongs to refresh orchestration; diagnostics may enrich presentation
+later but never substitute a no-op publisher.
+
+Prepared read-only entities subscribe to an integration-internal,
+config-entry-scoped stream keyed by `(entry_id, state_uuid)`. The existing
+public Loxone event behavior remains compatible, but an event from one
+Miniserver cannot update an engineering entity owned by another. Runtime events
+update finite numeric/boolean values only; unverified text or units never become
+state. Reconnect always rebinds cached channels even when topology is unchanged.
 
 After a successful refresh, the integration computes a UUID-based diff:
 
@@ -259,12 +304,17 @@ the committed generation is applied successfully.
 
 Automatic deletion remains disabled by default. A failed, empty, or incomplete structure load never increments the missing-observation count.
 
-Every complete engineering snapshot has a deterministic generation token based
-on provider identity and configuration revision, not download time. Registry
-maintenance stores the last processed generation and advances grace counters at
-most once for that successful generation. Startup, runtime-only rebind, retry,
-or repeated manual refresh of the same configuration cannot double-count an
-observation.
+Every committed complete engineering read has a stable application/observation
+token consisting of provider scope, the normalized configuration revision,
+canonical safe-content digest, and its persisted read sequence. Registry
+maintenance stores the last counted token together with updated counters and
+advances grace counters at most once for that committed read. Startup,
+runtime-only rebind, or retry cannot double-count it; a later forced complete
+read is intentionally a new observation even when the Loxone revision is
+unchanged. Reprocessing an already-counted snapshot may still reevaluate elapsed
+time without increasing observations, so time and combined grace modes can
+mature. Automatic deletion remains opt-in, and deletion attempts are
+idempotently replayable after the maintenance state is saved.
 
 ## Error handling and safety boundaries
 
