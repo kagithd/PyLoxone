@@ -85,17 +85,30 @@ For each channel or device, the owner resolver returns an immutable resolution w
 
 Resolution follows these rules in order:
 
-1. Walk the complete opaque `parent_key` chain and select the nearest recognized physical device or service module. `parent_uuid` is retained only for compatibility.
+1. Walk the complete opaque `parent_key` chain and select the nearest recognized physical endpoint, physical bridge/extension, or service module. `parent_uuid` is retained only for compatibility.
 2. Preserve recognized bus and bridge nodes in the transport path.
 3. Skip structural captions as owners, but retain useful branch labels such as `Tree Ast` in the diagnostic path.
 4. Assign document-level provider services to the source Miniserver from the source context.
 5. Assign internal channels whose physical ancestor is `LoxLIVE` directly to the Miniserver.
 6. Leave a node unresolved when neither its type nor ancestry proves ownership. Report it in diagnostics instead of guessing.
 
+When selecting `via_device`, skip a recognized ancestor that cannot itself be
+registered (for example UUID-less intermediate hardware) and continue to the
+nearest valid upstream bus, bridge, endpoint, or Miniserver. If policy cannot
+prove such a safe path, leave the node unresolved rather than reporting a
+successful but truncated topology.
+
 Sensitivity is inherited through the complete `parent_key` chain, including
 UUID-less containers. A sensitive container and all of its descendants are
 sanitized before snapshot persistence or public projection. Opaque parser keys
 prevent sensitive titles from leaking through synthetic identity fields.
+Sensitive classification uses exact technical `Type` values and exact XML tag
+identities for tag-only containers; it never infers sensitivity from a title.
+If ancestry is missing, cyclic, or exceeds its bound, sensitivity cannot be
+proven absent, so the unresolved node fails closed with its name, room, I/O
+metadata, attributes, and topology path suppressed while retaining the bounded
+failure reason. Physical NFC reader hardware itself is not sensitive; its tag,
+code, user, permission, and credential descendants are.
 
 The expected synthetic reference topology is:
 
@@ -132,7 +145,8 @@ The module registry is type-driven. Titles are presentation only. Unknown module
 
 A UUID-less provider service may use
 `{provider}:service:{normalized_type}` only when that technical type is a
-singleton in the source project. Duplicate UUID-less modules of the same type
+singleton across all UUID-backed and UUID-less occurrences in the source
+project. Duplicate modules of the same type
 remain inventory-only with an ambiguity reason; titles are never used to
 disambiguate them.
 

@@ -623,7 +623,7 @@ def resolve_engineering_topology(
     return OwnerResolver().resolve(inventory, source)
 ```
 
-For each node, walk no more than 128 `parent_key` ancestors and retain only non-sensitive structural titles in `topology_path`. A physical endpoint selects the nearest registered bridge/bus as `via_device_identifier`. A channel selects the nearest physical device or service module as `device_identifier`; an internal channel beneath `LoxLIVE` selects the Miniserver identifier. A document-level service module uses the source Miniserver as its provider even when `LoxLIVE` is a sibling. WeatherData and SysVar nodes resolve to their typed WeatherServer/GlobalStates module. A singleton UUID-less provider service uses the typed fallback from ruling 3; duplicates remain unresolved. Missing parents use `missing_parent`; cycles use `parent_cycle`; exceeded depth uses `parent_depth_exceeded`. A physical node with an unknown parent must not receive a guessed `via_device_identifier`. Mark `sensitive=True` when the node or any ancestor is a sensitive technical container and clear its public name/path before it leaves the resolver boundary.
+For each node, walk no more than 128 `parent_key` ancestors and retain only non-sensitive structural titles in `topology_path`. A physical endpoint selects the nearest registrable bridge/bus as `via_device_identifier`; skip an UUID-less/unregistrable recognized ancestor and continue to the nearest valid upstream identifier rather than silently truncating the path. A channel selects the nearest physical endpoint, physical bridge/extension, or service module as `device_identifier`; only a genuinely internal channel beneath `LoxLIVE` selects the Miniserver identifier. A document-level service module uses the source Miniserver as its provider even when `LoxLIVE` is a sibling. WeatherData and SysVar nodes resolve to their typed WeatherServer/GlobalStates module. A singleton UUID-less provider service uses the typed fallback from ruling 3 only when its normalized type occurs exactly once across UUID-backed and UUID-less modules; conflicts and dependent channels remain unresolved with `ambiguous_uuidless_service`. Missing parents use `missing_parent`; cycles use `parent_cycle`; exceeded depth uses `parent_depth_exceeded`. A physical node with an unknown parent must not receive a guessed `via_device_identifier`. Mark `sensitive=True` when the node or any ancestor matches the centralized exact sensitive technical `Type`/XML-tag policy and clear its public name, room, I/O, category, raw attributes, and path before it leaves the resolver boundary. Physical NFC reader hardware is not sensitive, but its tag/code/user/permission/credential children are. Because missing, cyclic, or depth-truncated ancestry cannot prove the absence of a hidden sensitive ancestor, such unresolved rows fail closed with the same sanitization while retaining their explicit failure reason.
 
 - [ ] **Step 4: Run the topology tests and the existing engineering tests**
 
@@ -683,6 +683,7 @@ def numeric_binding(uuid: str, value: float, element_type: str = "VoltageIn") ->
         binding_method="uuid_state",
         value_kind="number",
         numeric_value=value,
+        state_uuid=f"{uuid}-state",
     )
 
 
@@ -821,9 +822,13 @@ def test_numeric_prefix_with_unknown_suffix_is_text_not_a_unit():
 def test_explicit_runtime_state_uuid_may_differ_from_engineering_uuid():
     binding = numeric_binding("engineering-ai1", 2.4)
     binding = replace(binding, state_uuid="event-state-ai1")
-    row = resolve_capability(
-        resolved_node("engineering-ai1", "VoltageIn"), binding
-    )
+    row = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(
+            source=source(),
+            nodes=(resolved_node("engineering-ai1", "VoltageIn"),),
+        ),
+        EngineeringRuntimeInventory((binding,)),
+    )[0]
     spec = build_engineering_entity_specs((row,), EngineeringRuntimeInventory((binding,)))[0]
     assert spec.unique_id == "engineering-ai1"
     assert spec.state_uuid == "event-state-ai1"
@@ -831,22 +836,44 @@ def test_explicit_runtime_state_uuid_may_differ_from_engineering_uuid():
 
 def test_scalar_response_without_explicit_state_mapping_is_rebind_only():
     binding = replace(numeric_binding("ai1", 2.4), state_uuid=None)
-    row = resolve_capability(resolved_node("ai1", "VoltageIn"), binding)
+    row = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(
+            source=source(), nodes=(resolved_node("ai1", "VoltageIn"),)
+        ),
+        EngineeringRuntimeInventory((binding,)),
+    )[0]
     assert row.binding.event_binding_proven is False
     assert row.capability.exposure is ExposureStatus.INVENTORY_ONLY
     assert row.capability.reason == "readable_rebind_only"
 
 
 def test_status_boolean_and_unknown_channel_are_explicitly_classified():
-    online = resolve_capability(
-        resolved_node("online", "Online"),
-        replace(numeric_binding("online", 1.0, "Online"), state_uuid="online-state"),
+    runtime = EngineeringRuntimeInventory(
+        (
+            replace(
+                numeric_binding("online", 1.0, "Online"),
+                state_uuid="online-state",
+            ),
+        )
     )
-    unknown = resolve_capability(resolved_node("unknown", "FutureChannel"), None)
-    assert online.platform == "binary_sensor"
-    assert online.exposure is ExposureStatus.PREPARED_DISABLED
-    assert unknown.state in {CapabilityState.CONFIGURED_ONLY, CapabilityState.UNSUPPORTED}
-    assert unknown.exposure is ExposureStatus.INVENTORY_ONLY
+    rows = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(
+            source=source(),
+            nodes=(
+                resolved_node("online", "Online"),
+                resolved_node("unknown", "FutureChannel"),
+            ),
+        ),
+        runtime,
+    )
+    online, unknown = rows
+    assert online.semantic_platform == "binary_sensor"
+    assert online.capability.exposure is ExposureStatus.PREPARED_DISABLED
+    assert unknown.capability.state in {
+        CapabilityState.CONFIGURED_ONLY,
+        CapabilityState.UNSUPPORTED,
+    }
+    assert unknown.capability.exposure is ExposureStatus.INVENTORY_ONLY
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm the capability API is missing**
@@ -887,6 +914,7 @@ class EngineeringCapability:
 class EngineeringInventoryRow:
     node: ResolvedEngineeringNode
     capability: EngineeringCapability
+    semantic_platform: Literal["sensor", "binary_sensor"] | None
     binding: SafeRuntimeBindingDescriptor | None
 
 
@@ -984,10 +1012,13 @@ def make_snapshot(
     raw = inventory or provider_inventory()
     context = replace(source(), loxapp_last_modified=last_modified)
     resolved = resolve_engineering_topology(raw, context)
-    rows = resolve_engineering_capabilities(
-        resolved,
-        runtime or EngineeringRuntimeInventory(bindings=()),
+    default_runtime = EngineeringRuntimeInventory(
+        bindings=(
+            numeric_binding("weather-value", 18.5, "WeatherData"),
+            numeric_binding("system-variable", 1.0, "SysVar"),
+        )
     )
+    rows = resolve_engineering_capabilities(resolved, runtime or default_runtime)
     return EngineeringSnapshot(
         source=context,
         nodes=resolved.nodes,
@@ -1025,7 +1056,11 @@ def test_snapshot_round_trip_contains_only_public_allowlisted_fields():
     assert snapshot_to_dict(restored) == encoded
     assert restored.source.title is None
     assert restored.generation_id == original.generation_id
-    assert any(row.state_uuid for row in restored.rows if row.capability.platform)
+    assert any(
+        row.binding and row.binding.state_uuid
+        for row in restored.rows
+        if row.semantic_platform
+    )
     rendered = json.dumps(encoded)
     for forbidden_key in (
         "attributes",
@@ -1418,6 +1453,8 @@ git commit -m "feat: register engineering device topology"
 - Modify: `custom_components/loxone/sensor.py:315-463`
 - Modify: `custom_components/loxone/binary_sensor.py:49-97`
 - Modify: `custom_components/loxone/engineering_entities.py`
+- Modify: `custom_components/loxone/__init__.py:460-470`
+- Modify: `custom_components/loxone/const.py`
 - Test: `tests/test_engineering_entities.py`
 - Test: `tests/test_engineering_platforms.py`
 
@@ -1601,7 +1638,7 @@ Expected: all selected tests pass and no writable method exists on engineering e
 - [ ] **Step 6: Commit read-only platform exposure**
 
 ```powershell
-git add custom_components/loxone/sensor.py custom_components/loxone/binary_sensor.py custom_components/loxone/engineering_entities.py tests/test_engineering_entities.py tests/test_engineering_platforms.py
+git add custom_components/loxone/sensor.py custom_components/loxone/binary_sensor.py custom_components/loxone/engineering_entities.py custom_components/loxone/__init__.py custom_components/loxone/const.py tests/test_engineering_entities.py tests/test_engineering_platforms.py
 git commit -m "feat: expose resolved read-only channels"
 ```
 
@@ -1636,12 +1673,19 @@ def test_last_modified_accepts_only_scalar_revision_values():
 
 
 async def test_restore_registers_cached_devices_before_network_refresh(coordinator, stores, registries):
-    stores.snapshot = make_snapshot()
+    stores.snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element("tree", "LoxTree", parent_uuid="ms", room=None),
+            element("nfc", "TreeDevice", parent_uuid="tree", title="NFC endpoint"),
+        )
+    )
+    coordinator.async_rebind_engineering_runtime = AsyncMock(return_value=None)
     await coordinator.async_restore_engineering_snapshot()
 
     assert coordinator.engineering_snapshot == stores.snapshot
     assert registries.device("serial-a:nfc") is not None
-    assert coordinator.engineering_runtime is None
+    coordinator.async_rebind_engineering_runtime.assert_awaited_once()
 
 
 async def test_unchanged_revision_does_not_download(coordinator):
