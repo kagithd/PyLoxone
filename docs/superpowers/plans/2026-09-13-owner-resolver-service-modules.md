@@ -4,7 +4,7 @@
 
 **Goal:** Build a read-only, privacy-safe engineering inventory that reconstructs Loxone hardware ownership, registers entity-less devices and Miniserver service modules in Home Assistant, prepares verified read-only entities, persists the last good topology, and warns about configuration changes that affect Home Assistant consumers.
 
-**Architecture:** The existing engineering XML parser and runtime probe remain side-effect free. New topology, capability, snapshot, registry, and change modules transform a complete engineering download into one immutable, source-scoped model before Home Assistant registries are changed; the coordinator persists that model and publishes one config-entry-scoped refresh signal. Existing LoxAPP3 discovery remains authoritative for already-supported entities, while the engineering model fills hardware/topology/service gaps without issuing any write probe.
+**Architecture:** The existing engineering XML parser and runtime probe remain side-effect free. New topology, capability, snapshot, registry, and change modules transform a complete engineering download into one immutable, source-scoped candidate before Home Assistant registries are changed. A validated candidate is committed as a deterministic last-known-good generation, then applied idempotently to Home Assistant registries; signals, warnings, and stale observations are published only after that generation is fully applied. Existing LoxAPP3 discovery remains authoritative for already-supported entities, while the engineering model fills hardware/topology/service gaps without issuing any write probe.
 
 **Tech Stack:** Python 3.14.7, Home Assistant 2026.8.1 test dependency, pytest 9.1.1, stdlib `dataclasses`, `enum.StrEnum`, `xml.etree.ElementTree`, Home Assistant device/entity/area registries, dispatcher, `Store`, Searcher, and persistent notifications.
 
@@ -28,6 +28,94 @@
 - Do not push the branch, update a GitHub discussion, or open an upstream pull request during implementation or live validation.
 - Commit metadata must remain `kagithd <42038442+kagithd@users.noreply.github.com>`.
 
+#### Binding preflight rulings
+
+These rulings take precedence over any older example or step below that is not
+yet worded consistently. Each task must keep compatibility adapters until its
+callers have migrated, and must run its focused tests plus the complete suite
+before commit so intermediate commits remain usable.
+
+1. **Opaque parser identity and complete ancestry.** `EngineeringElement`
+   carries both `key` and `parent_key`. A UUID is used as `key` when present;
+   otherwise the parser assigns an opaque, deterministic-in-document key such
+   as `xml:000123`. Neither key may contain a title, value, address, access
+   label, or any other source text. The parser preserves `parent_uuid` for
+   compatibility but resolution walks `parent_key`. Duplicate non-empty UUIDs
+   invalidate the candidate before any UUID-indexed dictionary is built.
+2. **Sensitivity before projection.** Sensitivity propagates over the complete
+   `parent_key` chain, including UUID-less containers. Sensitive descendants
+   are excluded before runtime probing and sanitized before persistence,
+   diagnostics, notification text, or public conversion.
+3. **UUID-less provider services.** A UUID-less service receives
+   `{provider}:service:{normalized_type}` only when its normalized technical
+   type occurs once in the project. Duplicate UUID-less services of the same
+   type stay inventory-only with `ambiguous_uuidless_service`; titles never
+   disambiguate identity.
+4. **Shared candidate and value policy.** Runtime probe candidates come from
+   the capability resolver's exact technical-type allowlist, not legacy
+   `suggested_platform`. It includes verified digital inputs, analog inputs,
+   status/online channels, WeatherData, and SysVar. Runtime numbers must be
+   finite. Units pass only through an explicit safe-unit map; a numeric prefix
+   followed by arbitrary text is text, not a numeric value. Authentication and
+   transport failures are reported separately and never replace the last good
+   capability state.
+5. **Global Home Assistant entity identity.** Existing engineering entity
+   unique IDs stay unchanged. Before exposing a spec, query the entity registry
+   for `(domain, platform, unique_id)`. If it belongs to another config entry,
+   leave that entry untouched and keep the new row inventory-only with
+   `entity_unique_id_owned_by_other_entry`. Registry/persisted ownership must be
+   considered even if the owning config entry is unloaded. Tests cover both
+   load orders, restart, and an unloaded owner.
+6. **Safe reconstructable snapshot.** The private snapshot persists the scalar
+   source revision plus only safe fields required to rebuild cached unavailable
+   entities and topology: opaque key/parent key, UUID, technical type, safe
+   presentation name/room, kind, owner/via identifiers, sanitized path,
+   resolution/capability/exposure reasons, semantic platform, safe unit,
+   `io_name`, stable `state_uuid`, and binding method. It never persists runtime
+   values, endpoints, raw attributes, host/URL data, credentials, provider
+   titles, project titles, user/location fields, or access metadata.
+7. **Exact registry APIs and two passes.** Use the installed Home Assistant API:
+   entry-scoped `async_get_device_by_identifier(identifier, config_entry_id)`,
+   global `async_get_entity_id(domain, platform, unique_id)`, and
+   `async_update_device(..., via_device_id=...)`. First create/update all
+   eligible devices; then resolve their concrete registry IDs and update
+   `via_device_id`. Engineering entity `DeviceInfo` contains only the owner
+   identifier so platform setup cannot overwrite centrally managed topology.
+8. **Committed generation and idempotent replay.** Candidate construction,
+   validation, diffing, and impact discovery are pure and use the previous
+   snapshot plus pre-mutation registry state. Store the validated snapshot as
+   the new committed data generation before registry application. Then swap
+   coordinator memory and apply a deterministic registry plan idempotently. If
+   snapshot storage fails, old memory and registries remain untouched. If
+   registry application fails or is cancelled after a partial mutation, retain
+   the committed candidate, mark its registry generation pending, publish no
+   entity signal/impact warning/stale observation, and replay it at startup or
+   retry. This is a recovery boundary, not a transactional rollback claim.
+9. **Topology freshness and runtime liveness are separate.** An unchanged
+   `lastModified` causes zero FTPS downloads but still rebinds cached safe
+   channels by `state_uuid`. Prepared entities subscribe to normal Loxone
+   websocket events and accept only verified finite numeric or boolean values.
+   A transport/authentication failure keeps cached topology and marks live
+   bindings unavailable.
+10. **Exactly-once maintenance and post-apply publication.** Every complete
+    snapshot has a deterministic generation token based on provider identity
+    and configuration revision. Registry metadata stores committed,
+    registry-applied, and last-observed generation tokens plus integration-
+    managed areas. Warnings are published/dismissed and stale grace counters
+    advance only after successful registry application, at most once per
+    generation. Runtime-only rebind, restart, retry, or a repeated manual read
+    of the same configuration cannot double-count an observation.
+11. **Privacy fixture gate.** Synthetic fixtures are created by hand or through
+    an explicit input validator that rejects forbidden identity, location,
+    coordinate, URL, address, credential, and access-control fields before
+    writing anything. Permitted numbered device labels and ordinary room names
+    remain available for behavior tests. The final audit evaluates every added
+    line and commit intended for transmission; it does not rely on an
+    impossible repository-wide zero-hit rule for generic security code.
+12. **Live boundary.** Task 9 may prepare a sanitized, git-ignored validation
+    report, but backup, installation, integration reload, or Home Assistant
+    restart requires a fresh explicit authorization from the user at that gate.
+
 ---
 
 ### Task 1: Add source-scoped topology types and safe classification
@@ -43,6 +131,8 @@
 - Consumes: `EngineeringElement` and `EngineeringInventory` from `engineering_config.py`.
 - Produces: `EngineeringSourceContext`, `NodeKind`, `ResolutionStatus`, `ResolvedEngineeringNode`, `ResolvedEngineeringInventory`, `classify_node_kind(element)`, and `scoped_engineering_identifier(source, node)`.
 - Produces: `EngineeringInventory.is_complete`, which is true only for a non-empty parsed tree containing at least one stable UUID and one `LoxLIVE` node.
+- Extends `EngineeringElement` with opaque `key` and `parent_key`; `parent_uuid` remains a compatibility field only.
+- Produces early validation that rejects duplicate stable UUIDs before topology resolution.
 
 - [ ] **Step 1: Write failing model, classification, completeness, and allowlist tests**
 
@@ -51,28 +141,36 @@ Create the shared synthetic constructors in `tests/engineering_fixtures.py`; lat
 ```python
 from datetime import UTC, datetime
 
-from custom_components.loxone.engineering_config import EngineeringElement, EngineeringInventory
+from custom_components.loxone.engineering_config import (
+    EngineeringConfigError,
+    EngineeringElement,
+    EngineeringInventory,
+    parse_engineering_xml,
+)
 from custom_components.loxone.engineering_topology import EngineeringSourceContext, ResolvedEngineeringInventory
 
 
 def element(
-    uuid: str,
+    uuid: str | None,
     element_type: str,
     *,
     parent_uuid: str | None = None,
+    key: str | None = None,
+    parent_key: str | None = None,
     title: str | None = None,
     io_name: str | None = None,
     room: str | None = "Office",
     platform: str | None = None,
 ) -> EngineeringElement:
     return EngineeringElement(
-        key=uuid,
+        key=key or uuid or "xml:fixture",
         xml_element="C",
         loxone_type=element_type,
         title=title or element_type,
         uuid=uuid,
         io_name=io_name,
         parent_uuid=parent_uuid,
+        parent_key=parent_key or parent_uuid,
         room_uuid="room-uuid" if room else None,
         room=room,
         category_uuid=None,
@@ -113,14 +211,37 @@ from datetime import UTC, datetime
 
 import pytest
 
-from custom_components.loxone.engineering_config import EngineeringElement, EngineeringInventory
+from custom_components.loxone.engineering_config import (
+    EngineeringConfigError,
+    EngineeringElement,
+    EngineeringInventory,
+    parse_engineering_xml,
+)
 from custom_components.loxone.engineering_topology import (
     EngineeringSourceContext,
     NodeKind,
     classify_node_kind,
     scoped_engineering_identifier,
 )
-from tests.engineering_fixtures import element
+from tests.engineering_fixtures import (
+    DUPLICATE_UUID_XML,
+    SYNTHETIC_PARSE_CONTEXT,
+    UUIDLESS_CONTAINER_XML,
+    element,
+    validate_fixture_input,
+)
+
+
+def test_fixture_input_gate_rejects_identity_and_location_fields():
+    with pytest.raises(ValueError, match="forbidden fixture field"):
+        validate_fixture_input(
+            {"device": "ST-F01", "room": "Office", "CurrentUser": "person"}
+        )
+
+    assert validate_fixture_input({"device": "ST-F01", "room": "Office"}) == {
+        "device": "ST-F01",
+        "room": "Office",
+    }
 
 
 def test_type_driven_classification_does_not_trust_titles():
@@ -201,6 +322,21 @@ def test_inventory_requires_uuid_and_miniserver_to_be_complete():
 
     assert complete.is_complete is True
     assert empty.is_complete is False
+
+
+def test_uuidless_parser_keys_are_opaque_and_preserve_parent_chain():
+    inventory = parse_engineering_xml(UUIDLESS_CONTAINER_XML, **SYNTHETIC_PARSE_CONTEXT)
+    container, child = inventory.elements[-2:]
+
+    assert container.uuid is None
+    assert container.key.startswith("xml:")
+    assert "Private caption" not in container.key
+    assert child.parent_key == container.key
+
+
+def test_duplicate_stable_uuid_invalidates_inventory():
+    with pytest.raises(EngineeringConfigError, match="duplicate_engineering_uuid"):
+        parse_engineering_xml(DUPLICATE_UUID_XML, **SYNTHETIC_PARSE_CONTEXT)
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm the new imports/properties fail**
@@ -256,6 +392,7 @@ class ResolvedEngineeringNode:
     topology_path: tuple[str, ...]
     resolution_status: ResolutionStatus
     resolution_reason: str
+    sensitive: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,7 +405,7 @@ class ResolvedEngineeringInventory:
         return {node.element.key: node for node in self.nodes}
 ```
 
-Use case-folded exact type sets for `LoxLIVE`, `LoxLink`, `LoxTree`, Air/1-Wire extensions, typed physical endpoints, provider service containers, channels, and structural nodes. Permit conservative suffix checks only for `*Device`, `*Dev`, and `*Extension`, after excluding service and structural types. `scoped_engineering_identifier()` must return `f"{source.provider_identifier}:{element.uuid}"` for UUID-backed graph devices and return `None` for non-device nodes without a UUID. Add the `is_complete` property without changing parser limits or XML declaration rejection.
+Use case-folded exact type sets for `LoxLIVE`, `LoxLink`, `LoxTree`, Air/1-Wire extensions, typed physical endpoints, provider service containers, channels, and structural nodes. Permit conservative suffix checks only for `*Device`, `*Dev`, and `*Extension`, after excluding service and structural types. `scoped_engineering_identifier()` must return `f"{source.provider_identifier}:{element.uuid}"` for UUID-backed graph devices and return `None` for non-device nodes without a UUID. Parse elements in document order, assign UUID-less nodes an opaque `xml:{index:06d}` key, and retain the immediate opaque `parent_key` even when `parent_uuid` is absent. Reject duplicate non-empty UUIDs before returning the immutable inventory. Add the `is_complete` property without changing parser limits or XML declaration rejection. Task 1 tests parser key/parent retention and type classification; Task 2 adds the parser-through-resolver ownership and sensitivity propagation assertions. Define the synthetic XML constants and parse context in `tests/engineering_fixtures.py` before using them, so red tests fail on absent production behavior rather than fixture errors. Add a test-fixture input gate in that helper that recursively rejects forbidden key names and URL/address/coordinate/credential/access values before a helper can construct or serialize a fixture, while permitting synthetic numbered device labels and ordinary room names. Hand-authored negative security payloads remain test inputs and are not rejected before reaching the production parser being tested.
 
 - [ ] **Step 4: Run the focused tests and confirm they pass**
 
@@ -293,7 +430,7 @@ git commit -m "feat: model engineering topology"
 **Interfaces:**
 - Consumes: Task 1 topology types and `EngineeringInventory.elements`.
 - Produces: `OwnerResolver(max_depth: int = 128)` and `resolve_engineering_topology(inventory, source) -> ResolvedEngineeringInventory`.
-- Guarantees: every parsed node gets one result; physical and service ownership is UUID/type driven; cycles and missing ancestors produce `UNRESOLVED` rows rather than guesses.
+- Guarantees: every parsed node gets one result; physical and service ownership is opaque-key/type driven; cycles and missing ancestors produce `UNRESOLVED` rows rather than guesses; sensitivity is inherited before projection.
 
 - [ ] **Step 1: Add failing tests for Tree, Link/Air, Link/1-Wire, internal I/O, services, cycles, and multi-entry isolation**
 
@@ -400,6 +537,29 @@ def test_same_uuid_on_two_entries_produces_distinct_registry_identifiers():
 
     assert node(first, "shared").device_identifier == "serial-a:shared"
     assert node(second, "shared").device_identifier == "serial-b:shared"
+
+
+def test_singleton_uuidless_service_gets_stable_provider_identifier():
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", room=None),
+        element(None, "WeatherServer", key="xml:000002", room=None),
+    )
+    resolved = resolve_engineering_topology(inventory, source())
+
+    assert resolved.nodes[1].device_identifier == "serial-a:service:weatherserver"
+
+
+def test_duplicate_uuidless_service_types_are_inventory_only():
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", room=None),
+        element(None, "WeatherServer", key="xml:000002", room=None),
+        element(None, "WeatherServer", key="xml:000003", room=None),
+    )
+    resolved = resolve_engineering_topology(inventory, source())
+
+    assert {item.resolution_reason for item in resolved.nodes[1:]} == {
+        "ambiguous_uuidless_service"
+    }
 ```
 
 - [ ] **Step 2: Run the resolver tests and confirm they fail on the missing resolver**
@@ -422,10 +582,10 @@ class OwnerResolver:
         inventory: EngineeringInventory,
         source: EngineeringSourceContext,
     ) -> ResolvedEngineeringInventory:
-        elements_by_uuid = {item.uuid: item for item in inventory.elements if item.uuid}
+        elements_by_key = {item.key: item for item in inventory.elements}
         kinds = {item.key: classify_node_kind(item) for item in inventory.elements}
         nodes = tuple(
-            self._resolve_one(item, elements_by_uuid, kinds, source)
+            self._resolve_one(item, elements_by_key, kinds, source)
             for item in inventory.elements
         )
         return ResolvedEngineeringInventory(source=source, nodes=nodes)
@@ -438,7 +598,7 @@ def resolve_engineering_topology(
     return OwnerResolver().resolve(inventory, source)
 ```
 
-For each node, walk no more than 128 UUID ancestors and retain structural titles only in `topology_path`. A physical endpoint selects the nearest registered bridge/bus as `via_device_identifier`. A channel selects the nearest physical device or service module as `device_identifier`; an internal channel beneath `LoxLIVE` selects the Miniserver identifier. A document-level service module uses the source Miniserver as its provider even when `LoxLIVE` is a sibling. WeatherData and SysVar nodes resolve to their typed WeatherServer/GlobalStates module. Missing parents use `missing_parent`; cycles use `parent_cycle`; exceeded depth uses `parent_depth_exceeded`.
+For each node, walk no more than 128 `parent_key` ancestors and retain only non-sensitive structural titles in `topology_path`. A physical endpoint selects the nearest registered bridge/bus as `via_device_identifier`. A channel selects the nearest physical device or service module as `device_identifier`; an internal channel beneath `LoxLIVE` selects the Miniserver identifier. A document-level service module uses the source Miniserver as its provider even when `LoxLIVE` is a sibling. WeatherData and SysVar nodes resolve to their typed WeatherServer/GlobalStates module. A singleton UUID-less provider service uses the typed fallback from ruling 3; duplicates remain unresolved. Missing parents use `missing_parent`; cycles use `parent_cycle`; exceeded depth uses `parent_depth_exceeded`. A physical node with an unknown parent must not receive a guessed `via_device_identifier`. Mark `sensitive=True` when the node or any ancestor is a sensitive technical container and clear its public name/path before it leaves the resolver boundary.
 
 - [ ] **Step 4: Run the topology tests and the existing engineering tests**
 
@@ -465,7 +625,7 @@ git commit -m "feat: resolve engineering device owners"
 
 **Interfaces:**
 - Consumes: `ResolvedEngineeringInventory` and `EngineeringRuntimeInventory`.
-- Produces: `CapabilityState`, `ExposureStatus`, `EngineeringCapability`, `EngineeringInventoryRow`, `resolve_engineering_capabilities(resolved, runtime)`, `EngineeringEntitySpec`, and `build_engineering_entity_specs(rows, runtime | None)`.
+- Produces: `CapabilityState`, `ExposureStatus`, `EngineeringCapability`, `EngineeringInventoryRow`, `select_runtime_probe_candidates(resolved)`, `resolve_engineering_capabilities(resolved, runtime)`, `EngineeringEntitySpec`, and `build_engineering_entity_specs(rows, runtime | None)`.
 - Guarantees: readable does not imply writable; sensitive and arbitrary text channels never become entity specs; outputs remain inventory-only.
 
 - [ ] **Step 1: Write failing capability and entity-policy tests**
@@ -602,6 +762,35 @@ def test_weather_and_system_variables_share_their_module_owner():
     assert system.owner_identifier == "serial-a:global-states"
     assert weather.enabled_by_default is False
     assert system.enabled_by_default is False
+
+
+def test_probe_candidates_do_not_depend_on_legacy_platform_hint():
+    candidates = select_runtime_probe_candidates(
+        ResolvedEngineeringInventory(
+            source=source(),
+            nodes=(
+                resolved_node("i1", "DigitalIn"),
+                resolved_node("ai1", "VoltageIn"),
+                resolved_node("online", "Online"),
+            ),
+        )
+    )
+
+    assert {item.element.uuid for item in candidates} == {"i1", "ai1", "online"}
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_non_finite_values_are_not_exposed(value):
+    capability = resolve_capability(
+        resolved_node("ai1", "VoltageIn"), numeric_binding("ai1", value)
+    )
+    assert capability.exposure is ExposureStatus.SUPPRESSED
+
+
+def test_numeric_prefix_with_unknown_suffix_is_text_not_a_unit():
+    binding = binding_from_response("ai1", "12.4 private-label")
+    assert binding.value_kind == "text"
+    assert binding.numeric_value is None
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm the capability API is missing**
@@ -644,7 +833,13 @@ class EngineeringInventoryRow:
     capability: EngineeringCapability
 ```
 
-Use exact type sets for WeatherData, SysVar, DigitalIn, VoltageIn, Online/status, Actor/relay outputs, and analog outputs. Treat a bound numeric value as readable, a missing binding as configured-only, a non-numeric arbitrary text response as suppressed, and an unknown typed channel as unsupported. Define `SENSITIVE_TYPES` for access-code, NFC-tag, credential, user, and permission child records without marking the physical `TreeDevice` container sensitive. Do not define a writable whitelist in this change.
+Use exact type sets for WeatherData, SysVar, DigitalIn, VoltageIn, Online/status, Actor/relay outputs, and analog outputs. Treat a bound finite numeric value as readable, a missing binding as configured-only, a non-numeric arbitrary text response as suppressed, and an unknown typed channel as unsupported. `select_runtime_probe_candidates()` must use these same exact type sets, ignore the legacy `suggested_platform` hint, and omit sensitive descendants before an endpoint is constructed. Define `SENSITIVE_TYPES` for access-code, NFC-tag, credential, user, and permission child records without marking the physical `TreeDevice` container sensitive. Do not define a writable whitelist in this change. Keep authentication and transport failures distinct from an ordinary unbound value so they cannot downgrade the stored last-good capability.
+
+Replace permissive unit parsing with an explicit map of safe engineering units
+to Home Assistant units. Accept a bare finite number or a finite number followed
+by an allowlisted unit only. Reject `nan`, infinities, arbitrary suffixes,
+control characters, and numeric-prefix strings with unknown text. Add adversarial
+tests for all of these cases.
 
 - [ ] **Step 4: Replace sensor-only specs with a platform-neutral entity spec**
 
@@ -654,6 +849,7 @@ In `engineering_entities.py`, define:
 @dataclass(frozen=True, slots=True)
 class EngineeringEntitySpec:
     unique_id: str
+    state_uuid: str
     platform: Literal["sensor", "binary_sensor"]
     name: str
     native_value: float | bool | None
@@ -662,7 +858,6 @@ class EngineeringEntitySpec:
     owner_identifier: str
     owner_name: str
     owner_model: str
-    via_device_identifier: str | None
     room: str | None
     loxone_type: str | None
     io_name: str | None
@@ -671,7 +866,7 @@ class EngineeringEntitySpec:
     enabled_by_default: bool = False
 ```
 
-`build_engineering_entity_specs()` must emit only `PREPARED_DISABLED` rows with stable engineering UUIDs. When runtime is `None` during cache restore, emit the remembered safe spec with `available=False`, `native_value=None`, and no runtime endpoint. Keep `normalize_engineering_unit()` and delete `_nearest_device()` after its callers move to the resolver.
+`build_engineering_entity_specs()` must emit only `PREPARED_DISABLED` rows with stable engineering UUIDs and a proven `state_uuid`. When runtime is `None` during cache restore, emit the remembered safe spec with `available=False`, `native_value=None`, and no runtime endpoint. `owner_name` and `owner_model` are presentation data for registry planning only; the platform entity will later put only `owner_identifier` in `DeviceInfo`. Keep a compatibility wrapper for the previous sensor-only builder until all callers move to this model. Keep `normalize_engineering_unit()` as the explicit safe-unit map and delete `_nearest_device()` only after its callers move to the resolver.
 
 - [ ] **Step 5: Run capability, runtime, and entity tests**
 
@@ -697,8 +892,8 @@ git commit -m "feat: classify engineering capabilities"
 
 **Interfaces:**
 - Consumes: `ResolvedEngineeringInventory` and `EngineeringInventoryRow`.
-- Produces: `EngineeringSnapshot`, `EngineeringChangeSet`, `async_load_engineering_snapshot(hass, entry_id)`, `async_store_engineering_snapshot(hass, snapshot)`, `snapshot_to_dict(snapshot)`, `snapshot_from_dict(data)`, and `diff_engineering_snapshots(previous, current)`.
-- Storage key: `loxone.engineering_snapshot.<entry_id>`, version `1`, `private=True`.
+- Produces: `EngineeringSnapshot`, `StoredEngineeringState`, `EngineeringNodeChange`, `EngineeringChangeSet`, `async_load_engineering_state(hass, entry_id)`, `async_store_engineering_state(hass, state)`, `snapshot_to_dict(snapshot)`, `snapshot_from_dict(data)`, and `diff_engineering_snapshots(previous, current)`.
+- Storage key: `loxone.engineering_snapshot.<entry_id>`, version `2`, `private=True`; the loader migrates the previous private snapshot shape without publishing it.
 
 - [ ] **Step 1: Write failing round-trip, rejection, and UUID-diff tests**
 
@@ -731,6 +926,7 @@ def make_snapshot(
         source=context,
         nodes=resolved.nodes,
         rows=rows,
+        generation_id=engineering_generation_id(context),
         captured_at=datetime(2026, 9, 13, 12, tzinfo=UTC),
     )
 ```
@@ -757,6 +953,8 @@ def test_snapshot_round_trip_contains_only_public_allowlisted_fields():
 
     assert snapshot_to_dict(restored) == encoded
     assert restored.source.title is None
+    assert restored.generation_id == original.generation_id
+    assert any(row.state_uuid for row in restored.rows if row.capability.platform)
     rendered = json.dumps(encoded)
     for forbidden_key in (
         "attributes",
@@ -811,12 +1009,17 @@ def test_uuid_diff_separates_add_remove_metadata_move_and_platform_change():
     )
     changes = diff_engineering_snapshots(previous, current)
 
-    assert changes.added == ("new-device",)
-    assert changes.removed == ("removed-channel",)
-    assert changes.renamed == ("renamed-device",)
-    assert changes.room_moved == ("moved-device",)
-    assert changes.reparented == ("reparented-device",)
-    assert changes.platform_changed == ("changed-channel",)
+    assert tuple(item.unique_id for item in changes.added) == ("new-device",)
+    assert tuple(item.unique_id for item in changes.removed) == ("removed-channel",)
+    changed = {item.unique_id: item for item in changes.metadata_changed}
+    assert set(changed) == {
+        "renamed-device",
+        "moved-device",
+        "reparented-device",
+        "changed-channel",
+    }
+    assert changed["changed-channel"].old_semantic_platform == "sensor"
+    assert changed["changed-channel"].new_semantic_platform == "binary_sensor"
 ```
 
 - [ ] **Step 2: Run the focused tests and confirm snapshot APIs are missing**
@@ -835,14 +1038,22 @@ class EngineeringSnapshot:
     source: EngineeringSourceContext
     nodes: tuple[ResolvedEngineeringNode, ...]
     rows: tuple[EngineeringInventoryRow, ...]
+    generation_id: str
     captured_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEngineeringState:
+    snapshot: EngineeringSnapshot | None
+    registry_applied_generation: str | None = None
+    managed_area_ids: Mapping[str, str] = field(default_factory=dict)
 
 
 class EngineeringSnapshotError(ValueError):
     """Raised when a candidate or stored snapshot is unsafe or incomplete."""
 ```
 
-Serialize only the inventory columns named in the spec: node key, name, technical type, UUID, parent UUID, room, node kind, owner key, source provider identifier, bus kind, topology path, suggested platform, capability state, exposure status, resolution status, and reason. Do not serialize raw XML attributes, category values, runtime values, endpoint URLs, error strings, credentials, host data, or Miniserver titles. `snapshot_from_dict()` must validate enum values, list/string shapes, source entry ID, serial scope, duplicate stable UUIDs, parent cycles, and completeness before returning an immutable snapshot.
+Compute `generation_id` deterministically from the source provider identity and normalized scalar configuration revision; timestamps must not affect it. Serialize only the safe reconstruction fields named in binding ruling 6: opaque node key and parent key, technical type, UUID, safe name and room, node kind, owner/via identifiers, bus kind, sanitized topology path, resolution/capability/exposure reasons, semantic platform, safe unit, `io_name`, stable `state_uuid`, and binding method. Persist the committed snapshot, registry-applied token, and integration-managed area IDs in one versioned private envelope. Do not serialize `parent_uuid` when `parent_key` is sufficient, raw XML attributes, category values, runtime values, endpoint URLs, arbitrary error strings, credentials, host data, or Miniserver/provider/project/user/location titles. `snapshot_from_dict()` must validate enum values, list/string shapes, source entry ID, serial scope, duplicate stable UUIDs, opaque-key uniqueness, parent cycles, allowed units, finite-safe metadata, and completeness before returning an immutable snapshot.
 
 - [ ] **Step 4: Implement source-scoped UUID diffing**
 
@@ -850,20 +1061,30 @@ Define:
 
 ```python
 @dataclass(frozen=True, slots=True)
+class EngineeringNodeChange:
+    unique_id: str
+    old_name: str | None = None
+    new_name: str | None = None
+    old_room: str | None = None
+    new_room: str | None = None
+    old_owner_identifier: str | None = None
+    new_owner_identifier: str | None = None
+    old_semantic_platform: str | None = None
+    new_semantic_platform: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class EngineeringChangeSet:
-    added: tuple[str, ...] = ()
-    removed: tuple[str, ...] = ()
-    renamed: tuple[str, ...] = ()
-    room_moved: tuple[str, ...] = ()
-    reparented: tuple[str, ...] = ()
-    platform_changed: tuple[str, ...] = ()
+    added: tuple[EngineeringNodeChange, ...] = ()
+    removed: tuple[EngineeringNodeChange, ...] = ()
+    metadata_changed: tuple[EngineeringNodeChange, ...] = ()
 
     @property
     def is_empty(self) -> bool:
         return not any(astuple(self))
 ```
 
-Compare only nodes with a stable engineering UUID and include the source provider in each lookup key. A name, room, owner/via identifier, or platform change must never be represented as remove-plus-add.
+Compare only nodes with a stable engineering UUID and include the source provider in each lookup key. A name, room, owner/via identifier, or semantic-platform change must never be represented as remove-plus-add. Each change contains enough previous and candidate metadata for Task 8 to discover impacts before any Home Assistant registry mutation. `semantic_platform` records the resolver's meaning independently from whether an entity was suppressed by a cross-entry collision, so collision/load order cannot manufacture a false platform change.
 
 - [ ] **Step 5: Run the snapshot and change tests**
 
@@ -888,9 +1109,9 @@ git commit -m "feat: persist engineering snapshots"
 - Test: `tests/test_registry_maintenance.py`
 
 **Interfaces:**
-- Consumes: `EngineeringSnapshot`, Home Assistant registries, and previous integration-managed area metadata.
-- Produces: `EngineeringRegistryMetadata`, `EngineeringRegistrySyncResult`, `async_sync_engineering_devices(hass, entry_id, snapshot, previous_metadata)`, and updated `async_store_engineering_registry_metadata()` / `async_load_engineering_registry_metadata()`.
-- Guarantees: physical devices exist without entities; `via_device` uses the nearest registered owner; user-overridden areas remain untouched; ambiguous legacy devices are not merged.
+- Consumes: `EngineeringSnapshot`, Home Assistant registries, and `StoredEngineeringState` integration-managed area metadata.
+- Produces: `EngineeringRegistryPlan`, `EngineeringRegistryMetadata`, `EngineeringRegistrySyncResult`, `async_plan_engineering_registry_sync(...)`, `async_apply_engineering_registry_plan(...)`, `async_filter_entity_identity_conflicts(...)`, and a compatibility `async_sync_engineering_devices(...)` wrapper that plans then applies.
+- Guarantees: planning is mutation-free; application is idempotent; physical devices exist without entities; `via_device_id` uses the nearest registered owner; user-overridden areas remain untouched; ambiguous legacy devices are not merged; global entity identities owned by another entry are never stolen.
 
 - [ ] **Step 1: Write failing registry topology and migration tests**
 
@@ -905,7 +1126,7 @@ from tests.engineering_fixtures import (
 )
 
 
-def test_registry_creates_entityless_tree_device_with_full_via_chain(registries):
+async def test_registry_creates_entityless_tree_device_with_full_via_chain(registries):
     snapshot = make_snapshot(
         inventory=inventory_of(
             element("ms", "LoxLIVE", title="Miniserver", room=None),
@@ -914,7 +1135,7 @@ def test_registry_creates_entityless_tree_device_with_full_via_chain(registries)
             element("nfc", "TreeDevice", parent_uuid="branch", title="NFC Code Touch"),
         )
     )
-    result = async_sync_engineering_devices(
+    result = await async_sync_engineering_devices(
         registries.hass,
         "entry-a",
         snapshot,
@@ -928,8 +1149,8 @@ def test_registry_creates_entityless_tree_device_with_full_via_chain(registries)
     assert result.created_identifiers == ("serial-a:tree", "serial-a:nfc")
 
 
-def test_registry_builds_link_bridge_endpoint_chains(registries):
-    async_sync_engineering_devices(
+async def test_registry_builds_link_bridge_endpoint_chains(registries):
+    await async_sync_engineering_devices(
         registries.hass,
         "entry-a",
         make_snapshot(inventory=reference_link_inventory()),
@@ -941,7 +1162,7 @@ def test_registry_builds_link_bridge_endpoint_chains(registries):
     assert registries.device("serial-a:wire-sensor").via_device_id == registries.device("serial-a:wire-extension").id
 
 
-def test_service_module_is_created_only_when_it_has_supported_channels(registries):
+async def test_service_module_is_created_only_when_it_has_supported_channels(registries):
     runtime = EngineeringRuntimeInventory(
         bindings=(numeric_binding("weather-value", 18.5, "WeatherData"),)
     )
@@ -954,7 +1175,7 @@ def test_service_module_is_created_only_when_it_has_supported_channels(registrie
         ),
         runtime=runtime,
     )
-    async_sync_engineering_devices(
+    await async_sync_engineering_devices(
         registries.hass,
         "entry-a",
         snapshot,
@@ -965,7 +1186,7 @@ def test_service_module_is_created_only_when_it_has_supported_channels(registrie
     assert registries.device("serial-a:empty-service") is None
 
 
-def test_loxone_area_move_updates_only_integration_managed_assignment(registries):
+async def test_loxone_area_move_updates_only_integration_managed_assignment(registries):
     previous = EngineeringRegistryMetadata(
         active_device_identifiers=frozenset({"serial-a:device"}),
         room_names=frozenset({"Office"}),
@@ -978,15 +1199,15 @@ def test_loxone_area_move_updates_only_integration_managed_assignment(registries
         )
     )
     registries.device("serial-a:device").area_id = "office-area"
-    async_sync_engineering_devices(registries.hass, "entry-a", moved, previous)
+    await async_sync_engineering_devices(registries.hass, "entry-a", moved, previous)
     assert registries.device("serial-a:device").area_id == "work-area"
 
     registries.device("serial-a:device").area_id = "user-selected-area"
-    async_sync_engineering_devices(registries.hass, "entry-a", moved, previous)
+    await async_sync_engineering_devices(registries.hass, "entry-a", moved, previous)
     assert registries.device("serial-a:device").area_id == "user-selected-area"
 
 
-def test_legacy_unscoped_device_is_not_merged_when_multiple_entries_claim_uuid(registries):
+async def test_legacy_unscoped_device_is_not_merged_when_multiple_entries_claim_uuid(registries):
     registries.set_loaded_claims("shared-uuid", {"entry-a", "entry-b"})
     snapshot = make_snapshot(
         inventory=inventory_of(
@@ -994,7 +1215,7 @@ def test_legacy_unscoped_device_is_not_merged_when_multiple_entries_claim_uuid(r
             element("shared-uuid", "TreeDevice", parent_uuid="ms", title="ST-F01"),
         )
     )
-    result = async_sync_engineering_devices(
+    result = await async_sync_engineering_devices(
         registries.hass,
         "entry-a",
         snapshot,
@@ -1003,9 +1224,41 @@ def test_legacy_unscoped_device_is_not_merged_when_multiple_entries_claim_uuid(r
 
     assert result.migrated_entities == 0
     assert registries.device("shared-uuid") is not None
+
+
+@pytest.mark.parametrize("load_order", (("entry-a", "entry-b"), ("entry-b", "entry-a")))
+async def test_global_entity_collision_never_rewires_existing_owner(registries, load_order):
+    registries.persisted_entity(
+        domain="sensor", platform=DOMAIN, unique_id="shared-channel",
+        config_entry_id=load_order[0], device_id="owner-device",
+    )
+    specs = (engineering_spec("shared-channel"),)
+
+    accepted, rejected = await async_filter_entity_identity_conflicts(
+        registries.hass, load_order[1], specs
+    )
+
+    assert accepted == ()
+    assert rejected[0].reason == "entity_unique_id_owned_by_other_entry"
+    assert registries.entity("sensor", DOMAIN, "shared-channel").device_id == "owner-device"
+
+
+async def test_registry_plan_replays_after_partial_application(registries):
+    plan = await async_plan_engineering_registry_sync(
+        registries.hass, "entry-a", make_snapshot(), EngineeringRegistryMetadata.empty()
+    )
+    registries.fail_update_number = 2
+    with pytest.raises(RuntimeError):
+        await async_apply_engineering_registry_plan(registries.hass, plan)
+
+    registries.fail_update_number = None
+    first = await async_apply_engineering_registry_plan(registries.hass, plan)
+    second = await async_apply_engineering_registry_plan(registries.hass, plan)
+    assert first.metadata == second.metadata
+    assert registries.has_duplicate_devices is False
 ```
 
-The `registries` fixture must provide in-memory fakes for exactly the Home Assistant methods used by the production function: device `async_get_or_create`, `async_get_device_by_identifier`, `async_update_device`; area `async_get_area_by_name`, `async_get_or_create`; entity `async_get_entity_id`, `async_get`, `async_update_entity`; and loaded coordinator claims through `hass.data[DOMAIN]`. Its `device(identifier)` helper returns a fake entry by `(DOMAIN, identifier)`, `miniserver` is pre-created as `(DOMAIN, "serial-a")`, and `set_loaded_claims()` installs two synthetic coordinator snapshots without any network or user data.
+The `registries` fixture must provide in-memory fakes with the exact installed Home Assistant signatures used by production: device `async_get_or_create`, `async_get_device_by_identifier(identifier, config_entry_id)`, `async_update_device(..., via_device_id=...)`; area `async_get_area_by_name`, `async_get_or_create`; entity `async_get_entity_id(domain, platform, unique_id)`, `async_get`, `async_update_entity(..., config_entry_id=..., device_id=...)`; and persisted ownership independent of `hass.data[DOMAIN]`. Its `device(identifier)` helper returns a fake entry by `(DOMAIN, identifier)` within `entry-a`, `miniserver` is pre-created as `(DOMAIN, "serial-a")`, and fault injection can fail any numbered registry mutation. Tests must cover an unloaded owner and restart, not only two loaded coordinators.
 
 - [ ] **Step 2: Run registry tests and confirm the new synchronization layer is missing**
 
@@ -1023,10 +1276,19 @@ class EngineeringRegistryMetadata:
     active_device_identifiers: frozenset[str]
     room_names: frozenset[str]
     managed_area_ids: Mapping[str, str]
+    applied_generation: str | None
 
     @classmethod
     def empty(cls) -> EngineeringRegistryMetadata:
-        return cls(frozenset(), frozenset(), {})
+        return cls(frozenset(), frozenset(), {}, None)
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringRegistryPlan:
+    generation_id: str
+    device_operations: tuple[EngineeringDeviceOperation, ...]
+    entity_operations: tuple[EngineeringEntityOperation, ...]
+    metadata: EngineeringRegistryMetadata
 
 
 @dataclass(frozen=True, slots=True)
@@ -1037,15 +1299,15 @@ class EngineeringRegistrySyncResult:
     metadata: EngineeringRegistryMetadata
 ```
 
-Create/update nodes in this order: Miniserver reference, bus, bridge, physical device, service module. Register `(DOMAIN, scoped_identifier)` and use `(DOMAIN, via_identifier)` for `via_device`; keep the Miniserver identifier unscoped as specified. Use `suggested_area` on creation. Update `area_id` on a later room move only when the current area is empty or equals the previously stored managed area. Do not create devices for structural/channel nodes or empty/unsupported service modules.
+The planner reads the current registries but performs no mutation. The applier runs two device passes: first create/update every eligible Miniserver reference, bus, bridge, physical device, and service module; then resolve entry-scoped registry IDs and call `async_update_device(..., via_device_id=<concrete id>)`. Register `(DOMAIN, scoped_identifier)` and keep the Miniserver identifier unscoped as specified. Use `suggested_area` on creation. Update `area_id` on a later room move only when the current area is empty or equals the previously stored managed area. Do not create devices for structural/channel nodes or empty/unsupported service modules. Every operation has a stable target and desired end state so applying the same plan again is harmless after partial failure or restart.
 
 - [ ] **Step 4: Implement conservative legacy entity reassociation**
 
-For each entity spec, look up the existing entity registry entry by unchanged `(platform, DOMAIN, engineering_uuid)` and update only `device_id`, `original_name`, and integration-owned area association. Reassociate an entity from a legacy `(DOMAIN, engineering_uuid)` device only when exactly one loaded PyLoxone config entry claims that UUID. Leave ambiguous legacy devices and entity associations unchanged and include the ambiguity in the sync result count/log.
+For each entity spec, use global `async_get_entity_id(platform, DOMAIN, engineering_uuid)`. If the entry belongs to another config entry, do not mutate it and return an inventory-only rejection with the fixed reason from ruling 5. This lookup must work from the persisted registry even when the owner entry is unloaded. Otherwise update only `device_id`, `original_name`, and integration-owned area association. Reassociate an entity from a legacy `(DOMAIN, engineering_uuid)` device only when the persisted registry and all available snapshots establish one claimant; loaded-coordinator state alone is insufficient. Leave ambiguous legacy devices and entity associations unchanged and include the ambiguity in the sync result.
 
 - [ ] **Step 5: Change stale metadata consumers to use scoped identifiers**
 
-Update `async_load_engineering_registry_metadata()` to return `EngineeringRegistryMetadata`. In `async_run_registry_maintenance()`, merge `metadata.active_device_identifiers` into the public LoxAPP3 identifiers, merge `metadata.room_names` into current rooms, and leave observation counters unchanged on absent or incomplete engineering snapshots. Preserve the existing default-off cleanup option and all three grace modes.
+Store registry metadata through the Task 4 private `StoredEngineeringState` envelope. After a plan is fully applied, persist its `managed_area_ids` and `applied_generation`. In `async_run_registry_maintenance()`, merge `metadata.active_device_identifiers` into the public LoxAPP3 identifiers, merge `metadata.room_names` into current rooms, and leave observation counters unchanged on absent, incomplete, pending, or already-observed engineering generations. Preserve the existing default-off cleanup option and all three grace modes.
 
 - [ ] **Step 6: Run registry and maintenance tests**
 
@@ -1071,8 +1333,8 @@ git commit -m "feat: register engineering device topology"
 
 **Interfaces:**
 - Consumes: `build_engineering_entity_specs(snapshot.rows, runtime)` and the config-entry-scoped `engineering_inventory_updated_signal(entry_id)`.
-- Produces: `filter_existing_loxapp_entities(specs, existing_uuids)`, updated `LoxoneEngineeringSensor`, and new `LoxoneEngineeringBinarySensor`, both preserving `unique_id == engineering UUID` and attaching to `(DOMAIN, owner_identifier)`.
-- Guarantees: existing LoxAPP3 entities win UUID deduplication; cached entities start unavailable; removed prepared entities become unavailable rather than being deleted immediately.
+- Produces: `filter_existing_loxapp_entities(specs, existing_uuids)`, updated `LoxoneEngineeringSensor`, and new `LoxoneEngineeringBinarySensor`, both preserving `unique_id == engineering UUID`, attaching to `(DOMAIN, owner_identifier)`, and subscribing to verified `state_uuid` events.
+- Guarantees: existing LoxAPP3 entities and cross-entry registry owners win UUID deduplication; cached entities start unavailable but can rebind without an FTPS refresh; removed prepared entities become unavailable rather than being deleted immediately.
 
 - [ ] **Step 1: Write failing platform tests**
 
@@ -1089,6 +1351,7 @@ def entity_spec(
 ) -> EngineeringEntitySpec:
     return EngineeringEntitySpec(
         unique_id=unique_id,
+        state_uuid=unique_id,
         platform=platform,
         name="Outdoor temperature" if platform == "sensor" else "Input I1",
         native_value=value,
@@ -1097,7 +1360,6 @@ def entity_spec(
         owner_identifier="serial-a:weather-server" if platform == "sensor" else "serial-a",
         owner_name="Weather Server" if platform == "sensor" else "Miniserver",
         owner_model="WeatherServer" if platform == "sensor" else "Miniserver",
-        via_device_identifier="serial-a" if platform == "sensor" else None,
         room="Office",
         loxone_type="WeatherData" if platform == "sensor" else "DigitalIn",
         io_name="WDC1" if platform == "sensor" else "I1",
@@ -1112,12 +1374,15 @@ def test_engineering_sensor_attaches_to_service_module_and_keeps_uuid():
 
     assert entity.unique_id == "weather-value"
     assert entity.device_info["identifiers"] == {("loxone", "serial-a:weather-server")}
-    assert entity.device_info["via_device"] == ("loxone", "serial-a")
+    assert "via_device" not in entity.device_info
+    assert "name" not in entity.device_info
     assert entity.entity_registry_enabled_default is False
 
 
 def test_engineering_binary_sensor_is_read_only_and_uses_boolean_value():
-    entity = LoxoneEngineeringBinarySensor(entity_spec(platform="binary_sensor", value=True))
+    entity = LoxoneEngineeringBinarySensor(
+        entity_spec(unique_id="digital-i1", platform="binary_sensor", value=True)
+    )
 
     assert entity.unique_id == "digital-i1"
     assert entity.is_on is True
@@ -1139,6 +1404,23 @@ def test_public_loxapp_uuid_suppresses_duplicate_engineering_entity():
         {"existing-uuid"},
     )
     assert specs == ()
+
+
+async def test_cached_entity_rebinds_and_updates_from_state_uuid_event(entity_platform):
+    entity = entity_platform.add(entity_spec(value=None, available=False))
+    await entity_platform.rebind({"weather-value": 18.5})
+    entity_platform.fire_loxone_event("weather-value", 19.0)
+
+    assert entity.available is True
+    assert entity.native_value == 19.0
+
+
+async def test_non_finite_or_text_events_do_not_replace_last_good_value(entity_platform):
+    entity = entity_platform.add(entity_spec(value=18.5, available=True))
+    entity_platform.fire_loxone_event("weather-value", float("nan"))
+    entity_platform.fire_loxone_event("weather-value", "18.5 private-label")
+
+    assert entity.native_value == 18.5
 ```
 
 - [ ] **Step 2: Run platform tests and confirm binary engineering support is absent**
@@ -1149,22 +1431,16 @@ Expected: tests fail because `LoxoneEngineeringBinarySensor` and platform-neutra
 
 - [ ] **Step 3: Refactor sensor setup to consume platform-neutral specs**
 
-Keep one `prepared_entities: dict[str, LoxoneEngineeringSensor]` per config entry. Filter every spec whose UUID is already exposed by normal LoxAPP3 discovery. Construct device info only from the resolved spec:
+Keep one `prepared_entities: dict[str, LoxoneEngineeringSensor]` per config entry. Filter every spec whose UUID is already exposed by normal LoxAPP3 discovery or rejected by Task 5's persisted entity-identity check. Construct device info only from the resolved owner identifier:
 
 ```python
 device_info = {
     "identifiers": {(DOMAIN, spec.owner_identifier)},
-    "name": spec.owner_name,
-    "manufacturer": "Loxone",
-    "model": spec.owner_model,
-    "suggested_area": spec.room,
 }
-if spec.via_device_identifier is not None:
-    device_info["via_device"] = (DOMAIN, spec.via_device_identifier)
 self._attr_device_info = DeviceInfo(**device_info)
 ```
 
-Set `_attr_entity_registry_enabled_default = spec.enabled_by_default`, `_attr_available = spec.available`, and expose only technical fields (`uuid`, `io_name`, `loxone_type`, config version, binding method) as extra attributes. Do not expose raw XML attributes, arbitrary runtime text, full paths containing access labels, or endpoint URLs.
+Device names, models, rooms, and `via_device_id` are owned exclusively by Task 5 registry synchronization. Set `_attr_entity_registry_enabled_default = spec.enabled_by_default`, `_attr_available = spec.available`, and expose only technical fields (`uuid`, `io_name`, `loxone_type`, config version, binding method) as extra attributes. Do not expose raw XML attributes, arbitrary runtime text, full paths containing access labels, or endpoint URLs.
 
 - [ ] **Step 4: Add binary-sensor subscription and read-only entity class**
 
@@ -1198,6 +1474,14 @@ class LoxoneEngineeringBinarySensor(BinarySensorEntity):
             self.async_write_ha_state()
 ```
 
+Both engineering entity classes subscribe through the integration's ordinary
+Loxone websocket/event path using `spec.state_uuid`. A bounded reconnect rebind
+reads the currently known value without an engineering download. Accept only
+finite values already classified for the platform (`0/1` for binary sensors;
+finite number with the stored allowlisted unit for sensors). Transport or auth
+failure marks the binding unavailable while retaining the cached topology and
+last safe value. Unsubscribe callbacks are registered with the entity lifecycle.
+
 - [ ] **Step 5: Run platform and existing sensor tests**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests\test_engineering_platforms.py tests\test_engineering_entities.py tests\test_sensor_matching.py -v`
@@ -1221,9 +1505,9 @@ git commit -m "feat: expose resolved read-only channels"
 - Test: `tests/test_engineering_snapshot.py`
 
 **Interfaces:**
-- Consumes: snapshot store, topology resolver, capability resolver, registry sync, runtime probe, and LoxAPP3 `lastModified`.
-- Produces: `extract_loxapp_last_modified(lox_config)`, `LoxoneCoordinator._async_download_engineering_inventory()`, `async_restore_engineering_snapshot()`, `async_schedule_engineering_refresh()`, `async_refresh_engineering_inventory(force=False)`, and `engineering_snapshot` state.
-- Guarantees: unchanged revisions do not download FTPS; changed revisions queue one debounced refresh; manual refresh bypasses comparison; failed refresh leaves memory/storage/registries on the last good snapshot.
+- Consumes: private stored state, topology resolver, capability resolver, mutation-free registry planning, idempotent registry application, runtime probe/rebind, and LoxAPP3 `lastModified`.
+- Produces: `extract_loxapp_last_modified(lox_config)`, `LoxoneCoordinator._async_download_engineering_inventory()`, `async_restore_engineering_snapshot()`, `async_schedule_engineering_refresh()`, `async_refresh_engineering_inventory(force=False)`, `async_rebind_engineering_runtime()`, and committed/applied generation state.
+- Guarantees: unchanged revisions do not download FTPS but do rebind cached channels; changed revisions queue one debounced refresh; manual refresh bypasses comparison; pre-commit failure leaves old state untouched; post-commit registry failure retains a replayable pending generation and publishes no signals, impacts, or stale observation.
 
 - [ ] **Step 1: Write failing restore, debounce, unchanged, manual, and failure tests**
 
@@ -1252,9 +1536,11 @@ async def test_unchanged_revision_does_not_download(coordinator):
     coordinator.engineering_snapshot = make_snapshot(last_modified="revision-7")
     coordinator.miniserver.lox_config.json["lastModified"] = "revision-7"
     coordinator._async_download_engineering_inventory = AsyncMock()
+    coordinator.async_rebind_engineering_runtime = AsyncMock()
 
     assert await coordinator.async_refresh_engineering_inventory(force=False) is None
     coordinator._async_download_engineering_inventory.assert_not_awaited()
+    coordinator.async_rebind_engineering_runtime.assert_awaited_once()
 
 
 async def test_manual_refresh_downloads_even_when_revision_is_unchanged(coordinator):
@@ -1284,6 +1570,46 @@ async def test_failed_or_incomplete_refresh_preserves_last_good_snapshot(coordin
     assert coordinator.engineering_snapshot is original
     assert stores.snapshot is original
     assert registries.mutations == []
+
+
+async def test_snapshot_store_failure_leaves_memory_and_registries_untouched(
+    coordinator, stores, registries
+):
+    original = make_snapshot(last_modified="revision-7")
+    coordinator.engineering_snapshot = original
+    stores.fail_next_write = True
+    coordinator._async_download_engineering_inventory = AsyncMock(
+        return_value=provider_inventory()
+    )
+
+    with pytest.raises(RuntimeError):
+        await coordinator.async_refresh_engineering_inventory(force=True)
+
+    assert coordinator.engineering_snapshot is original
+    assert registries.mutations == []
+    assert coordinator.published_generations == []
+
+
+async def test_partial_registry_failure_is_committed_pending_and_replayed(
+    coordinator, stores, registries
+):
+    registries.fail_update_number = 2
+    coordinator._async_download_engineering_inventory = AsyncMock(
+        return_value=provider_inventory()
+    )
+
+    with pytest.raises(RuntimeError):
+        await coordinator.async_refresh_engineering_inventory(force=True)
+
+    pending = stores.state.snapshot.generation_id
+    assert stores.state.registry_applied_generation != pending
+    assert coordinator.published_generations == []
+    assert coordinator.stale_observations == []
+
+    registries.fail_update_number = None
+    await coordinator.async_restore_engineering_snapshot()
+    assert stores.state.registry_applied_generation == pending
+    assert coordinator.published_generations == [pending]
 ```
 
 - [ ] **Step 2: Run coordinator tests and confirm automatic orchestration is absent**
@@ -1297,16 +1623,29 @@ Expected: tests fail on missing restore/scheduling/snapshot behavior.
 `async_refresh_engineering_inventory(force=False)` must execute in this order:
 
 1. Read and normalize current LoxAPP3 `lastModified`.
-2. Return `None` without FTPS when `force` is false and the revision equals the stored revision.
-3. Download and parse into a local candidate without replacing coordinator fields.
-4. Reject an incomplete candidate.
-5. Probe runtime using existing bounded GET-only probes.
-6. Build source context, topology, capability rows, and candidate snapshot.
-7. Validate and store the sanitized candidate snapshot.
-8. Synchronize devices and registry metadata.
-9. Swap `engineering_inventory`, `engineering_runtime`, and `engineering_snapshot` together.
-10. Send the config-entry-scoped dispatcher signal.
-11. Compute warnings and run stale audit only after the successful swap.
+2. When `force` is false and the revision equals the stored revision, perform
+   only `async_rebind_engineering_runtime()` and return without FTPS.
+3. Download and parse into local candidate values without replacing coordinator
+   fields.
+4. Reject an incomplete candidate, duplicate UUIDs, unsafe snapshot fields, or
+   a failed auth/transport probe without mutating old state.
+5. Select safe probe candidates by technical capability, run bounded GET-only
+   probes, and build source, topology, capability rows, and entity specs.
+6. Build a deterministic candidate snapshot and registry plan. Compute its diff
+   and consumer impacts against the previous snapshot and pre-mutation Home
+   Assistant registry. This entire candidate phase is mutation-free.
+7. Persist the validated candidate as the committed last-known-good generation.
+   A failure here leaves old memory and registries untouched.
+8. Swap coordinator memory to the committed generation, then apply the registry
+   plan idempotently. If application fails or is cancelled, retain the committed
+   generation with an older `registry_applied_generation`, create one bounded
+   degraded-state notification, and stop without dispatcher signals, impact
+   publication/dismissal, or stale observation.
+9. After full registry success, persist the matching applied token and managed
+   area metadata. If this token write fails, treat the generation as pending and
+   replay safely; do not publish it yet.
+10. Send the config-entry-scoped entity signal, publish/dismiss precomputed
+    warnings, and submit the generation token to stale maintenance exactly once.
 
 Do not put passwords, hosts, URLs, arbitrary exception messages, or downloaded XML into notification text. Use a fixed notification ID per config entry so repeat failures replace one notification rather than accumulating.
 
@@ -1320,7 +1659,7 @@ self._engineering_refresh_task: asyncio.Task[None] | None = None
 self._engineering_refresh_lock = asyncio.Lock()
 ```
 
-`async_restore_engineering_snapshot()` loads the config-entry store, validates that its source entry ID and provider identifier match the connected Miniserver, registers cached devices, and publishes cached unavailable entity specs. `async_schedule_engineering_refresh(delay=5.0)` cancels only the coordinator's previous pending debounce task and schedules one background refresh. `async_cleanup()` cancels and awaits that task before closing the API.
+`async_restore_engineering_snapshot()` loads the config-entry store, validates that its source entry ID and provider identifier match the connected Miniserver, swaps in cached unavailable entity specs, and replays registry application whenever `registry_applied_generation != snapshot.generation_id`. It publishes the restored generation only after replay succeeds. It then performs a bounded runtime rebind regardless of whether the LoxAPP3 revision changed. `async_schedule_engineering_refresh(delay=5.0)` cancels only the coordinator's previous pending debounce task and schedules one background refresh. `async_cleanup()` cancels and awaits that task before closing the API. Cancellation at each await boundary follows the same pre-commit/post-commit recovery rule and is covered by fault-injection tests.
 
 - [ ] **Step 5: Wire startup/reload and manual refresh**
 
@@ -1351,9 +1690,9 @@ git commit -m "feat: refresh engineering inventory safely"
 - Test: `tests/test_registry_maintenance.py`
 
 **Interfaces:**
-- Consumes: `EngineeringChangeSet`, entity/device registries, Home Assistant Searcher, and `EngineeringSnapshot`.
-- Produces: `EngineeringEntityImpact`, `find_engineering_change_impacts()`, `async_warn_about_engineering_impacts()`, and a diagnostics-safe `engineering_inventory` tree/table payload.
-- Guarantees: affected automations/scripts/scenes/groups are reported but never modified; removed nodes enter existing grace handling; sensitive rows are omitted from public diagnostics.
+- Consumes: the previous and candidate snapshots, `EngineeringChangeSet`, pre-mutation entity/device registries, Home Assistant Searcher, and a successfully applied generation token.
+- Produces: `EngineeringEntityImpact`, immutable `EngineeringImpactPlan`, `async_find_engineering_change_impacts()`, `async_publish_engineering_impact_plan()`, exactly-once stale observation, and a diagnostics-safe `engineering_inventory` tree/table payload.
+- Guarantees: impact discovery precedes registry mutation; publication follows successful registry application; affected automations/scripts/scenes/groups are reported but never modified; removed nodes enter existing grace handling once per generation; sensitive rows are omitted from public diagnostics.
 
 - [ ] **Step 1: Write failing warning and diagnostics tests**
 
@@ -1362,12 +1701,15 @@ from custom_components.loxone.engineering_changes import EngineeringChangeSet
 from tests.engineering_fixtures import make_snapshot
 
 
-def test_removed_referenced_entity_creates_one_scoped_warning(impact_fakes):
-    count = async_warn_about_engineering_impacts(
+async def test_removed_referenced_entity_creates_one_scoped_warning(impact_fakes):
+    plan = await async_find_engineering_change_impacts(
         impact_fakes.hass,
         impact_fakes.config_entry,
-        EngineeringChangeSet(removed=("removed-channel",)),
+        PREVIOUS_WITH_REMOVED_CHANNEL,
         make_snapshot(),
+    )
+    count = await async_publish_engineering_impact_plan(
+        impact_fakes.hass, impact_fakes.config_entry, plan
     )
 
     assert count == 1
@@ -1376,12 +1718,15 @@ def test_removed_referenced_entity_creates_one_scoped_warning(impact_fakes):
     assert impact_fakes.automation_updates == []
 
 
-def test_unreferenced_metadata_rename_does_not_warn(impact_fakes):
-    count = async_warn_about_engineering_impacts(
+async def test_unreferenced_metadata_rename_does_not_warn(impact_fakes):
+    plan = await async_find_engineering_change_impacts(
         impact_fakes.hass,
         impact_fakes.config_entry,
-        EngineeringChangeSet(renamed=("renamed-device",)),
+        PREVIOUS_WITH_OLD_NAME,
         make_snapshot(),
+    )
+    count = await async_publish_engineering_impact_plan(
+        impact_fakes.hass, impact_fakes.config_entry, plan
     )
     assert count == 0
 
@@ -1402,7 +1747,7 @@ async def test_diagnostics_contains_complete_safe_rows_without_raw_exports(hass,
     assert "sensitive-payload" not in serialized
 ```
 
-Build `impact_fakes` with the same in-memory registry/Searcher pattern already used in `tests/test_config_impact.py`: one entity registry entry with unique ID `removed-channel`, one automation search result `automation.office_button`, a notification recorder, and an `automation_updates` list that remains empty. Patch only `dr.async_get`, `er.async_get`, `entity_sources`, `Searcher`, `persistent_notification.async_create`, and `persistent_notification.async_dismiss`; no Home Assistant service call is permitted in this fixture.
+Build `impact_fakes` with the same in-memory registry/Searcher pattern already used in `tests/test_config_impact.py`: one entity registry entry with unique ID `removed-channel`, one automation search result `automation.office_button`, a notification recorder, and an `automation_updates` list that remains empty. Patch only `dr.async_get`, `er.async_get`, `entity_sources`, `Searcher`, `persistent_notification.async_create`, and `persistent_notification.async_dismiss`; no Home Assistant service call is permitted in this fixture. Capture the immutable impact plan before applying a registry plan, mutate the fake registry, and prove publication still uses the captured previous entity identity.
 
 - [ ] **Step 2: Run impact and diagnostics tests and confirm they fail**
 
@@ -1423,7 +1768,7 @@ class EngineeringEntityImpact:
     references: Mapping[ItemType, tuple[str, ...]]
 ```
 
-Look up affected entity registry entries by unchanged engineering unique ID and use `Searcher` for the existing relevant item types. Warn only for removed or incompatible-platform changes with actual references. Names and room moves update presentation/areas but do not create an impact warning unless an existing area-targeted consumer is detected by the current area-impact code. Use one config-entry-scoped fixed notification ID; dismiss it when the latest successful diff has no impacts.
+`async_find_engineering_change_impacts()` accepts both snapshots and reads the current registry without mutation. Look up affected entity registry entries by unchanged engineering unique ID and use `Searcher` for the existing relevant item types. Warn only for removed or incompatible semantic-platform changes with actual references. Names and room moves update presentation/areas but do not create an impact warning unless an existing area-targeted consumer is detected by the current area-impact code. Return an immutable plan containing only sanitized entity IDs, consumer IDs, change kinds, and the candidate generation. `async_publish_engineering_impact_plan()` uses one config-entry-scoped fixed notification ID and dismisses it only when that exact generation has applied successfully with no impacts.
 
 - [ ] **Step 4: Replace raw diagnostics with the sanitized tree/table model**
 
@@ -1452,7 +1797,7 @@ Each row contains the exact inventory columns from the spec and no raw `attribut
 
 - [ ] **Step 5: Verify stale observations advance only after a successful complete refresh**
 
-Add a test that invokes the coordinator failure path followed by `async_run_registry_maintenance()` and asserts `missing_observations` is unchanged. Add a successful-removal test asserting the observation increments once and respects observation/time/combined mode exactly as configured.
+Add a test that invokes the coordinator failure path followed by `async_run_registry_maintenance()` and asserts `missing_observations` is unchanged. Add a successful-removal test asserting the observation increments once and respects observation/time/combined mode exactly as configured. Pass a deterministic `observation_token=snapshot.generation_id`; persist the last processed engineering token and make a second call with the same token a no-op. Runtime-only rebinds, startup replay of an already applied generation, and repeated forced downloads of the same revision must not advance the counter.
 
 - [ ] **Step 6: Run impacts, diagnostics, and maintenance tests**
 
@@ -1489,6 +1834,8 @@ Document these use cases in `docs/engineering-owner-resolution.md`:
 3. Internal digital/analog inputs and status values attach to the Miniserver.
 4. Weather and system-variable values group below service-module devices.
 5. Manual refresh always reads; automatic refresh downloads only after `lastModified` changes.
+   An unchanged revision still performs a read-only runtime rebind so cached
+   entities recover without another engineering archive download.
 6. Names, rooms, and topology moves preserve UUID identity; explicit user area overrides are respected.
 7. Removed or platform-incompatible referenced entities create a warning; automations are never edited.
 8. Outputs, NFC access data, arbitrary text, and unknown channels remain non-writable and are explained in inventory status.
@@ -1528,11 +1875,11 @@ Run:
 git diff --check upstream/master...HEAD
 git log --format='%h %an <%ae> %s' upstream/master..HEAD
 git diff --name-only upstream/master...HEAD
-rg -n -i "(latitude|longitude|gps|currentuser|username|password|token|remoteurl|localurl|hostaddress|accesscode|private[_ -]?key)" custom_components tests docs
-rg -n "(192\.168\.|10\.[0-9]+\.|172\.(1[6-9]|2[0-9]|3[01])\.)" custom_components tests docs
+git diff -U0 upstream/master...HEAD | rg -n -i "^\+.*(latitude|longitude|gps|currentuser|username|password|token|remoteurl|localurl|hostaddress|accesscode|private[_ -]?key)"
+git diff -U0 upstream/master...HEAD | rg -n "^\+.*(192\.168\.|10\.[0-9]+\.|172\.(1[6-9]|2[0-9]|3[01])\.)"
 ```
 
-Expected: `diff --check` is empty; every commit uses the approved GitHub identity; source hits are limited to generic field-deny/allowlist logic and synthetic safety assertions; private-address search returns no committed installation data. Inspect every remaining match manually before the final commit.
+Expected: `diff --check` is empty; every commit uses the approved GitHub identity; added-line hits are limited to generic field-deny/allowlist logic and synthetic safety assertions; private-address search returns no committed installation data. Inspect every added line and every remaining match manually before the final commit. Also inspect each transmissible commit rather than relying only on the aggregate diff.
 
 - [ ] **Step 6: Commit the version and documentation**
 
@@ -1555,9 +1902,16 @@ git rev-list --left-right --count upstream/master...HEAD
 
 Expected: lint/format/tests exit 0, the working tree is clean, and the branch reports `0` upstream-only commits.
 
-- [ ] **Step 8: Install locally in Home Assistant and validate only read-only behavior**
+- [ ] **Step 8: Stop for explicit live-deployment authorization, then validate read-only behavior**
 
-Use the Home Assistant API/operations path, not browser automation, to back up the currently installed integration, copy the verified `custom_components/loxone` directory, restart/reload Home Assistant, and confirm the reported integration version is `0.9.22.13`. Trigger the manual engineering refresh once and verify:
+Before any backup, copy, install, integration reload, or Home Assistant restart,
+present the completed automated verification and request a fresh explicit user
+authorization. Do not treat approval of this implementation plan as approval
+for the live mutation. After authorization, use the Home Assistant
+API/operations path, not browser automation, to back up the currently installed
+integration, copy the verified `custom_components/loxone` directory,
+restart/reload Home Assistant, and confirm the reported integration version is
+`0.9.22.13`. Trigger the manual engineering refresh once and verify:
 
 - the Miniserver has Link and Tree children when present;
 - the Tree NFC endpoint exists as a device without exposing tag/code data;
@@ -1568,7 +1922,7 @@ Use the Home Assistant API/operations path, not browser automation, to back up t
 - the automatic follow-up with unchanged `lastModified` performs no second FTPS download;
 - integration logs contain no new error and no raw sensitive/access value.
 
-Record the actual Home Assistant version and Loxone Miniserver firmware used for this validation in the local test report. Do not add host addresses, serial numbers, user names, project names, coordinates, credentials, or access labels to a commit.
+Record the actual Home Assistant version and Loxone Miniserver firmware used for this validation in `.superpowers/sdd/2026-09-13-owner-resolver-service-modules/local-ha-validation.md`. The file remains git-ignored and contains only sanitized versions, counts, outcomes, and risks. Do not add host addresses, serial numbers, user names, project names, coordinates, credentials, or access labels to a commit.
 
 - [ ] **Step 9: Stop at the local delivery boundary**
 

@@ -53,10 +53,17 @@ Every inventory is wrapped in an immutable source context containing:
 The config entry and serial number are the authoritative provider identity. This is essential because document-level service containers such as `WeatherServer` and `GlobalStates` are siblings of the `LoxLIVE` hardware node rather than its XML descendants. They still belong to the Miniserver from which that single project archive was downloaded.
 
 No ownership decision may be based on a translated title or user-editable name.
+The title is runtime presentation data and is not persisted in the sanitized
+snapshot. The serial number or config-entry ID remains the provider identity.
 
 ### 2. Topology graph and owner resolver
 
-The parsed engineering elements form a directed graph keyed by their stable engineering UUIDs. The graph classifies nodes as:
+The parsed engineering elements form a directed graph. UUID-backed nodes use
+their stable engineering UUID; UUID-less containers use an opaque, non-public
+parser key that contains no title, user value, address, or access label. Both
+`parent_uuid` and this internal `parent_key` are retained so a UUID-less
+container cannot disappear from ancestry. Duplicate stable UUIDs invalidate the
+candidate before resolver indexing. The graph classifies nodes as:
 
 - `miniserver`: the `LoxLIVE` physical controller
 - `bus`: a transport interface such as Link or Tree
@@ -84,6 +91,11 @@ Resolution follows these rules in order:
 4. Assign document-level provider services to the source Miniserver from the source context.
 5. Assign internal channels whose physical ancestor is `LoxLIVE` directly to the Miniserver.
 6. Leave a node unresolved when neither its type nor ancestry proves ownership. Report it in diagnostics instead of guessing.
+
+Sensitivity is inherited through the complete `parent_key` chain, including
+UUID-less containers. A sensitive container and all of its descendants are
+sanitized before snapshot persistence or public projection. Opaque parser keys
+prevent sensitive titles from leaking through synthetic identity fields.
 
 The expected synthetic reference topology is:
 
@@ -118,6 +130,12 @@ Initial recognized modules are:
 
 The module registry is type-driven. Titles are presentation only. Unknown module types remain visible in the complete inventory with `unsupported` status and are not silently discarded.
 
+A UUID-less provider service may use
+`{provider}:service:{normalized_type}` only when that technical type is a
+singleton in the source project. Duplicate UUID-less modules of the same type
+remain inventory-only with an ambiguity reason; titles are never used to
+disambiguate them.
+
 A structural or empty module is not created as a Home Assistant device. It remains visible in the integration inventory, with its configuration and capability status. This prevents device-registry clutter while preserving complete engineering visibility.
 
 ### 4. Capability resolver
@@ -132,6 +150,13 @@ Ownership and capability are separate decisions. Each channel receives one capab
 - `sensitive`: intentionally suppressed from normal exposure
 
 I/O prefixes such as `I`, `AI`, `Q`, `AQ`, `SYS`, or `WDC` are hints, not proof of write access. Runtime reads may use the existing UUID-first `/all` probe. Write capability is never tested by changing a real value. It is granted only from a whitelisted type and known command contract already supported by a dedicated handler.
+
+Probe candidates are selected by the same exact technical type policy used by
+the capability resolver, independently of the legacy `suggested_platform`
+hint. Sensitive descendants are excluded before any probe. Numeric results
+must be finite. Units are exposed only when empty or in the integration's
+explicit safe-unit map; a numeric prefix followed by arbitrary text is treated
+as text and is suppressed.
 
 Initial exposure policy:
 
@@ -162,9 +187,22 @@ Device identifiers use stable technical identities scoped to the source Miniserv
 
 User-facing names and rooms may change without changing these identifiers. Existing engineering entity unique IDs remain their engineering UUIDs. When an existing single-source pseudo-device uses the legacy unscoped engineering UUID, registry synchronization migrates its entity associations to the scoped owner and leaves the old device to the normal grace-based cleanup path. It must not merge an unscoped device when more than one config entry claims the same engineering UUID.
 
+Home Assistant entity identities are global to `(domain, platform,
+unique_id)` and are not config-entry scoped. If another config entry already
+owns a requested engineering UUID on the same platform, the existing entity is
+left unchanged and the conflicting channel remains inventory-only with reason
+`entity_unique_id_owned_by_other_entry`. Registry and persisted ownership are
+checked even when the other config entry is not currently loaded. Scoped IDs
+for such conflicting entities require a separate compatibility decision and
+are not introduced here.
+
 ### Entity registry
 
 Entities attach to the resolved owner device. Moving an entity from an old pseudo-device to its resolved owner changes the device association but not its unique ID. The integration must not forcibly rename a user-customized entity ID.
+
+Entity `DeviceInfo` contains only the resolved owner identifier. Device name,
+room, and `via_device_id` are synchronized centrally in two registry passes so
+platform setup cannot overwrite a newer topology with stale channel metadata.
 
 New engineering entities start disabled unless the exposure policy explicitly marks a read-only diagnostic/input class safe and useful by default. Writable engineering entities are never enabled automatically.
 
@@ -186,9 +224,25 @@ The inventory includes empty, configured-only, unsupported, and suppressed nodes
 
 ## Refresh, persistence, and change handling
 
-The sanitized resolved inventory is persisted per config entry. On Home Assistant startup it is restored before the first successful engineering download so registered hardware does not disappear during a temporary Miniserver or FTPS outage.
+The sanitized resolved inventory is persisted per config entry. On Home Assistant startup it is restored before the first successful engineering download so registered hardware does not disappear during a temporary Miniserver or FTPS outage. The private schema contains the source revision and only the safe topology, ownership, capability, unit, and entity-binding metadata required to reconstruct unavailable cached entities; it never contains runtime values, endpoints, raw attributes, host data, credentials, or provider/project/user/location titles.
 
-An explicit refresh button remains available. The integration also evaluates an automatic refresh trigger after the initial successful LoxAPP3 load and after every successful Miniserver reconnect/reload. It compares the current LoxAPP3 `lastModified` value with the value stored alongside the last resolved inventory. A changed value queues one debounced engineering refresh; an unchanged value causes no FTPS archive download. A missing or unparsable `lastModified` value does not discard the cache and leaves the manual refresh available. Failed refreshes preserve the last known-good snapshot and create a bounded repair notification; they never replace valid state with an empty inventory.
+An explicit refresh button remains available. The integration also evaluates an automatic refresh trigger after the initial successful LoxAPP3 load and after every successful Miniserver reconnect/reload. It compares the current LoxAPP3 `lastModified` value with the value stored alongside the last resolved inventory. A changed value queues one debounced engineering refresh; an unchanged value causes no FTPS archive download. An unchanged revision still performs a bounded read-only runtime rebind from cached channel identities so restored entities can become available without downloading the engineering archive. A missing or unparsable `lastModified` value does not discard the cache and leaves the manual refresh available. Failed downloads, parsing, validation, or snapshot writes preserve the last known-good snapshot and create a bounded repair notification; they never replace valid state with an empty inventory.
+
+Download, parse, resolve, candidate selection, runtime probe, capability
+resolution, validation, diffing, and impact discovery form a pure candidate
+phase. A validated candidate snapshot is then committed to the private store as
+the new last-known-good data generation. Device and entity registry application
+is a separate idempotent post-commit phase. If registry application fails after
+partial Home Assistant mutations, the committed generation is retained, no
+entity refresh signal or stale observation is published, and a bounded
+degraded-state notification schedules/requires replay. Startup replays any
+committed generation whose registry-applied token is older. This does not claim
+transactional rollback for Home Assistant registry calls.
+
+Prepared read-only entities subscribe to ordinary Loxone websocket events by
+their proven stable state UUID. Runtime events update finite numeric/boolean
+values only; unverified text or units never become state. Reconnect always
+rebinds cached channels even when topology is unchanged.
 
 After a successful refresh, the integration computes a UUID-based diff:
 
@@ -199,7 +253,18 @@ After a successful refresh, the integration computes a UUID-based diff:
 - removed nodes enter the existing persistent stale-device grace process
 - automations referencing entities affected by removal or an incompatible platform change are reported through Home Assistant repair/notification output
 
+Impact discovery runs against the previous snapshot and pre-mutation Home
+Assistant registry state. Notifications are emitted or dismissed only after
+the committed generation is applied successfully.
+
 Automatic deletion remains disabled by default. A failed, empty, or incomplete structure load never increments the missing-observation count.
+
+Every complete engineering snapshot has a deterministic generation token based
+on provider identity and configuration revision, not download time. Registry
+maintenance stores the last processed generation and advances grace counters at
+most once for that successful generation. Startup, runtime-only rebind, retry,
+or repeated manual refresh of the same configuration cannot double-count an
+observation.
 
 ## Error handling and safety boundaries
 
@@ -207,9 +272,12 @@ Automatic deletion remains disabled by default. A failed, empty, or incomplete s
 - Enforce the existing archive, compressed-data, and XML size limits.
 - Reject XML entity declarations and malformed parent cycles.
 - Bound parent traversal and report cycles or missing ancestors as unresolved.
+- Retain UUID-less parent context with opaque parser keys and inherit sensitive status through it.
+- Reject duplicate stable UUIDs before building dictionaries keyed by UUID.
 - Never downgrade a proven physical owner to a title-based guess.
 - Never perform write probes against the Miniserver.
 - Never expose NFC IDs, keycodes, passwords, tokens, or arbitrary string payloads.
+- Reject non-finite numeric values and numeric-prefix payloads with unknown text suffixes from entity exposure.
 - Never copy personal names, user-account names, geographic or installation names, GPS coordinates, private network addresses, or other person- or location-identifying artifacts into repository fixtures or documentation. Numbered device labels and room names are permitted. Examples otherwise use synthetic labels and invented identifiers that cannot be traced back to a person or deployment location.
 - Apply privacy filtering through an explicit field allowlist rather than a list of known personal values. Live exports must never be converted wholesale into repository fixtures. Source fields such as project or installation name, current user, location, latitude, longitude, local URL, remote URL, host address, and access-control labels are excluded before any fixture, log excerpt, or document is produced.
 - Keep the last known-good inventory on network, authentication, parsing, or runtime-probe failure.
@@ -235,6 +303,11 @@ Required cases:
 12. Keep automatic cleanup disabled by default and enforce observation, time, and combined grace modes.
 13. Produce change warnings for removed entities referenced by automations without modifying those automations.
 14. Reject a fixture-generation input containing forbidden identity, location, coordinate, URL, address, or access-control fields while retaining permitted numbered device labels and room names.
+15. Preserve UUID-less service/caption ancestry and reject duplicate stable UUIDs using parser-to-resolver XML tests.
+16. Keep conflicting entity UUIDs inventory-only when another config entry owns the global Home Assistant entity identity, including reversed load order and unloaded-owner cases.
+17. Rebind cached channels after restart with no FTPS download when `lastModified` is unchanged, then update them from finite websocket values.
+18. Reject unknown units, numeric-prefix text, non-finite values, authentication/transport probe failures, and nested sensitive descendants without changing the last good snapshot.
+19. Replay an idempotent partially applied registry generation after restart and process each stale-observation generation only once.
 
 Integration-level tests verify that Home Assistant device-registry entries form the expected `via_device` chain, service-module entities share one logical device, and disabled-by-default outputs cannot be invoked.
 
@@ -249,10 +322,12 @@ Integration-level tests verify that Home Assistant device-registry entries form 
 - The full inventory shows all discovered modules and explains why unsupported or configured-only items have no entity.
 - No real output changes while refreshing, probing, resolving, or registering the inventory.
 - Existing unique IDs remain unchanged.
+- A cross-entry UUID collision never steals or rewires the entity already owned by another config entry.
+- An unchanged topology revision performs no FTPS download but restores live read-only values through rebind/events.
 - Existing tests and all new topology, capability, privacy, and registry tests pass on the repository's supported Python and Home Assistant versions.
 
 ## Delivery boundaries
 
-Implementation remains local on a dedicated feature branch until tests, privacy review, and live Home Assistant validation are complete. The work must be split into reviewable commits by responsibility. No fork push, discussion update, upstream pull request, or other external publication is part of this implementation phase.
+Implementation remains local on a dedicated feature branch until tests, privacy review, and live Home Assistant validation are complete. The work must be split into reviewable commits by responsibility. No fork push, discussion update, upstream pull request, or other external publication is part of this implementation phase. Live Home Assistant backup, installation, or restart requires an explicit user authorization at that later gate. Its uncommitted report is stored only in the git-ignored SDD workspace and contains sanitized versions, counts, outcomes, and risks.
 
 Before any later push, review both the final upstream diff and every commit that would be transmitted. If an ancestor contains personal names, user-account names, geographic or installation names, GPS coordinates, private network addresses, or comparable identifying artifacts, rebuild the deliverable branch from the official upstream base with sanitized patches; adding a later cleanup commit is insufficient because the earlier commit remains visible in history. Commit metadata may contain only the approved GitHub username and GitHub-provided noreply address.
