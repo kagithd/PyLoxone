@@ -103,7 +103,8 @@ def select_runtime_probe_elements(inventory: Any):
 
     def sensitive(item: Any) -> bool:
         seen = set()
-        for _ in range(128):
+        # Starting node plus the resolver's 128 permitted parent links.
+        for _ in range(129):
             if item is None or item.key in seen:
                 return True
             seen.add(item.key)
@@ -139,41 +140,26 @@ def _descriptor(binding: EngineeringRuntimeBinding | None) -> SafeRuntimeBinding
         return None
     if binding.numeric_value is None or not math.isfinite(binding.numeric_value):
         return None
+    safe_unit = _safe_unit(binding)
+    if binding.unit is not None and safe_unit is None:
+        return None
     return SafeRuntimeBindingDescriptor(
         binding_method=binding.binding_method or "read_only",
         value_kind="boolean" if binding.value_kind == "boolean" else "number",
-        safe_unit=binding.unit
-        if binding.unit
-        in {
-            None,
-            "%",
-            "°",
-            "°C",
-            "°F",
-            "C",
-            "F",
-            "V",
-            "A",
-            "W",
-            "kW",
-            "Wh",
-            "kWh",
-            "Hz",
-            "lx",
-            "Pa",
-            "bar",
-            "ppm",
-            "s",
-            "min",
-            "h",
-        }
-        else None,
+        safe_unit=safe_unit,
         state_uuid=binding.state_uuid,
         event_binding_proven=bool(binding.state_uuid and binding.binding_method == "uuid_all"),
     )
 
 
-def resolve_capability(  # noqa: PLR0911
+def _safe_unit(binding: EngineeringRuntimeBinding) -> str | None:
+    """Return the sole canonical unit representation, or reject the input."""
+    from .engineering_entities import normalize_engineering_unit  # noqa: PLC0415
+
+    return normalize_engineering_unit(binding.unit, title=binding.title, loxone_type=binding.loxone_type)
+
+
+def resolve_capability(  # noqa: PLR0911, PLR0912
     node: ResolvedEngineeringNode, binding: EngineeringRuntimeBinding | None
 ) -> EngineeringCapability:
     """Classify a read result without granting any write capability."""
@@ -209,6 +195,10 @@ def resolve_capability(  # noqa: PLR0911
     ):
         return EngineeringCapability(
             CapabilityState.UNSUPPORTED, None, ExposureStatus.SUPPRESSED, "non_numeric_runtime_value"
+        )
+    if binding.unit is not None and _safe_unit(binding) is None:
+        return EngineeringCapability(
+            CapabilityState.UNSUPPORTED, None, ExposureStatus.INVENTORY_ONLY, "invalid_runtime_unit"
         )
     if type_value in OUTPUT_TYPES:
         return EngineeringCapability(

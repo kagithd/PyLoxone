@@ -166,6 +166,13 @@ def test_async_probe_uses_explicit_all_state_tuple_not_root_value():
     assert (binding.state_uuid, binding.numeric_value, binding.unit) == ("event", 20.5, "C")
 
 
+def test_async_probe_scalar_only_all_falls_back_without_event_mapping():
+    binding, _session = _probe([(200, b'<LL Code="200" value="2"/>'), (200, b'<LL Code="200" value="2"/>')])
+    assert binding.status == "bound"
+    assert binding.binding_method == "uuid_state"
+    assert binding.state_uuid is None
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf")])
 def test_nonfinite_scalar_is_cleared(value):
     binding = binding_from_response("id", value)

@@ -257,6 +257,8 @@ def normalize_engineering_unit(
         "min",
         "h",
     }
+    if unit is None:
+        return None
     if unit != "°":
         return unit if unit in safe_units else None
     context = f"{title or ''} {loxone_type or ''}".casefold()

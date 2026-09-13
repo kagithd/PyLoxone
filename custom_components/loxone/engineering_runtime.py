@@ -385,7 +385,8 @@ async def _probe_element(
                 if method == "uuid_all":
                     states = tuple(state for state in parsed.numeric_states if state.state_uuid)
                     if len(states) != 1:
-                        failures.add("malformed_response")
+                        # A well-formed /all response may simply lack an event
+                        # mapping.  It is not a malformed transport payload.
                         continue
                     state = states[0]
                     return EngineeringRuntimeBinding(

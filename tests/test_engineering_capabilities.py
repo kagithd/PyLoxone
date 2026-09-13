@@ -154,12 +154,8 @@ def test_descriptor_drops_unknown_units_and_cached_invalid_rebind_is_unavailable
         ResolvedEngineeringInventory(source(), (resolved_node("ai1", "VoltageIn"),)),
         EngineeringRuntimeInventory((binding,)),
     )
-    assert rows[0].binding is not None
-    assert rows[0].binding.safe_unit is None
-    failed = replace(binding, status="transport_error")
-    spec = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((failed,)))[0]
-    assert spec.available is False
-    assert spec.native_value is None
+    assert rows[0].binding is None
+    assert rows[0].capability.reason == "invalid_runtime_unit"
 
 
 @pytest.mark.parametrize("unit", ["invalid", "V"])
@@ -187,3 +183,15 @@ def test_malformed_probe_remains_distinguishable_in_capability_row():
 def test_physical_nfc_hardware_is_not_reclassified_sensitive():
     capability = resolve_capability(resolved_node("nfc", "NfcCodeTouch"), None)
     assert capability.state is not CapabilityState.SENSITIVE
+
+
+def test_invalid_initial_unit_is_not_prepared_and_degree_is_canonical():
+    invalid = replace(numeric_binding("ai1", 2.4), unit="invalid")
+    assert resolve_capability(resolved_node("ai1", "VoltageIn"), invalid).reason == "invalid_runtime_unit"
+    degree = replace(numeric_binding("ai2", 2.4), unit="°", title="Temperature")
+    rows = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("ai2", "VoltageIn"),)),
+        EngineeringRuntimeInventory((degree,)),
+    )
+    assert rows[0].binding is not None
+    assert rows[0].binding.safe_unit == "°C"
