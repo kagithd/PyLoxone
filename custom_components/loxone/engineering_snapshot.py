@@ -8,13 +8,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import re
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
-import hashlib
 from ipaddress import ip_address
-import json
-import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -39,9 +39,10 @@ from .engineering_config import EngineeringElement, EngineeringInventory
 from .engineering_topology import (
     EngineeringSourceContext,
     NodeKind,
-    ResolvedEngineeringNode,
     ResolutionStatus,
+    ResolvedEngineeringNode,
     classify_node_kind,
+    effective_engineering_technical_type,
     resolve_engineering_topology,
 )
 
@@ -61,9 +62,9 @@ _URL_PATTERN = re.compile(r"(?:https?|ftp)://", re.IGNORECASE)
 _ADDRESS_CONTENT = re.compile(r"[0-9A-Fa-f:.]+")
 _SEMANTIC_PLATFORMS = frozenset({"sensor", "binary_sensor"})
 _VALUE_KINDS = frozenset({"number", "boolean"})
-_SUPPORTED_BINDING_METHODS = frozenset({"uuid_all", "uuid_state"})
+_SUPPORTED_BINDING_METHODS = frozenset({"io_name_state", "uuid_all", "uuid_state"})
 _FORBIDDEN_PRESENTATION_TYPES = frozenset({"category", "document", "loxlive", "page", "place", "user"})
-_SENSITIVE_ROLE_PREFIXES = ("access", "keycode", "nfccode", "nfctag", "permission", "user")
+_ENGINEERING_STORE_WRITE_LOCKS = "loxone_engineering_store_write_locks"
 _MAX_SAFE_STRING_LENGTH = 256
 _FIRST_CONTROL_CHARACTER = 32
 
@@ -88,9 +89,15 @@ class EngineeringStoreCommitOutcome(StrEnum):
 class EngineeringStoreCommitError(EngineeringSnapshotError):
     """Raised when Home Assistant did not acknowledge an atomic Store commit."""
 
-    def __init__(self, outcome: EngineeringStoreCommitOutcome) -> None:
+    def __init__(
+        self,
+        outcome: EngineeringStoreCommitOutcome,
+        *,
+        settled_outcome: EngineeringStoreCommitOutcome | None = None,
+    ) -> None:
         """Initialize the bounded non-commit outcome."""
         self.outcome = outcome
+        self.settled_outcome = settled_outcome
         super().__init__(f"engineering state Store commit was not acknowledged: {outcome.value}")
 
 
@@ -232,12 +239,7 @@ def engineering_configuration_revision_id(source: EngineeringSourceContext) -> s
 
 def _effective_technical_type(element: EngineeringElement) -> str | None:
     """Keep only the technical role needed for independent validation."""
-    xml_role = element.xml_element.casefold()
-    if xml_role != "c" and xml_role.startswith(_SENSITIVE_ROLE_PREFIXES):
-        return element.xml_element
-    if element.loxone_type:
-        return element.loxone_type
-    return element.xml_element if element.xml_element.casefold() != "c" else None
+    return effective_engineering_technical_type(element)
 
 
 def _allows_presentation(
@@ -785,9 +787,7 @@ def _authoritative_topology(
         xml_size=0,
         elements=elements,
     )
-    if not any(
-        element.uuid is not None and (element.loxone_type or "").casefold() == "loxlive" for element in elements
-    ):
+    if not inventory.is_complete:
         raise EngineeringSnapshotError("snapshot is missing a stable Miniserver anchor")
     return resolve_engineering_topology(inventory, source).nodes
 
@@ -857,7 +857,7 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
                 raise EngineeringSnapshotError("row event binding proof is incomplete")
         elif binding.event_binding_proven or binding.state_uuid is not None:
             raise EngineeringSnapshotError("row scalar binding contains an unproven state_uuid")
-        if capability.state is not CapabilityState.READABLE:
+        if capability.state not in {CapabilityState.READABLE, CapabilityState.UNSUPPORTED}:
             raise EngineeringSnapshotError("row binding contradicts capability state")
     if capability.exposure is ExposureStatus.PREPARED_DISABLED:
         if (
@@ -880,13 +880,17 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
             raise EngineeringSnapshotError("output row capability is inconsistent")
         return
     if capability.state is CapabilityState.READABLE:
+        valid_reason = capability.reason in {
+            "entity_unique_id_owned_by_other_entry",
+            "readable_rebind_only",
+        }
         if (
             semantic is None
             or capability.platform != semantic
             or capability.exposure is not ExposureStatus.INVENTORY_ONLY
-            or capability.reason != "readable_rebind_only"
+            or not valid_reason
             or binding is None
-            or binding.event_binding_proven
+            or (capability.reason == "readable_rebind_only" and binding.event_binding_proven)
         ):
             raise EngineeringSnapshotError("readable row capability is inconsistent")
         return
@@ -915,9 +919,12 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
         }
         if (
             capability.platform is not None
-            or binding is not None
             or valid_unsupported.get(capability.reason) is not capability.exposure
             or (capability.reason == "unsupported_technical_type" and technical_type in PROBE_TYPES)
+            or (
+                binding is not None
+                and not (capability.reason == "binary_semantics_not_proven" and technical_type in BINARY_TYPES)
+            )
         ):
             raise EngineeringSnapshotError("unsupported row capability is inconsistent")
         return
@@ -1027,10 +1034,14 @@ def snapshot_to_dict(snapshot: EngineeringSnapshot) -> dict[str, Any]:
     """Serialize exactly the private safe reconstruction allowlist."""
     validate_engineering_snapshot(snapshot)
     safe_nodes = _safe_projection_nodes(snapshot.source, snapshot.nodes)
+    safe_nodes_by_key = {node.element.key: node for node in safe_nodes}
+    safe_rows = tuple(replace(row, node=safe_nodes_by_key[row.node.element.key]) for row in snapshot.rows)
+    safe_snapshot = replace(snapshot, nodes=safe_nodes, rows=safe_rows)
+    validate_engineering_snapshot(safe_snapshot)
     return {
         "source": _source_to_dict(snapshot.source),
         "nodes": [_node_to_dict(node) for node in safe_nodes],
-        "rows": [_row_to_dict(row) for row in snapshot.rows],
+        "rows": [_row_to_dict(row) for row in safe_rows],
         "configuration_revision_id": snapshot.configuration_revision_id,
         "safe_content_digest": snapshot.safe_content_digest,
         "read_sequence": snapshot.read_sequence,
@@ -1300,13 +1311,44 @@ class EngineeringStateStore(Store[dict[str, Any]]):
             atomic_writes=True,
             **kwargs,
         )
+        locks = hass.data.setdefault(_ENGINEERING_STORE_WRITE_LOCKS, {})
+        self._commit_lock = locks.setdefault(key, asyncio.Lock())
+
+    @staticmethod
+    def _settled_write_outcome(task: asyncio.Task[None]) -> EngineeringStoreCommitOutcome:
+        """Map one completed HA write task to a bounded persistence outcome."""
+        if task.cancelled():
+            return EngineeringStoreCommitOutcome.CANCELLED
+        try:
+            task.result()
+        except json_util.SerializationError:
+            return EngineeringStoreCommitOutcome.SERIALIZATION_FAILED
+        except WriteError:
+            return EngineeringStoreCommitOutcome.WRITE_FAILED
+        except Exception:  # noqa: BLE001 -- preserve the Store boundary's bounded outcome.
+            return EngineeringStoreCommitOutcome.FAILED
+        return EngineeringStoreCommitOutcome.COMMITTED
+
+    async def _join_cancelled_write(
+        self,
+        task: asyncio.Task[None],
+    ) -> EngineeringStoreCommitOutcome:
+        """Retain serialization ownership until an executor-backed write settles."""
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:  # noqa: BLE001 -- outcome is read from the completed task below.
+                break
+        return self._settled_write_outcome(task)
 
     async def async_save_acknowledged(
         self,
         data: dict[str, Any],
     ) -> EngineeringStoreCommitOutcome:
         """Atomically save, surfacing every non-commit outcome to the caller."""
-        async with self._write_lock:
+        async with self._commit_lock, self._write_lock:
             if self.hass.state is CoreState.stopping:
                 raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.STOPPING)
             if self._read_only:
@@ -1326,10 +1368,18 @@ class EngineeringStateStore(Store[dict[str, Any]]):
             self._data = None
             if candidate is None:
                 raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.DEFERRED)
+            write_task = asyncio.create_task(self._async_write_data(candidate))
             try:
-                await self._async_write_data(candidate)
+                await asyncio.shield(write_task)
             except asyncio.CancelledError as err:
-                raise EngineeringStoreCommitCancelledError(EngineeringStoreCommitOutcome.CANCELLED) from err
+                caller_cancelled = bool(asyncio.current_task() and asyncio.current_task().cancelling())
+                settled = await self._join_cancelled_write(write_task)
+                if caller_cancelled:
+                    raise EngineeringStoreCommitCancelledError(
+                        EngineeringStoreCommitOutcome.CANCELLED,
+                        settled_outcome=settled,
+                    ) from err
+                raise EngineeringStoreCommitError(settled) from err
             except json_util.SerializationError as err:
                 raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.SERIALIZATION_FAILED) from err
             except WriteError as err:

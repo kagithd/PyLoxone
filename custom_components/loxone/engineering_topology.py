@@ -152,6 +152,31 @@ _PHYSICAL_TYPES = frozenset({"nfccodetouch"})
 _TYPED_SERVICE_OWNERS = {"weatherdata": "weatherserver", "sysvar": "globalstates"}
 
 
+def is_sensitive_engineering_role(value: str | None, *, technical_type: bool = False) -> bool:
+    """Apply the one authoritative policy for privacy-sensitive XML roles."""
+    normalized = (value or "").casefold()
+    if technical_type and normalized in _PHYSICAL_TYPES:
+        return False
+    return normalized in _SENSITIVE_TYPES or normalized.startswith(_SENSITIVE_PREFIXES)
+
+
+def is_sensitive_engineering_element(element: EngineeringElement) -> bool:
+    """Return whether either the XML role or technical type is sensitive."""
+    return is_sensitive_engineering_role(element.xml_element) or is_sensitive_engineering_role(
+        element.loxone_type,
+        technical_type=True,
+    )
+
+
+def effective_engineering_technical_type(element: EngineeringElement) -> str | None:
+    """Preserve an XML sensitivity role ahead of any unrelated Type attribute."""
+    if is_sensitive_engineering_role(element.xml_element):
+        return element.xml_element
+    if element.loxone_type:
+        return element.loxone_type
+    return element.xml_element if element.xml_element.casefold() != "c" else None
+
+
 def classify_node_kind(element: EngineeringElement) -> NodeKind:
     """Classify only from the technical type, never editable presentation text."""
     normalized_type = (element.loxone_type or "").casefold()
@@ -457,13 +482,7 @@ class OwnerResolver:
 
     @staticmethod
     def _is_sensitive(item: EngineeringElement) -> bool:
-        type_value = (item.loxone_type or "").casefold()
-        tag_value = item.xml_element.casefold()
-        if tag_value in _SENSITIVE_TYPES or tag_value.startswith(_SENSITIVE_PREFIXES):
-            return True
-        return type_value not in _PHYSICAL_TYPES and (
-            type_value in _SENSITIVE_TYPES or type_value.startswith(_SENSITIVE_PREFIXES)
-        )
+        return is_sensitive_engineering_element(item)
 
     @staticmethod
     def _sanitize(item: EngineeringElement) -> EngineeringElement:

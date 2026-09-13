@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
-import math
 from typing import TYPE_CHECKING, Any, Literal
+
+from .engineering_topology import is_sensitive_engineering_element
 
 if TYPE_CHECKING:
     from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
@@ -15,9 +17,6 @@ SENSOR_TYPES = frozenset({"voltagein", "analoginput", "weatherdata", "sysvar"})
 BINARY_TYPES = frozenset({"digitalin", "digitalinput", "online", "status", "devicestatus", "deviceonline"})
 OUTPUT_TYPES = frozenset({"actor", "analogout"})
 PROBE_TYPES = SENSOR_TYPES | BINARY_TYPES | OUTPUT_TYPES
-SENSITIVE_TYPES = frozenset(
-    {"accesscode", "credential", "keycode", "nfccode", "nfctag", "password", "permission", "user"}
-)
 
 
 class CapabilityState(StrEnum):
@@ -78,14 +77,7 @@ def _type(node: ResolvedEngineeringNode) -> str:
 
 
 def _is_sensitive(node: ResolvedEngineeringNode) -> bool:
-    type_value = _type(node)
-    return node.sensitive or (
-        type_value != "nfccodetouch"
-        and (
-            type_value in SENSITIVE_TYPES
-            or type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
-        )
-    )
+    return node.sensitive or is_sensitive_engineering_element(node.element)
 
 
 def select_runtime_probe_candidates(resolved: ResolvedEngineeringInventory) -> tuple[ResolvedEngineeringNode, ...]:
@@ -108,16 +100,7 @@ def select_runtime_probe_elements(inventory: Any):
             if item is None or item.key in seen:
                 return True
             seen.add(item.key)
-            type_value = (item.loxone_type or "").casefold()
-            tag_value = (item.xml_element or "").casefold()
-            if tag_value in SENSITIVE_TYPES or tag_value.startswith(
-                ("access", "keycode", "nfccode", "nfctag", "permission", "user")
-            ):
-                return True
-            if type_value in SENSITIVE_TYPES or (
-                type_value != "nfccodetouch"
-                and type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
-            ):
+            if is_sensitive_engineering_element(item):
                 return True
             if item.parent_key is None:
                 return False

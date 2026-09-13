@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from datetime import UTC, datetime
 from math import nan
@@ -20,13 +21,15 @@ from custom_components.loxone.engineering_capabilities import (
     EngineeringCapability,
     ExposureStatus,
     SafeRuntimeBindingDescriptor,
+    resolve_engineering_capabilities,
 )
 from custom_components.loxone.engineering_changes import (
     EngineeringEntityImpact,
     EngineeringImpactPlan,
 )
+from custom_components.loxone.engineering_config import parse_engineering_xml
 from custom_components.loxone.engineering_entities import build_engineering_entity_specs
-from custom_components.loxone.engineering_runtime import EngineeringRuntimeInventory
+from custom_components.loxone.engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
 from custom_components.loxone.engineering_snapshot import (
     ENGINEERING_SNAPSHOT_STORAGE_VERSION,
     EngineeringSnapshot,
@@ -47,6 +50,7 @@ from custom_components.loxone.engineering_snapshot import (
     stored_state_to_dict,
     validate_engineering_snapshot,
 )
+from custom_components.loxone.engineering_topology import resolve_engineering_topology
 from tests.engineering_fixtures import (
     cyclic_inventory,
     element,
@@ -1031,3 +1035,231 @@ async def test_real_store_surfaces_non_committing_modes(
 
     assert raised.value.outcome is outcome
     assert not Path(store.path).exists()
+
+
+async def _wait_thread_event(event: threading.Event) -> None:
+    """Wait without occupying a Home Assistant executor worker."""
+    for _ in range(500):
+        if event.is_set():
+            return
+        await asyncio.sleep(0.01)
+    pytest.fail("controlled Store writer did not reach the expected phase")
+
+
+@pytest.mark.anyio
+async def test_cancelled_same_store_save_keeps_serialization_until_write_settles(tmp_path, monkeypatch):
+    """Caller cancellation before the executor starts cannot release write ownership."""
+    hass = HomeAssistant(str(tmp_path))
+    store = _real_engineering_store(hass)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original = store._async_write_data
+
+    async def blocked_write(data):
+        entered.set()
+        await release.wait()
+        await original(data)
+
+    monkeypatch.setattr(store, "_async_write_data", blocked_write)
+    first = asyncio.create_task(
+        store.async_save_acknowledged(stored_state_to_dict(StoredEngineeringState(make_snapshot())))
+    )
+    await entered.wait()
+    first.cancel()
+    retry = asyncio.create_task(
+        store.async_save_acknowledged(stored_state_to_dict(StoredEngineeringState(make_snapshot(read_sequence=2))))
+    )
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert not retry.done()
+    release.set()
+    with pytest.raises(EngineeringStoreCommitError) as raised:
+        await first
+    assert raised.value.outcome is EngineeringStoreCommitOutcome.CANCELLED
+    assert raised.value.settled_outcome is EngineeringStoreCommitOutcome.COMMITTED
+    assert await retry is EngineeringStoreCommitOutcome.COMMITTED
+    loaded = stored_state_from_dict(await _real_engineering_store(hass).async_load(), "entry-a")
+    assert loaded.snapshot.read_sequence == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("block_after_replace", [False, True])
+async def test_cancelled_wrapper_save_blocks_new_store_until_executor_settles(
+    tmp_path,
+    monkeypatch,
+    block_after_replace,
+):
+    """New Store wrappers cannot let a retry overtake an in-flight cancelled writer."""
+    hass = HomeAssistant(str(tmp_path))
+    started = threading.Event()
+    release = threading.Event()
+    completion_order = []
+    original = EngineeringStateStore._write_prepared_data
+
+    def controlled_write(store, mode, json_data):
+        raw = json.loads(json_data)
+        sequence = raw["data"]["snapshot"]["read_sequence"]
+        if sequence == 1:
+            if block_after_replace:
+                original(store, mode, json_data)
+            started.set()
+            release.wait(5)
+            if not block_after_replace:
+                original(store, mode, json_data)
+        else:
+            original(store, mode, json_data)
+        completion_order.append(sequence)
+
+    monkeypatch.setattr(EngineeringStateStore, "_write_prepared_data", controlled_write)
+    first = asyncio.create_task(async_store_engineering_state(hass, StoredEngineeringState(make_snapshot())))
+    await _wait_thread_event(started)
+    first.cancel()
+    retry = asyncio.create_task(
+        async_store_engineering_state(hass, StoredEngineeringState(make_snapshot(read_sequence=2)))
+    )
+    await asyncio.sleep(0.05)
+
+    assert not first.done()
+    assert not retry.done()
+    release.set()
+    with pytest.raises(EngineeringStoreCommitError) as raised:
+        await first
+    assert raised.value.outcome is EngineeringStoreCommitOutcome.CANCELLED
+    assert raised.value.settled_outcome is EngineeringStoreCommitOutcome.COMMITTED
+    await retry
+    assert completion_order == [1, 2]
+    loaded = await async_load_engineering_state(hass, "entry-a")
+    assert loaded.snapshot.read_sequence == 2
+
+
+def test_nonbinary_digital_input_producer_snapshot_round_trip_is_inventory_only():
+    """A safely bound non-binary DigitalIn remains inventory data, never prepared."""
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", room=None),
+        element("digital", "DigitalIn", parent_uuid="ms", io_name="I1"),
+    )
+    runtime = EngineeringRuntimeInventory(bindings=(numeric_binding("digital", 2.0, "DigitalIn"),))
+
+    restored = snapshot_from_dict(snapshot_to_dict(make_snapshot(inventory=inventory, runtime=runtime)))
+    row = next(item for item in restored.rows if item.node.element.uuid == "digital")
+
+    assert row.capability.reason == "binary_semantics_not_proven"
+    assert row.capability.exposure is ExposureStatus.INVENTORY_ONLY
+    assert row.binding is not None
+    assert build_engineering_entity_specs(restored.rows, None) == ()
+
+
+def test_io_name_scalar_binding_producer_snapshot_round_trip_is_rebind_only():
+    """The supported name fallback remains a scalar hint without event proof."""
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", room=None),
+        element("analog", "VoltageIn", parent_uuid="ms", io_name="AI1"),
+    )
+    runtime = EngineeringRuntimeInventory(
+        bindings=(
+            EngineeringRuntimeBinding(
+                engineering_uuid="analog",
+                io_name="AI1",
+                loxone_type="VoltageIn",
+                title="Analog",
+                room="Office",
+                suggested_platform=None,
+                status="bound",
+                binding_method="io_name_state",
+                value_kind="number",
+                numeric_value=2.5,
+            ),
+        )
+    )
+
+    restored = snapshot_from_dict(snapshot_to_dict(make_snapshot(inventory=inventory, runtime=runtime)))
+    row = next(item for item in restored.rows if item.node.element.uuid == "analog")
+
+    assert row.binding.binding_method == "io_name_state"
+    assert row.binding.state_uuid is None
+    assert row.binding.event_binding_proven is False
+    assert row.capability.reason == "readable_rebind_only"
+    assert build_engineering_entity_specs(restored.rows, None) == ()
+
+
+def test_collision_suppressed_producer_row_round_trips_with_semantics_and_binding():
+    """A source-scoped global collision suppresses exposure, not technical semantics."""
+    produced = make_snapshot()
+    collision = _replace_row(
+        produced,
+        "weather-value",
+        lambda row: replace(
+            row,
+            capability=replace(
+                row.capability,
+                exposure=ExposureStatus.INVENTORY_ONLY,
+                reason="entity_unique_id_owned_by_other_entry",
+            ),
+        ),
+    )
+
+    restored = snapshot_from_dict(snapshot_to_dict(collision))
+    row = next(item for item in restored.rows if item.node.element.key == "weather-value")
+
+    assert row.semantic_platform == "sensor"
+    assert row.binding.event_binding_proven is True
+    assert row.capability.exposure is ExposureStatus.INVENTORY_ONLY
+    assert "weather-value" not in {spec.unique_id for spec in build_engineering_entity_specs(restored.rows, None)}
+
+
+@pytest.mark.parametrize(
+    "role",
+    ["AccessCode", "Credential", "KeyCode", "NfcCode", "NfcTag", "Password", "Permission", "User"],
+)
+@pytest.mark.parametrize("with_type", [False, True])
+def test_sensitive_xml_role_projection_is_private_and_reloadable(role, with_type):
+    """Every authoritative XML sensitivity family survives its safe projection."""
+    type_attribute = ' Type="Page"' if with_type else ""
+    xml = (
+        '<ControlList><C Type="LoxLIVE" U="ms" />'
+        f'<{role} U="secret-{role}" Title="PRIVATE-MARKER" IName="PRIVATE-IO"{type_attribute} />'
+        "</ControlList>"
+    ).encode()
+    inventory = parse_engineering_xml(
+        xml,
+        source_archive="sps_7_20260913120000.zip",
+        config_version=7,
+        config_timestamp=datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+    context = source()
+    resolved = resolve_engineering_topology(inventory, context)
+    rows = resolve_engineering_capabilities(resolved, None)
+    snapshot = EngineeringSnapshot(
+        context,
+        resolved.nodes,
+        rows,
+        engineering_configuration_revision_id(context),
+        engineering_safe_content_digest(context, resolved.nodes, rows),
+        1,
+        engineering_generation_id(context, resolved.nodes, rows, read_sequence=1),
+        datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+
+    encoded = snapshot_to_dict(snapshot)
+    restored = snapshot_from_dict(encoded)
+    rendered = json.dumps(encoded)
+    sensitive = next(item for item in restored.rows if item.node.element.uuid == f"secret-{role}")
+
+    assert sensitive.capability.state is CapabilityState.SENSITIVE
+    assert sensitive.node.sensitive is True
+    assert "PRIVATE-MARKER" not in rendered
+    assert "PRIVATE-IO" not in rendered
+
+
+def test_uuidless_loxlive_with_uuid_backed_device_is_complete_and_reloadable():
+    """Completeness needs LoxLIVE and a stable UUID, not the UUID on LoxLIVE itself."""
+    inventory = inventory_of(
+        element(None, "LoxLIVE", key="xml:fixture", room=None),
+        element("device", "TreeDevice", parent_key="xml:fixture"),
+    )
+
+    restored = snapshot_from_dict(snapshot_to_dict(make_snapshot(inventory=inventory)))
+
+    assert any(node.kind.value == "miniserver" for node in restored.nodes)
+    assert any(node.element.uuid == "device" for node in restored.nodes)
