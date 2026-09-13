@@ -80,6 +80,11 @@ def build_engineering_entity_specs(
             if runtime is None
             else next((item for item in runtime.bindings if item.engineering_uuid == node.element.uuid), None)
         )
+        live_unit = (
+            None
+            if live is None
+            else normalize_engineering_unit(live.unit, title=live.title, loxone_type=live.loxone_type)
+        )
         live_is_compatible = (
             live is not None
             and live.status == "bound"
@@ -88,59 +93,8 @@ def build_engineering_entity_specs(
             and live.value_kind == binding.value_kind
             and live.numeric_value is not None
             and math.isfinite(live.numeric_value)
-            and live.unit
-            in {
-                None,
-                "%",
-                "°",
-                "°C",
-                "°F",
-                "C",
-                "F",
-                "V",
-                "A",
-                "W",
-                "kW",
-                "Wh",
-                "kWh",
-                "Hz",
-                "lx",
-                "Pa",
-                "bar",
-                "ppm",
-                "s",
-                "min",
-                "h",
-            }
-            and (
-                live.unit
-                if live.unit
-                in {
-                    None,
-                    "%",
-                    "°",
-                    "°C",
-                    "°F",
-                    "C",
-                    "F",
-                    "V",
-                    "A",
-                    "W",
-                    "kW",
-                    "Wh",
-                    "kWh",
-                    "Hz",
-                    "lx",
-                    "Pa",
-                    "bar",
-                    "ppm",
-                    "s",
-                    "min",
-                    "h",
-                }
-                else None
-            )
-            == binding.safe_unit
+            and (live.unit is None or live_unit is not None)
+            and (live_unit == binding.safe_unit)
         )
         if row.semantic_platform == "binary_sensor" and live_is_compatible:
             live_is_compatible = live.numeric_value in {0.0, 1.0}

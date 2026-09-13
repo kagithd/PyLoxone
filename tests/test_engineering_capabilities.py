@@ -195,3 +195,10 @@ def test_invalid_initial_unit_is_not_prepared_and_degree_is_canonical():
     )
     assert rows[0].binding is not None
     assert rows[0].binding.safe_unit == "°C"
+    initial = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((degree,)))[0]
+    assert initial.available is True
+    assert initial.native_value == 2.4
+    rebind = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((replace(degree),)))[0]
+    assert rebind.available is True
+    canonical = replace(degree, unit="°C")
+    assert build_engineering_entity_specs(rows, EngineeringRuntimeInventory((canonical,)))[0].available is True
