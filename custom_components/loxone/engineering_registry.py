@@ -143,6 +143,7 @@ class _AreaIntent:
     identifier: str
     from_area_id: str | None
     to_room: str | None
+    replay: bool = False
 
 
 async def _async_load_area_intents(
@@ -173,7 +174,12 @@ async def _async_load_area_intents(
             or (to_room is not None and not isinstance(to_room, str))
         ):
             continue
-        intents[identifier] = _AreaIntent(identifier, from_area_id, to_room)
+        intents[identifier] = _AreaIntent(
+            identifier,
+            from_area_id,
+            to_room,
+            replay=True,
+        )
     return raw["generation_id"], MappingProxyType(intents)
 
 
@@ -428,8 +434,14 @@ async def async_plan_engineering_registry_sync(
             intent_generation == snapshot.generation_id
             and prior_intent is not None
             and prior_intent.to_room == node.element.room
-            and current is not None
-            and current_area == (desired_area.id if desired_area is not None else None)
+            and (
+                (current is None and prior_intent.from_area_id is None)
+                or current_area
+                in {
+                    prior_intent.from_area_id,
+                    desired_area.id if desired_area is not None else None,
+                }
+            )
         )
         device_operations.append(
             EngineeringDeviceOperation(
@@ -535,7 +547,11 @@ def _candidate_area_intents(
     intent_generation, persisted_intents = prior_intent_state
     intents: dict[str, _AreaIntent] = {}
     for operation in plan.device_operations:
-        if not operation.area_update_allowed:
+        if (
+            not operation.area_update_allowed
+            or operation.room is None
+            or operation.identifier not in plan.metadata.active_device_identifiers
+        ):
             continue
         current = device_registry.async_get_device_by_identifier(
             (DOMAIN, operation.identifier),
@@ -543,24 +559,27 @@ def _candidate_area_intents(
         )
         current_area = getattr(current, "area_id", None) if current else None
         persisted = persisted_intents.get(operation.identifier)
-        replay_is_authorized = (
-            operation.area_intent_replay
-            and intent_generation == plan.generation_id
-            and persisted is not None
-            and persisted.to_room == operation.room
+        persisted_matches = (
+            intent_generation == plan.generation_id and persisted is not None and persisted.to_room == operation.room
         )
+        desired_area_id = _desired_area_id(area_registry, operation.room)
+        persisted_replay_is_authorized = persisted_matches and (
+            (current is None and persisted.from_area_id is None)
+            or current_area in {persisted.from_area_id, desired_area_id}
+        )
+        if persisted_replay_is_authorized:
+            intents[operation.identifier] = replace(persisted, replay=True)
+            continue
         compatibility_replay = (
             compatibility_mode
             and operation.expected_area_id is None
             and current is not None
-            and current_area == _desired_area_id(area_registry, operation.room)
+            and current_area == desired_area_id
         )
         original_state_unchanged = (
             current is None and operation.expected_area_id is None
         ) or current_area == operation.expected_area_id
-        if compatibility_replay or (
-            original_state_unchanged and (not operation.area_intent_replay or replay_is_authorized)
-        ):
+        if compatibility_replay or (original_state_unchanged and not operation.area_intent_replay):
             intents[operation.identifier] = _AreaIntent(
                 operation.identifier,
                 operation.expected_area_id,
@@ -572,6 +591,7 @@ def _candidate_area_intents(
 def _recheck_area_intents(
     plan: EngineeringRegistryPlan,
     device_registry: object,
+    area_registry: object,
     intents: Mapping[str, _AreaIntent],
 ) -> dict[str, _AreaIntent]:
     """Drop user changes made while the intent Store write yielded."""
@@ -584,7 +604,16 @@ def _recheck_area_intents(
             operation.entry_id,
         )
         current_area = getattr(current, "area_id", None) if current else None
-        if (current is None and intent.from_area_id is None) or (current_area == intent.from_area_id):
+        desired_area_id = _desired_area_id(area_registry, intent.to_room)
+        replay_at_known_area = intent.replay and current_area in {
+            intent.from_area_id,
+            desired_area_id,
+        }
+        if (
+            (current is None and intent.from_area_id is None)
+            or current_area == intent.from_area_id
+            or replay_at_known_area
+        ):
             rechecked[identifier] = intent
     return rechecked
 
@@ -614,21 +643,22 @@ async def _async_prepare_area_intents(
     if committed_state is None:
         return intents
     entry_id = committed_state.snapshot.source.entry_id
-    await _async_store_area_intents(
-        hass,
-        entry_id,
-        plan.generation_id,
-        intents,
-    )
-    rechecked = _recheck_area_intents(plan, device_registry, intents)
-    if rechecked != intents:
+    while True:
         await _async_store_area_intents(
             hass,
             entry_id,
             plan.generation_id,
-            rechecked,
+            intents,
         )
-    return rechecked
+        rechecked = _recheck_area_intents(
+            plan,
+            device_registry,
+            area_registry,
+            intents,
+        )
+        if rechecked == intents:
+            return rechecked
+        intents = rechecked
 
 
 def _apply_device_properties(
@@ -867,12 +897,6 @@ async def async_apply_engineering_registry_plan(
                 registry_applied_generation=plan.generation_id,
                 managed_area_ids=managed_areas,
             ),
-        )
-        await _async_store_area_intents(
-            hass,
-            committed_state.snapshot.source.entry_id,
-            plan.generation_id,
-            {},
         )
     return result
 

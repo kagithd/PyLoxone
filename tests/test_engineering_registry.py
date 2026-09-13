@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
@@ -54,6 +56,8 @@ class FakeIntentStore:
 
     data: dict[str, object] | None = None
     fail_save = False
+    save_callbacks: ClassVar[list[Callable[[], None]]] = []
+    save_count = 0
 
     def __init__(self, *args, **kwargs) -> None:
         del args, kwargs
@@ -65,6 +69,9 @@ class FakeIntentStore:
         if self.__class__.fail_save:
             raise RuntimeError("injected registry intent store failure")
         self.__class__.data = deepcopy(data)
+        self.__class__.save_count += 1
+        if self.__class__.save_callbacks:
+            self.__class__.save_callbacks.pop(0)()
 
 
 class FakeLegacyMetadataStore:
@@ -292,6 +299,8 @@ class RegistryHarness:
 def registries(monkeypatch) -> RegistryHarness:
     FakeIntentStore.data = None
     FakeIntentStore.fail_save = False
+    FakeIntentStore.save_callbacks = []
+    FakeIntentStore.save_count = 0
     harness = RegistryHarness()
     monkeypatch.setattr(
         "custom_components.loxone.engineering_registry.ar.async_get",
@@ -847,7 +856,7 @@ def test_area_intent_survives_metadata_failure_and_fresh_replan(registries, monk
         )
     )
     assert recovered.metadata.managed_area_ids["serial-a:device"] == workshop.id
-    assert FakeIntentStore.data == {}
+    assert FakeIntentStore.data
 
     second_snapshot = make_snapshot(
         inventory=inventory_of(
@@ -881,6 +890,364 @@ def test_area_intent_survives_metadata_failure_and_fresh_replan(registries, monk
     assert device.area_id == living.id
     assert second.metadata.managed_area_ids["serial-a:device"] == living.id
     assert saved
+
+
+def test_same_plan_replay_retains_managed_area_after_metadata_failure(registries, monkeypatch):
+    """The original deterministic plan must recognize its persisted move."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+
+    async def fail_metadata_save(hass, candidate):
+        del hass, candidate
+        raise RuntimeError("injected metadata failure")
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        fail_metadata_save,
+    )
+    state = StoredEngineeringState(snapshot=snapshot)
+    with pytest.raises(RuntimeError, match="injected metadata failure"):
+        asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                plan,
+                committed_state=state,
+            )
+        )
+    workshop = registries.areas.async_get_area_by_name("Workshop")
+    assert device.area_id == workshop.id
+    assert FakeIntentStore.data
+
+    async def save_metadata(hass, candidate):
+        del hass, candidate
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        save_metadata,
+    )
+    recovered = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=state,
+        )
+    )
+
+    assert device.area_id == workshop.id
+    assert recovered.metadata.managed_area_ids["serial-a:device"] == workshop.id
+    assert FakeIntentStore.data
+
+
+def test_retained_area_evidence_recovers_delayed_ha_write_then_allows_next_move(
+    registries,
+    monkeypatch,
+):
+    """A cold registry rollback is recovered before a later Loxone room move."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+
+    async def save_metadata(hass, candidate):
+        del hass, candidate
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        save_metadata,
+    )
+    state = StoredEngineeringState(snapshot=snapshot)
+    first_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    first = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            first_plan,
+            committed_state=state,
+        )
+    )
+    workshop = registries.areas.async_get_area_by_name("Workshop")
+    assert device.area_id == workshop.id
+    assert FakeIntentStore.data
+
+    device.area_id = office.id
+    cold_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            first.metadata,
+        )
+    )
+    recovered = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=state,
+        )
+    )
+    assert device.area_id == workshop.id
+    assert recovered.metadata.managed_area_ids["serial-a:device"] == workshop.id
+
+    second_snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Living Room",
+            ),
+        ),
+        read_sequence=2,
+    )
+    second_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            second_snapshot,
+            recovered.metadata,
+        )
+    )
+    second = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            second_plan,
+            committed_state=StoredEngineeringState(snapshot=second_snapshot),
+        )
+    )
+    living = registries.areas.async_get_area_by_name("Living Room")
+    assert device.area_id == living.id
+    assert second.metadata.managed_area_ids["serial-a:device"] == living.id
+
+
+def test_retained_area_evidence_is_discarded_for_a_user_override(registries, monkeypatch):
+    """A user area outside retained previous/desired evidence cannot be reclaimed."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+
+    async def save_metadata(hass, candidate):
+        del hass, candidate
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        save_metadata,
+    )
+    state = StoredEngineeringState(snapshot=snapshot)
+    first_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    first = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            first_plan,
+            committed_state=state,
+        )
+    )
+    user_area = registries.areas.async_get_or_create("User Area")
+    device.area_id = user_area.id
+
+    cold_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            first.metadata,
+        )
+    )
+    recovered = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=state,
+        )
+    )
+
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in recovered.metadata.managed_area_ids
+    assert not any(
+        item["identifier"] == "serial-a:device" for item in (FakeIntentStore.data or {}).get("area_intents", ())
+    )
+    replayed = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=state,
+        )
+    )
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in replayed.metadata.managed_area_ids
+
+
+def test_each_journal_save_rechecks_all_remaining_area_mutations(registries, monkeypatch):
+    """User changes during consecutive journal saves both win."""
+    office = registries.areas.async_get_or_create("Office")
+    user_area = registries.areas.async_get_or_create("User Area")
+    first_device = registries.devices.add(
+        "serial-a:device-a",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F01",
+    )
+    second_device = registries.devices.add(
+        "serial-a:device-b",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F02",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device-a", "serial-a:device-b"}),
+        frozenset({"Office"}),
+        {
+            "serial-a:device-a": office.id,
+            "serial-a:device-b": office.id,
+        },
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device-a",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F01",
+                room="Workshop",
+            ),
+            element(
+                "device-b",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F02",
+                room="Workshop",
+            ),
+        )
+    )
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    FakeIntentStore.save_callbacks = [
+        lambda: setattr(first_device, "area_id", user_area.id),
+        lambda: setattr(second_device, "area_id", user_area.id),
+    ]
+
+    async def save_metadata(hass, candidate):
+        del hass, candidate
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        save_metadata,
+    )
+    result = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+
+    assert FakeIntentStore.save_count >= 3
+    assert first_device.area_id == user_area.id
+    assert second_device.area_id == user_area.id
+    assert "serial-a:device-a" not in result.metadata.managed_area_ids
+    assert "serial-a:device-b" not in result.metadata.managed_area_ids
+    retained = (FakeIntentStore.data or {}).get("area_intents", ())
+    assert not any(item["identifier"] in {"serial-a:device-a", "serial-a:device-b"} for item in retained)
 
 
 @pytest.mark.parametrize("user_room", ("User Area", "Workshop"))
