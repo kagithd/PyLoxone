@@ -147,6 +147,8 @@ _SENSITIVE_TYPES = frozenset(
         "user",
     }
 )
+_SENSITIVE_PREFIXES = ("access", "keycode", "nfccode", "nfctag", "permission", "user")
+_PHYSICAL_TYPES = frozenset({"nfccodetouch"})
 _TYPED_SERVICE_OWNERS = {"weatherdata": "weatherserver", "sysvar": "globalstates"}
 
 
@@ -163,6 +165,8 @@ def classify_node_kind(element: EngineeringElement) -> NodeKind:
         return NodeKind.SERVICE_MODULE
     if normalized_type in _CHANNEL_TYPES:
         return NodeKind.CHANNEL
+    if normalized_type in _PHYSICAL_TYPES:
+        return NodeKind.PHYSICAL_DEVICE
     if normalized_type in _STRUCTURAL_TYPES or normalized_type.endswith(("caption", "ref")):
         return NodeKind.STRUCTURAL
     if normalized_type.endswith(("device", "dev", "extension")):
@@ -193,20 +197,18 @@ class OwnerResolver:
         """Resolve every parsed node without using presentation data as identity."""
         elements_by_key = {item.key: item for item in inventory.elements}
         kinds = {item.key: classify_node_kind(item) for item in inventory.elements}
-        uuidless_service_types = {
+        service_types = {
             (item.loxone_type or "").casefold()
             for item in inventory.elements
-            if kinds[item.key] is NodeKind.SERVICE_MODULE and item.uuid is None
+            if kinds[item.key] is NodeKind.SERVICE_MODULE
         }
         uuidless_service_counts = {
             item_type: sum(
                 1
                 for item in inventory.elements
-                if kinds[item.key] is NodeKind.SERVICE_MODULE
-                and item.uuid is None
-                and (item.loxone_type or "").casefold() == item_type
+                if kinds[item.key] is NodeKind.SERVICE_MODULE and (item.loxone_type or "").casefold() == item_type
             )
-            for item_type in uuidless_service_types
+            for item_type in service_types
         }
         nodes = tuple(
             self._resolve_one(
@@ -229,7 +231,7 @@ class OwnerResolver:
         uuidless_service_counts: dict[str, int],
     ) -> ResolvedEngineeringNode:
         chain, failure = self._ancestry(item, elements_by_key)
-        sensitive = any(self._is_sensitive(ancestor) for ancestor in chain)
+        sensitive = failure is not None or any(self._is_sensitive(ancestor) for ancestor in chain)
         public_item = self._sanitize(item) if sensitive else item
         path = () if sensitive else tuple(self._presentation_name(ancestor) for ancestor in reversed(chain))
         kind = kinds[item.key]
@@ -335,9 +337,15 @@ class OwnerResolver:
                             "service_channel",
                             sensitive,
                         )
-                    break
+                    return self._unresolved(
+                        public_item,
+                        NodeKind.CHANNEL,
+                        path,
+                        "ambiguous_uuidless_service",
+                        sensitive,
+                    )
                 continue
-            if ancestor_kind is NodeKind.PHYSICAL_DEVICE:
+            if ancestor_kind in {NodeKind.PHYSICAL_DEVICE, NodeKind.BRIDGE}:
                 identifier = scoped_engineering_identifier(source, ancestor)
                 if identifier is not None:
                     return self._resolved(
@@ -363,6 +371,14 @@ class OwnerResolver:
                         self._nearest_bus(chain, kinds),
                         path,
                         "service_channel",
+                        sensitive,
+                    )
+                if ancestor.uuid is None:
+                    return self._unresolved(
+                        public_item,
+                        NodeKind.CHANNEL,
+                        path,
+                        "ambiguous_uuidless_service",
                         sensitive,
                     )
             if ancestor_kind is NodeKind.MINISERVER:
@@ -418,7 +434,8 @@ class OwnerResolver:
             if kinds[ancestor.key] in {NodeKind.BUS, NodeKind.BRIDGE, NodeKind.PHYSICAL_DEVICE, NodeKind.MINISERVER}:
                 if kinds[ancestor.key] is NodeKind.MINISERVER:
                     return source.provider_identifier
-                return scoped_engineering_identifier(source, ancestor)
+                if identifier := scoped_engineering_identifier(source, ancestor):
+                    return identifier
         return None
 
     @staticmethod
@@ -440,7 +457,13 @@ class OwnerResolver:
 
     @staticmethod
     def _is_sensitive(item: EngineeringElement) -> bool:
-        return (item.loxone_type or "").casefold() in _SENSITIVE_TYPES
+        type_value = (item.loxone_type or "").casefold()
+        tag_value = item.xml_element.casefold()
+        if tag_value in _SENSITIVE_TYPES or tag_value.startswith(_SENSITIVE_PREFIXES):
+            return True
+        return type_value not in _PHYSICAL_TYPES and (
+            type_value in _SENSITIVE_TYPES or type_value.startswith(_SENSITIVE_PREFIXES)
+        )
 
     @staticmethod
     def _sanitize(item: EngineeringElement) -> EngineeringElement:

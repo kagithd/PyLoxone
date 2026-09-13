@@ -13,6 +13,7 @@ from custom_components.loxone.engineering_config import (
 from custom_components.loxone.engineering_topology import (
     EngineeringSourceContext,
     NodeKind,
+    OwnerResolver,
     ResolutionStatus,
     classify_node_kind,
     resolve_engineering_topology,
@@ -306,8 +307,6 @@ def test_cycle_and_missing_or_overdeep_parents_are_unresolved_without_guesses():
 
 def test_depth_limit_is_reported_without_owner_guess():
     """A custom bounded resolver reports chains that exceed its traversal limit."""
-    from custom_components.loxone.engineering_topology import OwnerResolver
-
     resolved = OwnerResolver(max_depth=1).resolve(
         inventory_of(
             element("a", "TreeDevice", parent_key="b"),
@@ -386,3 +385,129 @@ def test_parser_to_resolver_keeps_uuidless_sensitive_ancestry_opaque_and_sanitiz
     assert child.sensitive is True
     assert child.element.title is None
     assert child.topology_path == ()
+
+
+def test_sensitive_technical_tag_and_type_containers_sanitize_nested_uuidless_ancestry():
+    """Sensitive technical tags/types propagate without consulting presentation text."""
+    tag_only_xml = b"""<?xml version=\"1.0\"?>
+<ControlList>
+  <User Title=\"Private caption\">
+    <C Title=\"Nested caption\">
+      <C Type=\"DigitalIn\" U=\"tag-child\" Title=\"ST-F05\" />
+    </C>
+  </User>
+</ControlList>"""
+    typed = inventory_of(
+        element(None, "NfcTag", key="xml:000002", title="Private caption"),
+        element("typed-child", "DigitalIn", parent_key="xml:000002", title="ST-F06"),
+    )
+
+    tag_child = node(
+        resolve_engineering_topology(parse_engineering_xml(tag_only_xml, **SYNTHETIC_PARSE_CONTEXT), source()),
+        "tag-child",
+    )
+    typed_child = node(resolve_engineering_topology(typed, source()), "typed-child")
+
+    for child in (tag_child, typed_child):
+        assert child.sensitive is True
+        assert child.element.title is None
+        assert child.element.attributes == {}
+        assert child.element.as_public_dict()["title"] is None
+        assert child.topology_path == ()
+
+
+def test_physical_nfc_hardware_is_not_suppressed_by_sensitive_container_policy():
+    """An explicit physical NFC hardware type is not a sensitive data container."""
+    resolved = resolve_engineering_topology(inventory_of(element("touch", "NfcCodeTouch", title="ST-F07")), source())
+    touch = node(resolved, "touch")
+
+    assert touch.kind is NodeKind.PHYSICAL_DEVICE
+    assert touch.sensitive is False
+    assert touch.element.title == "ST-F07"
+
+
+def test_incomplete_ancestry_fails_closed_before_public_projection():
+    """Missing, cyclic, and depth-limited paths cannot establish safe ancestry."""
+    missing = node(
+        resolve_engineering_topology(
+            inventory_of(element("missing", "DigitalIn", parent_key="absent", title="ST-F08")),
+            source(),
+        ),
+        "missing",
+    )
+    cyclic = node(resolve_engineering_topology(cyclic_inventory(), source()), "cycle-a")
+    depth = node(
+        OwnerResolver(max_depth=1).resolve(
+            inventory_of(
+                element("depth-child", "DigitalIn", parent_key="caption", title="ST-F09"),
+                element("caption", "TreeCaption", parent_key="nfc"),
+                element(None, "NfcCode", key="nfc", title="Private caption"),
+            ),
+            source(),
+        ),
+        "depth-child",
+    )
+
+    assert [item.resolution_reason for item in (missing, cyclic, depth)] == [
+        "missing_parent",
+        "parent_cycle",
+        "parent_depth_exceeded",
+    ]
+    for item in (missing, cyclic, depth):
+        assert item.sensitive is True
+        assert item.element.title is None
+        assert item.topology_path == ()
+
+
+def test_uuidless_service_fallback_counts_uuid_backed_case_normalized_peers():
+    """UUID-less fallback is only safe when its technical type is project-singleton."""
+    resolved = resolve_engineering_topology(
+        inventory_of(
+            element("weather-server", "WeatherServer", room=None),
+            element(None, "weatherserver", key="xml:000002", room=None),
+            element("weather-value", "WeatherData", parent_key="xml:000002"),
+        ),
+        source(),
+    )
+
+    service = resolved.nodes[1]
+    child = node(resolved, "weather-value")
+    assert service.resolution_reason == "ambiguous_uuidless_service"
+    assert child.resolution_reason == "ambiguous_uuidless_service"
+    assert service.device_identifier is None
+    assert child.device_identifier is None
+
+
+def test_channels_below_bridges_keep_nearest_bridge_owner_through_captions():
+    """Bridge diagnostics and inputs attach to the extension rather than the source."""
+    resolved = resolve_engineering_topology(
+        inventory_of(
+            element("ms", "LoxLIVE"),
+            element("link", "LoxLink", parent_uuid="ms"),
+            element("air", "AirBaseExtension", parent_uuid="link"),
+            element("air-caption", "TreeCaption", parent_uuid="air"),
+            element("air-status", "DeviceStatus", parent_uuid="air-caption"),
+            element("wire", "Lox1WireExtension", parent_uuid="link"),
+            element("wire-caption", "TreeCaption", parent_uuid="wire"),
+            element("wire-input", "DigitalIn", parent_uuid="wire-caption"),
+        ),
+        source(),
+    )
+
+    assert node(resolved, "air-status").device_identifier == "serial-a:air"
+    assert node(resolved, "wire-input").device_identifier == "serial-a:wire"
+
+
+def test_uuidless_hardware_does_not_hide_a_valid_upstream_via_device():
+    """Transport resolution skips unregistrable hardware to an upstream bus."""
+    resolved = resolve_engineering_topology(
+        inventory_of(
+            element("ms", "LoxLIVE"),
+            element("tree", "LoxTree", parent_uuid="ms"),
+            element(None, "TreeDevice", key="xml:000002", parent_uuid="tree"),
+            element("endpoint", "TreeDevice", parent_key="xml:000002"),
+        ),
+        source(),
+    )
+
+    assert node(resolved, "endpoint").via_device_identifier == "serial-a:tree"
