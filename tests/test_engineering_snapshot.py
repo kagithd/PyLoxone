@@ -22,6 +22,7 @@ from custom_components.loxone.engineering_capabilities import (
     ExposureStatus,
     SafeRuntimeBindingDescriptor,
     resolve_engineering_capabilities,
+    select_runtime_probe_candidates,
 )
 from custom_components.loxone.engineering_changes import (
     EngineeringEntityImpact,
@@ -29,7 +30,11 @@ from custom_components.loxone.engineering_changes import (
 )
 from custom_components.loxone.engineering_config import parse_engineering_xml
 from custom_components.loxone.engineering_entities import build_engineering_entity_specs
-from custom_components.loxone.engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
+from custom_components.loxone.engineering_runtime import (
+    EngineeringRuntimeBinding,
+    EngineeringRuntimeInventory,
+    binding_from_response,
+)
 from custom_components.loxone.engineering_snapshot import (
     ENGINEERING_SNAPSHOT_STORAGE_VERSION,
     EngineeringSnapshot,
@@ -1263,3 +1268,89 @@ def test_uuidless_loxlive_with_uuid_backed_device_is_complete_and_reloadable():
 
     assert any(node.kind.value == "miniserver" for node in restored.nodes)
     assert any(node.element.uuid == "device" for node in restored.nodes)
+
+
+@pytest.mark.parametrize("technical_type", ["SysVar", "VoltageIn", "WeatherData"])
+@pytest.mark.parametrize("event_mapped", [False, True])
+@pytest.mark.parametrize("boolean_value", [False, True])
+def test_boolean_sensor_response_producer_round_trip_stays_conservative(
+    technical_type,
+    event_mapped,
+    boolean_value,
+):
+    """A real boolean parse cannot abort a numeric sensor snapshot or prepare it unsafely."""
+    target_uuid = f"target-{technical_type}"
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", room=None),
+        element(target_uuid, technical_type, parent_uuid="ms", io_name="AI1"),
+    )
+    parsed = binding_from_response(target_uuid, boolean_value)
+    binding = replace(
+        parsed,
+        io_name="AI1",
+        loxone_type=technical_type,
+        binding_method="uuid_all" if event_mapped else "uuid_state",
+        state_uuid=f"{target_uuid}-state" if event_mapped else None,
+    )
+    runtime = EngineeringRuntimeInventory(bindings=(binding,))
+
+    restored = snapshot_from_dict(snapshot_to_dict(make_snapshot(inventory=inventory, runtime=runtime)))
+    row = next(item for item in restored.rows if item.node.element.uuid == target_uuid)
+
+    assert parsed.value_kind == "boolean"
+    assert parsed.numeric_value == float(boolean_value)
+    assert row.binding.value_kind == "boolean"
+    assert row.capability.reason == "boolean_sensor_semantics_not_proven"
+    assert row.capability.exposure is ExposureStatus.INVENTORY_ONLY
+    assert build_engineering_entity_specs(restored.rows, runtime) == ()
+
+
+@pytest.mark.parametrize(
+    "technical_type",
+    ["Page", "VoltageIn", "TreeDevice", "WeatherServer"],
+)
+def test_sensitive_xml_role_precedes_unrelated_type_during_full_round_trip(technical_type):
+    """Sensitive XML roles and descendants resolve identically before and after projection."""
+    xml = (
+        '<ControlList><C Type="LoxLIVE" U="ms" />'
+        f'<Credential U="secret" Type="{technical_type}" Title="PRIVATE-PARENT" IName="PRIVATE-PARENT-IO">'
+        '<C Type="VoltageIn" U="secret-child" Title="PRIVATE-CHILD" IName="PRIVATE-CHILD-IO" />'
+        "</Credential></ControlList>"
+    ).encode()
+    inventory = parse_engineering_xml(
+        xml,
+        source_archive="sps_7_20260913120000.zip",
+        config_version=7,
+        config_timestamp=datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+    context = source()
+    resolved = resolve_engineering_topology(inventory, context)
+    rows = resolve_engineering_capabilities(resolved, None)
+    snapshot = EngineeringSnapshot(
+        context,
+        resolved.nodes,
+        rows,
+        engineering_configuration_revision_id(context),
+        engineering_safe_content_digest(context, resolved.nodes, rows),
+        1,
+        engineering_generation_id(context, resolved.nodes, rows, read_sequence=1),
+        datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+
+    assert not {"secret", "secret-child"} & {node.element.uuid for node in select_runtime_probe_candidates(resolved)}
+    encoded = snapshot_to_dict(snapshot)
+    restored = snapshot_from_dict(encoded)
+    rendered = json.dumps(encoded)
+    restored_rows = {
+        row.node.element.uuid: row for row in restored.rows if row.node.element.uuid in {"secret", "secret-child"}
+    }
+
+    assert set(restored_rows) == {"secret", "secret-child"}
+    assert all(row.node.sensitive for row in restored_rows.values())
+    assert all(row.capability.state is CapabilityState.SENSITIVE for row in restored_rows.values())
+    assert all(row.capability.exposure is ExposureStatus.SUPPRESSED for row in restored_rows.values())
+    assert all(row.binding is None for row in restored_rows.values())
+    assert restored_rows["secret"].semantic_platform is None
+    assert restored_rows["secret-child"].semantic_platform == "sensor"
+    assert "PRIVATE-PARENT" not in rendered
+    assert "PRIVATE-CHILD" not in rendered

@@ -850,7 +850,15 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
             raise EngineeringSnapshotError("row binding targets an unsupported technical type")
         if binding.binding_method not in _SUPPORTED_BINDING_METHODS:
             raise EngineeringSnapshotError("row binding method is unsupported")
-        if technical_type in SENSOR_TYPES and binding.value_kind != "number":
+        conservative_boolean_sensor = (
+            technical_type in SENSOR_TYPES
+            and binding.value_kind == "boolean"
+            and capability.state is CapabilityState.READABLE
+            and capability.platform == "sensor"
+            and capability.exposure is ExposureStatus.INVENTORY_ONLY
+            and capability.reason == "boolean_sensor_semantics_not_proven"
+        )
+        if technical_type in SENSOR_TYPES and binding.value_kind != "number" and not conservative_boolean_sensor:
             raise EngineeringSnapshotError("row binding value kind contradicts sensor semantics")
         if binding.binding_method == "uuid_all":
             if not binding.event_binding_proven or binding.state_uuid is None:
@@ -881,6 +889,7 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
         return
     if capability.state is CapabilityState.READABLE:
         valid_reason = capability.reason in {
+            "boolean_sensor_semantics_not_proven",
             "entity_unique_id_owned_by_other_entry",
             "readable_rebind_only",
         }
@@ -891,6 +900,10 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
             or not valid_reason
             or binding is None
             or (capability.reason == "readable_rebind_only" and binding.event_binding_proven)
+            or (
+                capability.reason == "boolean_sensor_semantics_not_proven"
+                and (technical_type not in SENSOR_TYPES or binding.value_kind != "boolean")
+            )
         ):
             raise EngineeringSnapshotError("readable row capability is inconsistent")
         return

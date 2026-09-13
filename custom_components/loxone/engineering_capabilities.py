@@ -196,6 +196,13 @@ def resolve_capability(  # noqa: PLR0911, PLR0912
         platform = "binary_sensor"
     else:
         platform = "sensor"
+        if binding.value_kind == "boolean":
+            return EngineeringCapability(
+                CapabilityState.READABLE,
+                platform,
+                ExposureStatus.INVENTORY_ONLY,
+                "boolean_sensor_semantics_not_proven",
+            )
     descriptor = _descriptor(binding)
     if descriptor is None or not descriptor.event_binding_proven:
         return EngineeringCapability(

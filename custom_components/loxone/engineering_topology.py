@@ -178,8 +178,8 @@ def effective_engineering_technical_type(element: EngineeringElement) -> str | N
 
 
 def classify_node_kind(element: EngineeringElement) -> NodeKind:
-    """Classify only from the technical type, never editable presentation text."""
-    normalized_type = (element.loxone_type or "").casefold()
+    """Classify only from the effective technical role, never presentation text."""
+    normalized_type = (effective_engineering_technical_type(element) or "").casefold()
     if normalized_type in _MINISERVER_TYPES:
         return NodeKind.MINISERVER
     if normalized_type in _BUS_TYPES:
@@ -486,7 +486,15 @@ class OwnerResolver:
 
     @staticmethod
     def _sanitize(item: EngineeringElement) -> EngineeringElement:
-        return replace(item, title=None, io_name=None, room=None, category=None, attributes={})
+        return replace(
+            item,
+            loxone_type=effective_engineering_technical_type(item),
+            title=None,
+            io_name=None,
+            room=None,
+            category=None,
+            attributes={},
+        )
 
     @staticmethod
     def _resolved(
