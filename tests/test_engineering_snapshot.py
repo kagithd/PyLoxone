@@ -2,21 +2,38 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
 from math import nan
+from pathlib import Path
 from types import MappingProxyType
 
 import pytest
+from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.helpers.storage import Store
+from homeassistant.util.file import WriteError
 
+from custom_components.loxone.engineering_capabilities import (
+    CapabilityState,
+    EngineeringCapability,
+    ExposureStatus,
+    SafeRuntimeBindingDescriptor,
+)
 from custom_components.loxone.engineering_changes import (
     EngineeringEntityImpact,
     EngineeringImpactPlan,
 )
+from custom_components.loxone.engineering_entities import build_engineering_entity_specs
+from custom_components.loxone.engineering_runtime import EngineeringRuntimeInventory
 from custom_components.loxone.engineering_snapshot import (
     ENGINEERING_SNAPSHOT_STORAGE_VERSION,
+    EngineeringSnapshot,
     EngineeringSnapshotError,
+    EngineeringStateStore,
+    EngineeringStoreCommitError,
+    EngineeringStoreCommitOutcome,
     StoredEngineeringState,
     async_load_engineering_state,
     async_store_engineering_state,
@@ -35,8 +52,43 @@ from tests.engineering_fixtures import (
     element,
     inventory_of,
     make_snapshot,
+    numeric_binding,
+    reference_link_inventory,
     source,
 )
+
+
+def _rehash(snapshot):
+    """Recompute integrity tokens after an intentional semantic mutation."""
+    return replace(
+        snapshot,
+        safe_content_digest=engineering_safe_content_digest(
+            snapshot.source,
+            snapshot.nodes,
+            snapshot.rows,
+        ),
+        generation_id=engineering_generation_id(
+            snapshot.source,
+            snapshot.nodes,
+            snapshot.rows,
+            read_sequence=snapshot.read_sequence,
+        ),
+    )
+
+
+def _replace_node(snapshot, node_key, transform):
+    """Replace a graph node and keep its row reference internally coherent."""
+    old_node = next(node for node in snapshot.nodes if node.element.key == node_key)
+    new_node = transform(old_node)
+    nodes = tuple(new_node if node is old_node else node for node in snapshot.nodes)
+    rows = tuple(replace(row, node=new_node) if row.node is old_node else row for row in snapshot.rows)
+    return _rehash(replace(snapshot, nodes=nodes, rows=rows))
+
+
+def _replace_row(snapshot, node_key, transform):
+    """Replace one capability row and recompute the safe integrity tokens."""
+    rows = tuple(transform(row) if row.node.element.key == node_key else row for row in snapshot.rows)
+    return _rehash(replace(snapshot, rows=rows))
 
 
 def test_snapshot_round_trip_contains_only_safe_allowlisted_fields():
@@ -299,6 +351,10 @@ async def test_store_uses_private_v2_entry_scoped_envelope(monkeypatch):
         async def async_save(self, payload):
             payloads.append(payload)
 
+        async def async_save_acknowledged(self, payload):
+            payloads.append(payload)
+            return EngineeringStoreCommitOutcome.COMMITTED
+
     monkeypatch.setattr(
         "custom_components.loxone.engineering_snapshot.EngineeringStateStore",
         FakeStore,
@@ -353,3 +409,625 @@ def test_candidate_row_version_must_match_the_source_version():
 
     with pytest.raises(EngineeringSnapshotError, match="config_version"):
         validate_engineering_snapshot(replace(snapshot, rows=(changed, *snapshot.rows[1:])))
+
+
+def test_snapshot_strips_forbidden_role_presentation_but_retains_operational_labels():
+    """Project/provider/user/location labels must not enter the safe projection."""
+    inventory = inventory_of(
+        element("project", "Document", title="PROJECT-MARKER", room=None),
+        element(
+            "ms",
+            "LoxLIVE",
+            parent_uuid="project",
+            title="PROVIDER-MARKER",
+            room=None,
+        ),
+        element("place", "Place", parent_uuid="ms", title="LOCATION-MARKER"),
+        element(
+            None,
+            "TreeCaption",
+            key="xml:000001",
+            parent_key="ms",
+            title="Branch A",
+            room=None,
+        ),
+        element(
+            "device",
+            "TreeDevice",
+            parent_key="xml:000001",
+            title="ST-F07",
+            room="Office",
+        ),
+        element("user", "User", parent_uuid="ms", title="USER-MARKER"),
+        element("service", "WeatherServer", title="Weather service", room=None),
+    )
+
+    payload = snapshot_to_dict(make_snapshot(inventory=inventory))
+    rendered = json.dumps(payload)
+
+    assert all(
+        marker not in rendered
+        for marker in (
+            "PROJECT-MARKER",
+            "PROVIDER-MARKER",
+            "LOCATION-MARKER",
+            "USER-MARKER",
+        )
+    )
+    assert "Branch A" in rendered
+    assert "ST-F07" in rendered
+    assert "Office" in rendered
+    assert "Weather service" in rendered
+    restored = snapshot_from_dict(payload)
+    assert all(
+        marker not in json.dumps(snapshot_to_dict(restored))
+        for marker in (
+            "PROJECT-MARKER",
+            "PROVIDER-MARKER",
+            "LOCATION-MARKER",
+            "USER-MARKER",
+        )
+    )
+
+
+def test_decoder_rejects_checksum_consistent_forbidden_role_presentation():
+    """A locally edited payload cannot restore project titles through safe fields."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("project", "Document", title="PROJECT-ORIGINAL", room=None),
+            element("ms", "LoxLIVE", parent_uuid="project", room=None),
+            element("device", "TreeDevice", parent_uuid="ms", title="ST-F07"),
+        )
+    )
+    payload = snapshot_to_dict(snapshot)
+    document = next(node for node in payload["nodes"] if node["key"] == "project")
+    document["name"] = "FORBIDDEN-PROJECT-MARKER"
+    for node in payload["nodes"]:
+        node["topology_path"] = [
+            "FORBIDDEN-PROJECT-MARKER" if item == "Document" else item for item in node["topology_path"]
+        ]
+
+    with pytest.raises(EngineeringSnapshotError, match=r"presentation|privacy"):
+        snapshot_from_dict(payload)
+
+
+def test_safe_digest_ignores_forbidden_role_titles_but_tracks_device_labels():
+    """Only the role-aware safe projection may influence content identity."""
+
+    def projected(project_title: str, provider_title: str, device_title: str):
+        return make_snapshot(
+            inventory=inventory_of(
+                element("project", "Document", title=project_title, room=None),
+                element(
+                    "ms",
+                    "LoxLIVE",
+                    parent_uuid="project",
+                    title=provider_title,
+                    room=None,
+                ),
+                element(
+                    "device",
+                    "TreeDevice",
+                    parent_uuid="ms",
+                    title=device_title,
+                ),
+            )
+        )
+
+    first = projected("PROJECT-A", "PROVIDER-A", "ST-F07")
+    forbidden_changed = projected("PROJECT-B", "PROVIDER-B", "ST-F07")
+    device_changed = projected("PROJECT-B", "PROVIDER-B", "ST-F07 renamed")
+
+    assert first.safe_content_digest == forbidden_changed.safe_content_digest
+    assert first.safe_content_digest != device_changed.safe_content_digest
+
+
+def test_uuidless_branch_and_provider_service_round_trip_authoritatively():
+    """Safe structural ancestry and a unique UUID-less service remain reconstructable."""
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element(
+            None,
+            "TreeCaption",
+            key="xml:000001",
+            parent_key="ms",
+            title="Branch A",
+            room=None,
+        ),
+        element(
+            "device",
+            "TreeDevice",
+            parent_key="xml:000001",
+            title="ST-F07",
+        ),
+        element(
+            None,
+            "WeatherServer",
+            key="xml:000002",
+            title="Weather service",
+            room=None,
+        ),
+        element(
+            "weather",
+            "WeatherData",
+            parent_key="xml:000002",
+            io_name="WDC1",
+        ),
+    )
+    snapshot = make_snapshot(
+        inventory=inventory,
+        runtime=EngineeringRuntimeInventory(bindings=(numeric_binding("weather", 18.5, "WeatherData"),)),
+    )
+
+    restored = snapshot_from_dict(snapshot_to_dict(snapshot))
+    weather = next(row for row in restored.rows if row.node.element.key == "weather")
+
+    assert weather.node.device_identifier == "serial-a:service:weatherserver"
+    assert weather.node.owner_key == "xml:000002"
+    assert next(node for node in restored.nodes if node.element.key == "device").topology_path[-2:] == (
+        "Branch A",
+        "ST-F07",
+    )
+
+
+def test_snapshot_rejects_uuidless_miniserver_without_stable_anchor():
+    """A type assertion alone cannot establish the source Miniserver anchor."""
+    candidate = make_snapshot(
+        inventory=inventory_of(
+            element(None, "LoxLIVE", key="xml:000001", title="Miniserver", room=None),
+        )
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="anchor|complete"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_checksum_consistent_owner_identifier_forgery():
+    """An in-scope-looking identifier must still match the resolved owner key."""
+    snapshot = make_snapshot()
+    candidate = _replace_node(
+        snapshot,
+        "weather-value",
+        lambda node: replace(node, device_identifier="serial-a:missing-owner"),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="topology|owner"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_checksum_consistent_via_identifier_forgery():
+    """A scoped existing via identifier must still be the nearest eligible ancestor."""
+    snapshot = make_snapshot(inventory=reference_link_inventory())
+    candidate = _replace_node(
+        snapshot,
+        "air-device",
+        lambda node: replace(
+            node,
+            via_device_identifier="serial-a:wire-extension",
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match=r"topology|via"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_checksum_consistent_sensitive_type_forgery():
+    """Type-derived sensitivity and kind cannot be overridden by cached booleans."""
+    snapshot = make_snapshot()
+    candidate = _replace_node(
+        snapshot,
+        "weather-value",
+        lambda node: replace(
+            node,
+            element=replace(node.element, loxone_type="NfcCode"),
+            sensitive=False,
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="sensitive|topology|kind"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_unsupported_binding_method_with_valid_checksums():
+    """Only the proven all/state read contracts may survive persistence."""
+    snapshot = make_snapshot()
+    candidate = _replace_row(
+        snapshot,
+        "weather-value",
+        lambda row: replace(
+            row,
+            capability=EngineeringCapability(
+                CapabilityState.READABLE,
+                "sensor",
+                ExposureStatus.INVENTORY_ONLY,
+                "readable_rebind_only",
+            ),
+            binding=SafeRuntimeBindingDescriptor(
+                "unsupported_read",
+                "number",
+                None,
+                None,
+                False,
+            ),
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="method|binding"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_unproven_state_uuid_with_valid_checksums():
+    """A scalar rebind hint must never smuggle an unproven event-state UUID."""
+    snapshot = make_snapshot()
+    candidate = _replace_row(
+        snapshot,
+        "weather-value",
+        lambda row: replace(
+            row,
+            capability=EngineeringCapability(
+                CapabilityState.READABLE,
+                "sensor",
+                ExposureStatus.INVENTORY_ONLY,
+                "readable_rebind_only",
+            ),
+            binding=SafeRuntimeBindingDescriptor(
+                "uuid_state",
+                "number",
+                None,
+                "unproven-state",
+                False,
+            ),
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="proof|state_uuid|binding"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_boolean_binding_for_numeric_sensor_semantics():
+    """A numeric sensor platform cannot be reconstructed from a boolean descriptor."""
+    snapshot = make_snapshot()
+    candidate = _replace_row(
+        snapshot,
+        "weather-value",
+        lambda row: replace(
+            row,
+            binding=replace(row.binding, value_kind="boolean"),
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match=r"binding|semantic"):
+        validate_engineering_snapshot(candidate)
+
+
+@pytest.mark.parametrize("technical_type", ["Actor", "UnknownType"])
+def test_snapshot_rejects_prepared_exposure_for_output_or_unknown_type(technical_type):
+    """Prepared entities are limited to safe, read-only sensor semantics."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element("target", technical_type, parent_uuid="ms", io_name="IO1"),
+        )
+    )
+    candidate = _replace_row(
+        snapshot,
+        "target",
+        lambda row: replace(
+            row,
+            capability=EngineeringCapability(
+                CapabilityState.READABLE,
+                "sensor",
+                ExposureStatus.PREPARED_DISABLED,
+                "read_only_event_binding_proven",
+            ),
+            semantic_platform="sensor",
+            binding=SafeRuntimeBindingDescriptor(
+                "uuid_all",
+                "number",
+                None,
+                "target-state",
+                True,
+            ),
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="prepared|semantic|topology"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_snapshot_rejects_writable_prepared_assertion_with_valid_checksums():
+    """Persistence may never upgrade the read-only feature to writable."""
+    snapshot = make_snapshot()
+    candidate = _replace_row(
+        snapshot,
+        "weather-value",
+        lambda row: replace(
+            row,
+            capability=replace(row.capability, state=CapabilityState.WRITABLE),
+        ),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="writable|capability"):
+        validate_engineering_snapshot(candidate)
+
+
+def test_valid_numeric_and_binary_bindings_restore_as_unavailable_specs():
+    """Safe read bindings remain reconstructable without persisting runtime values."""
+    from custom_components.loxone.engineering_runtime import (
+        EngineeringRuntimeBinding,
+        EngineeringRuntimeInventory,
+    )
+
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("io", "IoData", parent_uuid="ms", room=None),
+        element("analog", "VoltageIn", parent_uuid="io", io_name="AI1"),
+        element("binary", "DigitalIn", parent_uuid="io", io_name="I1"),
+    )
+    runtime = EngineeringRuntimeInventory(
+        bindings=(
+            EngineeringRuntimeBinding(
+                engineering_uuid="analog",
+                io_name="AI1",
+                loxone_type="VoltageIn",
+                title="Analog",
+                room="Office",
+                suggested_platform=None,
+                status="bound",
+                binding_method="uuid_all",
+                value_kind="number",
+                numeric_value=1.5,
+                state_uuid="analog-state",
+            ),
+            EngineeringRuntimeBinding(
+                engineering_uuid="binary",
+                io_name="I1",
+                loxone_type="DigitalIn",
+                title="Binary",
+                room="Office",
+                suggested_platform=None,
+                status="bound",
+                binding_method="uuid_all",
+                value_kind="boolean",
+                numeric_value=1.0,
+                state_uuid="binary-state",
+            ),
+        )
+    )
+    restored = snapshot_from_dict(snapshot_to_dict(make_snapshot(inventory=inventory, runtime=runtime)))
+
+    specs = build_engineering_entity_specs(restored.rows, None)
+
+    assert {(spec.platform, spec.available) for spec in specs} == {
+        ("sensor", False),
+        ("binary_sensor", False),
+    }
+
+
+def test_state_rejects_publication_ahead_of_registry_application():
+    """A published current generation requires the same registry application proof."""
+    snapshot = make_snapshot()
+    impossible = StoredEngineeringState(
+        snapshot=snapshot,
+        registry_applied_generation=None,
+        impact_published_generation=snapshot.generation_id,
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="publication|registry"):
+        stored_state_to_dict(impossible)
+
+
+def test_state_round_trips_each_supported_recovery_phase():
+    """Pending, registry-applied, fully-applied, and migrated phases are durable."""
+    snapshot = make_snapshot()
+    previous = "gen:" + "1" * 64
+    plan = EngineeringImpactPlan(snapshot.generation_id, ())
+    phases = (
+        StoredEngineeringState(snapshot=snapshot, pending_impact_plan=plan),
+        StoredEngineeringState(
+            snapshot=snapshot,
+            registry_applied_generation=previous,
+            pending_impact_plan=plan,
+            impact_published_generation=previous,
+        ),
+        StoredEngineeringState(
+            snapshot=snapshot,
+            registry_applied_generation=snapshot.generation_id,
+            pending_impact_plan=plan,
+            impact_published_generation=previous,
+        ),
+        StoredEngineeringState(
+            snapshot=snapshot,
+            registry_applied_generation=snapshot.generation_id,
+            pending_impact_plan=plan,
+            impact_published_generation=snapshot.generation_id,
+        ),
+        StoredEngineeringState(snapshot=snapshot),
+    )
+
+    for phase in phases:
+        assert stored_state_to_dict(
+            stored_state_from_dict(stored_state_to_dict(phase), "entry-a")
+        ) == stored_state_to_dict(phase)
+
+
+def test_snapshot_detaches_nested_path_and_attribute_aliases():
+    """Caller mutation cannot alter committed candidate content after construction."""
+    snapshot = make_snapshot()
+    path = ["Miniserver", "Weather"]
+    attributes = {"technical": "value"}
+    node = snapshot.nodes[0]
+    mutable_node = replace(
+        node,
+        element=replace(node.element, attributes=attributes),
+        topology_path=path,
+    )
+    rows = tuple(replace(row, node=mutable_node) if row.node is node else row for row in snapshot.rows)
+    candidate = EngineeringSnapshot(
+        snapshot.source,
+        (mutable_node, *snapshot.nodes[1:]),
+        rows,
+        snapshot.configuration_revision_id,
+        snapshot.safe_content_digest,
+        snapshot.read_sequence,
+        snapshot.generation_id,
+        snapshot.captured_at,
+    )
+
+    path.append("MUTATED")
+    attributes["technical"] = "MUTATED"
+
+    assert candidate.nodes[0].topology_path == ("Miniserver", "Weather")
+    assert candidate.nodes[0].element.attributes == {"technical": "value"}
+    assert isinstance(candidate.nodes[0].element.attributes, MappingProxyType)
+
+
+def test_snapshot_rejects_nested_mutable_attribute_values():
+    """Arbitrary nested raw-attribute aliases cannot enter a frozen candidate."""
+    snapshot = make_snapshot()
+    node = replace(
+        snapshot.nodes[0],
+        element=replace(snapshot.nodes[0].element, attributes={"unsafe": []}),
+    )
+
+    with pytest.raises(EngineeringSnapshotError, match="mutable"):
+        EngineeringSnapshot(
+            snapshot.source,
+            (node, *snapshot.nodes[1:]),
+            snapshot.rows,
+            snapshot.configuration_revision_id,
+            snapshot.safe_content_digest,
+            snapshot.read_sequence,
+            snapshot.generation_id,
+            snapshot.captured_at,
+        )
+
+
+def _real_engineering_store(hass, entry_id="entry-a", **kwargs):
+    return EngineeringStateStore(
+        hass,
+        ENGINEERING_SNAPSHOT_STORAGE_VERSION,
+        f"loxone.engineering_snapshot.{entry_id}",
+        private=True,
+        **kwargs,
+    )
+
+
+@pytest.mark.anyio
+async def test_real_store_is_atomic_acknowledged_and_migrates_v1(tmp_path):
+    """The installed HA Store performs an atomic v1 migration and acknowledged v2 write."""
+    hass = HomeAssistant(str(tmp_path))
+    snapshot = make_snapshot()
+    legacy = snapshot_to_dict(snapshot)
+    legacy_store = Store(
+        hass,
+        1,
+        "loxone.engineering_snapshot.entry-a",
+        private=True,
+        atomic_writes=True,
+    )
+    await legacy_store.async_save(legacy)
+
+    migrated = _real_engineering_store(hass)
+    restored = stored_state_from_dict(await migrated.async_load(), "entry-a")
+    raw_v2 = await Store(
+        hass,
+        ENGINEERING_SNAPSHOT_STORAGE_VERSION,
+        "loxone.engineering_snapshot.entry-a",
+        private=True,
+    ).async_load()
+
+    assert restored.snapshot.generation_id == snapshot.generation_id
+    assert migrated._atomic_writes is True
+    assert raw_v2["schema_version"] == ENGINEERING_SNAPSHOT_STORAGE_VERSION
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("failure_kind", "outcome"),
+    [
+        ("serialization", EngineeringStoreCommitOutcome.SERIALIZATION_FAILED),
+        ("write", EngineeringStoreCommitOutcome.WRITE_FAILED),
+        ("cancel", EngineeringStoreCommitOutcome.CANCELLED),
+        ("unexpected", EngineeringStoreCommitOutcome.FAILED),
+    ],
+)
+async def test_real_store_surfaces_write_failures_and_preserves_last_good(
+    tmp_path,
+    monkeypatch,
+    failure_kind,
+    outcome,
+):
+    """No failed/cancelled candidate may silently authorize downstream work."""
+    hass = HomeAssistant(str(tmp_path))
+    snapshot = make_snapshot()
+    store = _real_engineering_store(hass)
+    last_good = StoredEngineeringState(snapshot=snapshot)
+    await store.async_save_acknowledged(stored_state_to_dict(last_good))
+    changed = StoredEngineeringState(snapshot=make_snapshot(read_sequence=2))
+    payload = stored_state_to_dict(changed)
+
+    if failure_kind == "serialization":
+        payload["invalid"] = object()
+    elif failure_kind == "write":
+
+        def fail_write(*args):
+            del args
+            raise WriteError("synthetic")
+
+        monkeypatch.setattr(store, "_write_prepared_data", fail_write)
+    else:
+        failure = asyncio.CancelledError() if failure_kind == "cancel" else RuntimeError("synthetic")
+
+        async def fail_async_write(data):
+            del data
+            raise failure
+
+        monkeypatch.setattr(store, "_async_write_data", fail_async_write)
+    with pytest.raises(EngineeringStoreCommitError) as raised:
+        await store.async_save_acknowledged(payload)
+
+    assert raised.value.outcome is outcome
+    loaded = await _real_engineering_store(hass).async_load()
+    assert stored_state_from_dict(loaded, "entry-a").snapshot.generation_id == snapshot.generation_id
+
+
+@pytest.mark.anyio
+async def test_real_store_surfaces_deferred_pending_write(tmp_path):
+    """An acknowledged save never replaces a previously queued Store write."""
+    hass = HomeAssistant(str(tmp_path))
+    store = _real_engineering_store(hass)
+    store.async_delay_save(lambda: {"pending": True}, 60)
+
+    with pytest.raises(EngineeringStoreCommitError) as raised:
+        await store.async_save_acknowledged(stored_state_to_dict(StoredEngineeringState(snapshot=make_snapshot())))
+
+    assert raised.value.outcome is EngineeringStoreCommitOutcome.DEFERRED
+    store._async_cleanup_delay_listener()
+    store._async_cleanup_final_write_listener()
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("read_only", "core_state", "outcome"),
+    [
+        (True, CoreState.running, EngineeringStoreCommitOutcome.READ_ONLY),
+        (False, CoreState.stopping, EngineeringStoreCommitOutcome.STOPPING),
+    ],
+)
+async def test_real_store_surfaces_non_committing_modes(
+    tmp_path,
+    read_only,
+    core_state,
+    outcome,
+):
+    """Stopping and read-only stores are explicit non-commit outcomes."""
+    hass = HomeAssistant(str(tmp_path))
+    hass.set_state(core_state)
+    store = _real_engineering_store(hass, read_only=read_only)
+
+    with pytest.raises(EngineeringStoreCommitError) as raised:
+        await store.async_save_acknowledged(stored_state_to_dict(StoredEngineeringState(snapshot=make_snapshot())))
+
+    assert raised.value.outcome is outcome
+    assert not Path(store.path).exists()

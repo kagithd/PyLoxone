@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import asyncio
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
+from enum import StrEnum
 import hashlib
 from ipaddress import ip_address
 import json
@@ -16,9 +18,16 @@ import re
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from homeassistant.core import CoreState
 from homeassistant.helpers.storage import Store
+from homeassistant.util import json as json_util
+from homeassistant.util.file import WriteError
 
 from .engineering_capabilities import (
+    BINARY_TYPES,
+    OUTPUT_TYPES,
+    PROBE_TYPES,
+    SENSOR_TYPES,
     CapabilityState,
     EngineeringCapability,
     EngineeringInventoryRow,
@@ -26,12 +35,14 @@ from .engineering_capabilities import (
     SafeRuntimeBindingDescriptor,
 )
 from .engineering_changes import EngineeringEntityImpact, EngineeringImpactPlan
-from .engineering_config import EngineeringElement
+from .engineering_config import EngineeringElement, EngineeringInventory
 from .engineering_topology import (
     EngineeringSourceContext,
     NodeKind,
     ResolvedEngineeringNode,
     ResolutionStatus,
+    classify_node_kind,
+    resolve_engineering_topology,
 )
 
 if TYPE_CHECKING:
@@ -50,12 +61,44 @@ _URL_PATTERN = re.compile(r"(?:https?|ftp)://", re.IGNORECASE)
 _ADDRESS_CONTENT = re.compile(r"[0-9A-Fa-f:.]+")
 _SEMANTIC_PLATFORMS = frozenset({"sensor", "binary_sensor"})
 _VALUE_KINDS = frozenset({"number", "boolean"})
+_SUPPORTED_BINDING_METHODS = frozenset({"uuid_all", "uuid_state"})
+_FORBIDDEN_PRESENTATION_TYPES = frozenset({"category", "document", "loxlive", "page", "place", "user"})
+_SENSITIVE_ROLE_PREFIXES = ("access", "keycode", "nfccode", "nfctag", "permission", "user")
 _MAX_SAFE_STRING_LENGTH = 256
 _FIRST_CONTROL_CHARACTER = 32
 
 
 class EngineeringSnapshotError(ValueError):
     """Raised when a candidate or stored snapshot is unsafe or incomplete."""
+
+
+class EngineeringStoreCommitOutcome(StrEnum):
+    """Explicit result of the acknowledged private Store boundary."""
+
+    COMMITTED = "committed"
+    DEFERRED = "deferred"
+    STOPPING = "stopping"
+    READ_ONLY = "read_only"
+    SERIALIZATION_FAILED = "serialization_failed"
+    WRITE_FAILED = "write_failed"
+    CANCELLED = "cancelled"
+    FAILED = "failed"
+
+
+class EngineeringStoreCommitError(EngineeringSnapshotError):
+    """Raised when Home Assistant did not acknowledge an atomic Store commit."""
+
+    def __init__(self, outcome: EngineeringStoreCommitOutcome) -> None:
+        """Initialize the bounded non-commit outcome."""
+        self.outcome = outcome
+        super().__init__(f"engineering state Store commit was not acknowledged: {outcome.value}")
+
+
+class EngineeringStoreCommitCancelledError(
+    EngineeringStoreCommitError,
+    asyncio.CancelledError,
+):
+    """Cancellation-shaped Store outcome that cannot be mistaken for success."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +113,33 @@ class EngineeringSnapshot:
     read_sequence: int
     generation_id: str
     captured_at: datetime
+
+    def __post_init__(self) -> None:
+        """Detach every nested collection from caller-owned mutable aliases."""
+        original_nodes = tuple(self.nodes)
+        frozen_nodes = tuple(_freeze_node(node) for node in original_nodes)
+        frozen_rows: list[EngineeringInventoryRow] = []
+        for row in tuple(self.rows):
+            frozen_row_node = next(
+                (
+                    frozen
+                    for original, frozen in zip(
+                        original_nodes,
+                        frozen_nodes,
+                        strict=True,
+                    )
+                    if row.node == original
+                ),
+                None,
+            )
+            frozen_rows.append(
+                replace(
+                    row,
+                    node=frozen_row_node or _freeze_node(row.node),
+                )
+            )
+        object.__setattr__(self, "nodes", frozen_nodes)
+        object.__setattr__(self, "rows", tuple(frozen_rows))
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +159,25 @@ class StoredEngineeringState:
             "managed_area_ids",
             MappingProxyType(dict(sorted(self.managed_area_ids.items()))),
         )
+
+
+def _freeze_node(node: ResolvedEngineeringNode) -> ResolvedEngineeringNode:
+    """Return a node detached from nested caller-owned collections."""
+    try:
+        copied_attributes = dict(node.element.attributes)
+        topology_path = tuple(node.topology_path)
+    except (TypeError, ValueError) as err:
+        raise EngineeringSnapshotError("snapshot node contains mutable invalid shapes") from err
+    if any(not isinstance(key, str) or not isinstance(value, str) for key, value in copied_attributes.items()):
+        raise EngineeringSnapshotError("snapshot node contains mutable invalid shapes")
+    return replace(
+        node,
+        element=replace(
+            node.element,
+            attributes=MappingProxyType(copied_attributes),
+        ),
+        topology_path=topology_path,
+    )
 
 
 def _canonical_digest(prefix: str, value: Any) -> str:
@@ -141,6 +230,83 @@ def engineering_configuration_revision_id(source: EngineeringSourceContext) -> s
     )
 
 
+def _effective_technical_type(element: EngineeringElement) -> str | None:
+    """Keep only the technical role needed for independent validation."""
+    xml_role = element.xml_element.casefold()
+    if xml_role != "c" and xml_role.startswith(_SENSITIVE_ROLE_PREFIXES):
+        return element.xml_element
+    if element.loxone_type:
+        return element.loxone_type
+    return element.xml_element if element.xml_element.casefold() != "c" else None
+
+
+def _allows_presentation(
+    element: EngineeringElement,
+    kind: NodeKind,
+    *,
+    sensitive: bool,
+) -> bool:
+    """Return whether this role may contribute safe operational labels."""
+    technical_type = (_effective_technical_type(element) or "").casefold()
+    if sensitive or technical_type in _FORBIDDEN_PRESENTATION_TYPES:
+        return False
+    if kind is NodeKind.MINISERVER:
+        return False
+    if kind is NodeKind.STRUCTURAL:
+        return technical_type.endswith("caption") or technical_type == "caption"
+    return True
+
+
+def _projection_inventory(
+    source: EngineeringSourceContext,
+    nodes: Sequence[ResolvedEngineeringNode],
+) -> EngineeringInventory:
+    """Build the attribute-free role-aware graph used by the private Store."""
+    elements: list[EngineeringElement] = []
+    for node in nodes:
+        element = node.element
+        technical_type = _effective_technical_type(element)
+        keep_presentation = _allows_presentation(
+            element,
+            classify_node_kind(element),
+            sensitive=node.sensitive,
+        )
+        elements.append(
+            EngineeringElement(
+                key=element.key,
+                xml_element="C",
+                loxone_type=technical_type,
+                title=element.title if keep_presentation else None,
+                uuid=element.uuid,
+                io_name=element.io_name if keep_presentation else None,
+                parent_uuid=None,
+                room_uuid=None,
+                room=element.room if keep_presentation else None,
+                category_uuid=None,
+                category=None,
+                suggested_platform=None,
+                attributes=MappingProxyType({}),
+                parent_key=element.parent_key,
+            )
+        )
+    return EngineeringInventory(
+        source_archive="",
+        config_version=source.config_version,
+        config_timestamp=source.config_timestamp,
+        downloaded_at=source.config_timestamp,
+        xml_size=0,
+        elements=tuple(elements),
+    )
+
+
+def _safe_projection_nodes(
+    source: EngineeringSourceContext,
+    nodes: Sequence[ResolvedEngineeringNode],
+) -> tuple[ResolvedEngineeringNode, ...]:
+    """Re-resolve the role-aware safe projection so inherited paths are clean."""
+    return resolve_engineering_topology(_projection_inventory(source, nodes), source).nodes
+
+
 def _node_to_dict(node: ResolvedEngineeringNode) -> dict[str, Any]:
     element = node.element
     return {
@@ -186,9 +352,10 @@ def _content_payload(
     nodes: Sequence[ResolvedEngineeringNode],
     rows: Sequence[EngineeringInventoryRow],
 ) -> dict[str, Any]:
+    safe_nodes = _safe_projection_nodes(source, nodes)
     return {
         "source_scope": _source_scope(source),
-        "nodes": sorted((_node_to_dict(node) for node in nodes), key=lambda item: item["key"]),
+        "nodes": sorted((_node_to_dict(node) for node in safe_nodes), key=lambda item: item["key"]),
         "rows": sorted((_row_to_dict(row) for row in rows), key=lambda item: item["node_key"]),
     }
 
@@ -591,6 +758,172 @@ def _validate_scope(identifier: str | None, provider: str) -> None:
         raise EngineeringSnapshotError("node identifier is outside source scope")
 
 
+def _authoritative_topology(
+    source: EngineeringSourceContext,
+    nodes: tuple[ResolvedEngineeringNode, ...],
+) -> tuple[ResolvedEngineeringNode, ...]:
+    """Recompute topology solely from persisted technical graph inputs."""
+    elements = tuple(
+        replace(
+            node.element,
+            xml_element=node.element.xml_element or "C",
+            loxone_type=_effective_technical_type(node.element),
+            parent_uuid=None,
+            room_uuid=None,
+            category_uuid=None,
+            category=None,
+            suggested_platform=None,
+            attributes=MappingProxyType({}),
+        )
+        for node in nodes
+    )
+    inventory = EngineeringInventory(
+        source_archive="",
+        config_version=source.config_version,
+        config_timestamp=source.config_timestamp,
+        downloaded_at=source.config_timestamp,
+        xml_size=0,
+        elements=elements,
+    )
+    if not any(
+        element.uuid is not None and (element.loxone_type or "").casefold() == "loxlive" for element in elements
+    ):
+        raise EngineeringSnapshotError("snapshot is missing a stable Miniserver anchor")
+    return resolve_engineering_topology(inventory, source).nodes
+
+
+def _validate_authoritative_topology(
+    source: EngineeringSourceContext,
+    nodes: tuple[ResolvedEngineeringNode, ...],
+) -> None:
+    """Reject cached classification, ownership, and sensitivity assertions."""
+    expected_nodes = _authoritative_topology(source, nodes)
+    for claimed, expected in zip(nodes, expected_nodes, strict=True):
+        if (
+            claimed.kind is not expected.kind
+            or claimed.owner_key != expected.owner_key
+            or claimed.device_identifier != expected.device_identifier
+            or claimed.via_device_identifier != expected.via_device_identifier
+            or claimed.bus_kind != expected.bus_kind
+            or claimed.topology_path != expected.topology_path
+            or claimed.resolution_status is not expected.resolution_status
+            or claimed.resolution_reason != expected.resolution_reason
+            or claimed.sensitive is not expected.sensitive
+        ):
+            raise EngineeringSnapshotError("snapshot topology or safe content digest is not authoritative")
+
+
+def _expected_semantic_platform(node: ResolvedEngineeringNode) -> str | None:
+    technical_type = (node.element.loxone_type or "").casefold()
+    if technical_type in SENSOR_TYPES:
+        return "sensor"
+    if technical_type in BINARY_TYPES:
+        return "binary_sensor"
+    return None
+
+
+def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR0912
+    """Validate cached capability/binding claims from technical type semantics."""
+    node = row.node
+    capability = row.capability
+    binding = row.binding
+    technical_type = (node.element.loxone_type or "").casefold()
+    semantic = _expected_semantic_platform(node)
+    if row.semantic_platform != semantic:
+        raise EngineeringSnapshotError("row semantic platform contradicts technical type")
+    if capability.state in {CapabilityState.WRITABLE, CapabilityState.READ_WRITE}:
+        raise EngineeringSnapshotError("row capability must never assert writable access")
+    if node.sensitive:
+        if (
+            capability.state is not CapabilityState.SENSITIVE
+            or capability.platform is not None
+            or capability.exposure is not ExposureStatus.SUPPRESSED
+            or capability.reason != "sensitive_metadata_suppressed"
+            or binding is not None
+        ):
+            raise EngineeringSnapshotError("sensitive row capability is inconsistent")
+        return
+    if capability.state is CapabilityState.SENSITIVE:
+        raise EngineeringSnapshotError("non-sensitive row asserts sensitive capability")
+    if binding is not None:
+        if technical_type not in PROBE_TYPES:
+            raise EngineeringSnapshotError("row binding targets an unsupported technical type")
+        if binding.binding_method not in _SUPPORTED_BINDING_METHODS:
+            raise EngineeringSnapshotError("row binding method is unsupported")
+        if technical_type in SENSOR_TYPES and binding.value_kind != "number":
+            raise EngineeringSnapshotError("row binding value kind contradicts sensor semantics")
+        if binding.binding_method == "uuid_all":
+            if not binding.event_binding_proven or binding.state_uuid is None:
+                raise EngineeringSnapshotError("row event binding proof is incomplete")
+        elif binding.event_binding_proven or binding.state_uuid is not None:
+            raise EngineeringSnapshotError("row scalar binding contains an unproven state_uuid")
+        if capability.state is not CapabilityState.READABLE:
+            raise EngineeringSnapshotError("row binding contradicts capability state")
+    if capability.exposure is ExposureStatus.PREPARED_DISABLED:
+        if (
+            technical_type not in SENSOR_TYPES | BINARY_TYPES
+            or capability.state is not CapabilityState.READABLE
+            or capability.platform != semantic
+            or capability.reason != "read_only_event_binding_proven"
+            or binding is None
+            or not binding.event_binding_proven
+        ):
+            raise EngineeringSnapshotError("row prepared exposure is inconsistent")
+        return
+    if technical_type in OUTPUT_TYPES and capability.state is CapabilityState.READABLE:
+        if (
+            capability.platform is not None
+            or row.semantic_platform is not None
+            or capability.exposure is not ExposureStatus.INVENTORY_ONLY
+            or capability.reason != "output_write_contract_not_enabled"
+        ):
+            raise EngineeringSnapshotError("output row capability is inconsistent")
+        return
+    if capability.state is CapabilityState.READABLE:
+        if (
+            semantic is None
+            or capability.platform != semantic
+            or capability.exposure is not ExposureStatus.INVENTORY_ONLY
+            or capability.reason != "readable_rebind_only"
+            or binding is None
+            or binding.event_binding_proven
+        ):
+            raise EngineeringSnapshotError("readable row capability is inconsistent")
+        return
+    if capability.state is CapabilityState.CONFIGURED_ONLY:
+        if (
+            technical_type not in PROBE_TYPES
+            or capability.platform is not None
+            or capability.exposure is not ExposureStatus.INVENTORY_ONLY
+            or capability.reason
+            not in {
+                "runtime_auth_failure",
+                "runtime_binding_not_proven",
+                "runtime_malformed_failure",
+                "runtime_transport_failure",
+            }
+            or binding is not None
+        ):
+            raise EngineeringSnapshotError("configured-only row capability is inconsistent")
+        return
+    if capability.state is CapabilityState.UNSUPPORTED:
+        valid_unsupported = {
+            "binary_semantics_not_proven": ExposureStatus.INVENTORY_ONLY,
+            "invalid_runtime_unit": ExposureStatus.INVENTORY_ONLY,
+            "non_numeric_runtime_value": ExposureStatus.SUPPRESSED,
+            "unsupported_technical_type": ExposureStatus.INVENTORY_ONLY,
+        }
+        if (
+            capability.platform is not None
+            or binding is not None
+            or valid_unsupported.get(capability.reason) is not capability.exposure
+            or (capability.reason == "unsupported_technical_type" and technical_type in PROBE_TYPES)
+        ):
+            raise EngineeringSnapshotError("unsupported row capability is inconsistent")
+        return
+    raise EngineeringSnapshotError("row capability state is unsupported")
+
+
 def validate_engineering_snapshot(  # noqa: PLR0912, PLR0915
     snapshot: EngineeringSnapshot,
 ) -> None:
@@ -613,8 +946,6 @@ def validate_engineering_snapshot(  # noqa: PLR0912, PLR0915
     uuids = [node.element.uuid for node in snapshot.nodes if node.element.uuid is not None]
     if len(uuids) != len(set(uuids)):
         raise EngineeringSnapshotError("duplicate stable uuid")
-    if not any(node.kind is NodeKind.MINISERVER for node in snapshot.nodes):
-        raise EngineeringSnapshotError("snapshot is missing a Miniserver anchor")
     _validate_parent_graph(snapshot.nodes)
     nodes_by_key = {node.element.key: node for node in snapshot.nodes}
     provider = snapshot.source.provider_identifier
@@ -625,6 +956,7 @@ def validate_engineering_snapshot(  # noqa: PLR0912, PLR0915
             raise EngineeringSnapshotError("node owner key is missing")
         _validate_scope(checked.device_identifier, provider)
         _validate_scope(checked.via_device_identifier, provider)
+    _validate_authoritative_topology(snapshot.source, snapshot.nodes)
     seen_rows: set[str] = set()
     for node, row in zip(snapshot.nodes, snapshot.rows, strict=True):
         if row.node != node:
@@ -640,6 +972,7 @@ def validate_engineering_snapshot(  # noqa: PLR0912, PLR0915
             nodes_by_key,
             config_version=snapshot.source.config_version,
         )
+        _validate_row_contract(row)
     if seen_rows != set(keys):
         raise EngineeringSnapshotError("snapshot rows are incomplete")
     if (
@@ -693,9 +1026,10 @@ _SNAPSHOT_FIELDS = frozenset(
 def snapshot_to_dict(snapshot: EngineeringSnapshot) -> dict[str, Any]:
     """Serialize exactly the private safe reconstruction allowlist."""
     validate_engineering_snapshot(snapshot)
+    safe_nodes = _safe_projection_nodes(snapshot.source, snapshot.nodes)
     return {
         "source": _source_to_dict(snapshot.source),
-        "nodes": [_node_to_dict(node) for node in snapshot.nodes],
+        "nodes": [_node_to_dict(node) for node in safe_nodes],
         "rows": [_row_to_dict(row) for row in snapshot.rows],
         "configuration_revision_id": snapshot.configuration_revision_id,
         "safe_content_digest": snapshot.safe_content_digest,
@@ -745,6 +1079,15 @@ def snapshot_from_dict(value: Any) -> EngineeringSnapshot:
         captured_at=_datetime_from_string(data["captured_at"], "captured_at"),
     )
     validate_engineering_snapshot(snapshot)
+    safe_nodes = _safe_projection_nodes(source, nodes)
+    for node, safe_node in zip(nodes, safe_nodes, strict=True):
+        if (
+            node.element.title != safe_node.element.title
+            or node.element.room != safe_node.element.room
+            or node.element.io_name != safe_node.element.io_name
+            or node.topology_path != safe_node.topology_path
+        ):
+            raise EngineeringSnapshotError("stored node contains forbidden role presentation metadata")
     return snapshot
 
 
@@ -853,6 +1196,15 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
         _impact_plan_from_dict(_impact_plan_to_dict(state.pending_impact_plan))
         if state.pending_impact_plan.generation_id != snapshot.generation_id:
             raise EngineeringSnapshotError("pending impact generation does not match snapshot")
+    current = snapshot.generation_id
+    registry = state.registry_applied_generation
+    published = state.impact_published_generation
+    if registry is None and published is not None:
+        raise EngineeringSnapshotError("impact publication has no registry application proof")
+    if registry != current and published is not None and published != registry:
+        raise EngineeringSnapshotError("impact publication is ahead of registry application")
+    if published == current and registry != current:
+        raise EngineeringSnapshotError("current publication requires current registry application")
     provider = snapshot.source.provider_identifier
     for identifier, area_id in state.managed_area_ids.items():
         checked_identifier = _required_identifier(identifier, "managed area owner")
@@ -930,6 +1282,66 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
 class EngineeringStateStore(Store[dict[str, Any]]):
     """Versioned Home Assistant store with a validating v1-to-v2 migration."""
 
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        version: int,
+        key: str,
+        private: bool = False,  # noqa: FBT001, FBT002
+        **kwargs: Any,
+    ) -> None:
+        """Create an always-atomic private engineering state Store."""
+        kwargs.pop("atomic_writes", None)
+        super().__init__(
+            hass,
+            version,
+            key,
+            private,
+            atomic_writes=True,
+            **kwargs,
+        )
+
+    async def async_save_acknowledged(
+        self,
+        data: dict[str, Any],
+    ) -> EngineeringStoreCommitOutcome:
+        """Atomically save, surfacing every non-commit outcome to the caller."""
+        async with self._write_lock:
+            if self.hass.state is CoreState.stopping:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.STOPPING)
+            if self._read_only:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.READ_ONLY)
+            if self._data is not None or self._delay_handle is not None:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.DEFERRED)
+            self._data = {
+                "version": self.version,
+                "minor_version": self.minor_version,
+                "key": self.key,
+                "data": data,
+            }
+            self._manager.async_invalidate(self.key)
+            self._async_cleanup_delay_listener()
+            self._async_cleanup_final_write_listener()
+            candidate = self._data
+            self._data = None
+            if candidate is None:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.DEFERRED)
+            try:
+                await self._async_write_data(candidate)
+            except asyncio.CancelledError as err:
+                raise EngineeringStoreCommitCancelledError(EngineeringStoreCommitOutcome.CANCELLED) from err
+            except json_util.SerializationError as err:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.SERIALIZATION_FAILED) from err
+            except WriteError as err:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.WRITE_FAILED) from err
+            except Exception as err:
+                raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.FAILED) from err
+        return EngineeringStoreCommitOutcome.COMMITTED
+
+    async def async_save(self, data: dict[str, Any]) -> None:
+        """Use acknowledged semantics for Store-triggered migrations too."""
+        await self.async_save_acknowledged(data)
+
     async def _async_migrate_func(
         self,
         old_major_version: int,
@@ -975,4 +1387,4 @@ async def async_store_engineering_state(
         f"{ENGINEERING_SNAPSHOT_STORAGE_KEY}.{state.snapshot.source.entry_id}",
         private=True,
     )
-    await store.async_save(stored_state_to_dict(state))
+    await store.async_save_acknowledged(stored_state_to_dict(state))
