@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from ipaddress import ip_address
-import re
 from typing import Any
 
+from custom_components.loxone.engineering_capabilities import resolve_engineering_capabilities
 from custom_components.loxone.engineering_config import EngineeringElement, EngineeringInventory
-from custom_components.loxone.engineering_topology import (
-    EngineeringSourceContext,
-    ResolvedEngineeringInventory,
-)
 from custom_components.loxone.engineering_runtime import (
     EngineeringRuntimeBinding,
     EngineeringRuntimeInventory,
+)
+from custom_components.loxone.engineering_snapshot import (
+    EngineeringSnapshot,
+    engineering_configuration_revision_id,
+    engineering_generation_id,
+    engineering_safe_content_digest,
+)
+from custom_components.loxone.engineering_topology import (
+    EngineeringSourceContext,
+    ResolvedEngineeringInventory,
+    resolve_engineering_topology,
 )
 
 SYNTHETIC_PARSE_CONTEXT = {
@@ -207,6 +216,41 @@ def provider_inventory() -> EngineeringInventory:
     )
 
 
+def make_snapshot(
+    *,
+    last_modified: str | None = "revision-7",
+    inventory: EngineeringInventory | None = None,
+    runtime: EngineeringRuntimeInventory | None = None,
+    read_sequence: int = 1,
+) -> EngineeringSnapshot:
+    """Build a complete deterministic sanitized engineering snapshot."""
+    raw = inventory or provider_inventory()
+    context = replace(source(), loxapp_last_modified=last_modified)
+    resolved = resolve_engineering_topology(raw, context)
+    default_runtime = EngineeringRuntimeInventory(
+        bindings=(
+            numeric_binding("weather-value", 18.5, "WeatherData"),
+            numeric_binding("system-variable", 1.0, "SysVar"),
+        )
+    )
+    rows = resolve_engineering_capabilities(resolved, runtime or default_runtime)
+    return EngineeringSnapshot(
+        source=context,
+        nodes=resolved.nodes,
+        rows=rows,
+        configuration_revision_id=engineering_configuration_revision_id(context),
+        safe_content_digest=engineering_safe_content_digest(context, resolved.nodes, rows),
+        read_sequence=read_sequence,
+        generation_id=engineering_generation_id(
+            context,
+            resolved.nodes,
+            rows,
+            read_sequence=read_sequence,
+        ),
+        captured_at=datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+
+
 def cyclic_inventory() -> EngineeringInventory:
     """Build a cycle that cannot be resolved to a physical owner."""
     return inventory_of(
@@ -252,8 +296,8 @@ def resolved_node(uuid: str, element_type: str, *, io_name: str = "AI1"):
     """Create a resolved channel without relying on a legacy platform hint."""
     from custom_components.loxone.engineering_topology import (
         NodeKind,
-        ResolvedEngineeringNode,
         ResolutionStatus,
+        ResolvedEngineeringNode,
     )
 
     return ResolvedEngineeringNode(
