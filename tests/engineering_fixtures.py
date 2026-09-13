@@ -5,8 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from ipaddress import ip_address
+import re
 from typing import Any
-from urllib.parse import urlsplit
 
 from custom_components.loxone.engineering_config import EngineeringElement, EngineeringInventory
 from custom_components.loxone.engineering_topology import (
@@ -49,23 +49,41 @@ _ALLOWED_FIXTURE_FIELDS = frozenset(
     }
 )
 _FIXTURE_ERROR = "forbidden fixture field"
+_PRESENTATION_FIELDS = frozenset({"room", "title"})
+_OPAQUE_KEY = re.compile(r"^xml:(?:\d{6}|fixture)$")
+_TECHNICAL_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+_URL_CONTENT = re.compile(r"\b(?:https?|ftp)://", re.IGNORECASE)
+_ADDRESS_CONTENT = re.compile(r"[0-9A-Fa-f:.]+")
 
 
 def _raise_fixture_error() -> None:
     raise ValueError(_FIXTURE_ERROR)
 
 
-def _validate_fixture_scalar(value: Any) -> None:
-    """Allow only safe presentation or technical scalar values."""
+def _contains_network_material(value: str) -> bool:
+    """Return whether a presentation string embeds an IP address or URL."""
+    if _URL_CONTENT.search(value):
+        return True
+    for candidate in _ADDRESS_CONTENT.findall(value):
+        try:
+            ip_address(candidate)
+        except ValueError:
+            continue
+        return True
+    return False
+
+
+def _validate_fixture_scalar(field: str, value: Any) -> None:
+    """Validate a scalar according to its presentation or technical field role."""
     if value is None:
         return
     if not isinstance(value, str):
         _raise_fixture_error()
-    if urlsplit(value).scheme:
+    if field not in _PRESENTATION_FIELDS:
+        if _OPAQUE_KEY.fullmatch(value) or _TECHNICAL_TOKEN.fullmatch(value):
+            return
         _raise_fixture_error()
-    try:
-        ip_address(value.strip("[]"))
-    except ValueError:
+    if not _contains_network_material(value):
         return
     _raise_fixture_error()
 
@@ -82,9 +100,9 @@ def validate_fixture_input(value: Any) -> Any:
             _raise_fixture_error()
         if isinstance(item, (list, tuple, set, frozenset)):
             for nested_item in item:
-                _validate_fixture_scalar(nested_item)
+                _validate_fixture_scalar(key, nested_item)
             _raise_fixture_error()
-        _validate_fixture_scalar(item)
+        _validate_fixture_scalar(key, item)
     return value
 
 

@@ -36,6 +36,29 @@ def test_fixture_input_gate_rejects_identity_and_location_fields():
     }
 
 
+def test_fixture_input_accepts_opaque_xml_keys_for_uuidless_ancestry():
+    """Synthetic UUID-less nodes can retain their parser-compatible opaque key."""
+    container = element(None, "WeatherServer", key="xml:000002")
+    child = element("weather-uuid", "WeatherData", parent_key=container.key)
+
+    assert container.key == "xml:000002"
+    assert child.parent_key == "xml:000002"
+
+
+@pytest.mark.parametrize(
+    "title",
+    (
+        "Device at https://example.invalid",
+        "Sensor 198.51.100.1",
+        "Sensor [2001:db8::1]",
+    ),
+)
+def test_fixture_input_rejects_embedded_network_material_in_allowed_title(title):
+    """Presentation fields cannot conceal URL or address material."""
+    with pytest.raises(ValueError, match="forbidden fixture field"):
+        validate_fixture_input({"title": title})
+
+
 @pytest.mark.parametrize(
     "fixture_input",
     (
