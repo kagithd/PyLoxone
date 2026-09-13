@@ -36,6 +36,27 @@ def test_fixture_input_gate_rejects_identity_and_location_fields():
     }
 
 
+@pytest.mark.parametrize(
+    "fixture_input",
+    (
+        {"ProjectName": "Synthetic project"},
+        {"Installation": "Synthetic installation"},
+        {"CurrentUser": "person"},
+        {"Location": "Office"},
+        {"coordinates": [12.0, 34.0]},
+        {"url": "https://example.invalid"},
+        {"host": "2001:db8::1"},
+        {"credential": "synthetic-secret"},
+        {"accessCode": "synthetic-secret"},
+        {"device": {"host": "198.51.100.1"}},
+    ),
+)
+def test_fixture_input_schema_rejects_forbidden_nested_and_network_fields(fixture_input):
+    """Only the fixture constructor's safe scalar fields are accepted."""
+    with pytest.raises(ValueError, match="forbidden fixture field"):
+        validate_fixture_input(fixture_input)
+
+
 def test_type_driven_classification_does_not_trust_titles():
     """Only technical types can establish topology identity."""
     link = element("link-uuid", "LoxLink", title="Editable caption")
@@ -70,6 +91,42 @@ def test_type_driven_classification_does_not_trust_titles():
 def test_known_provider_containers_are_service_modules(element_type):
     """Known provider services are recognized from their exact types."""
     assert classify_node_kind(element("service", element_type)) is NodeKind.SERVICE_MODULE
+
+
+@pytest.mark.parametrize(
+    "element_type",
+    (
+        "DigitalIn",
+        "digitalin",
+        "VoltageIn",
+        "VOLTAGEIN",
+        "Actor",
+        "actor",
+        "AnalogOut",
+        "ANALOGOUT",
+        "Status",
+        "Online",
+        "DeviceStatus",
+        "DeviceOnline",
+    ),
+)
+def test_known_io_and_status_types_are_channels_without_capability(element_type):
+    """Exact technical types identify channels without implying write access."""
+    assert classify_node_kind(element("channel", element_type)) is NodeKind.CHANNEL
+
+
+@pytest.mark.parametrize(
+    ("element_type", "expected_kind"),
+    (
+        ("Page", NodeKind.STRUCTURAL),
+        ("TreeCaption", NodeKind.STRUCTURAL),
+        ("WeatherServer", NodeKind.SERVICE_MODULE),
+        ("SystemStatus", NodeKind.SERVICE_MODULE),
+    ),
+)
+def test_structural_and_service_types_are_not_channels(element_type, expected_kind):
+    """Channel aliases cannot override exact service or structural classifications."""
+    assert classify_node_kind(element("item", element_type)) is expected_kind
 
 
 def test_scoped_identifier_uses_serial_and_uuid_only():

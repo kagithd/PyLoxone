@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import re
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from ipaddress import ip_address
 from typing import Any
+from urllib.parse import urlsplit
 
 from custom_components.loxone.engineering_config import EngineeringElement, EngineeringInventory
 from custom_components.loxone.engineering_topology import (
@@ -33,35 +34,57 @@ DUPLICATE_UUID_XML = b"""<?xml version="1.0"?>
   <C Type="TreeDevice" U="duplicate-uuid" Title="ST-F01" />
 </ControlList>"""
 
-_FORBIDDEN_KEY_PARTS = (
-    "access",
-    "address",
-    "credential",
-    "latitude",
-    "longitude",
-    "password",
-    "privatekey",
-    "remoteurl",
-    "localurl",
-    "token",
-    "user",
+_ALLOWED_FIXTURE_FIELDS = frozenset(
+    {
+        "device",
+        "element_type",
+        "io_name",
+        "key",
+        "parent_key",
+        "parent_uuid",
+        "platform",
+        "room",
+        "title",
+        "uuid",
+    }
 )
-_URL_OR_ADDRESS = re.compile(r"(?:https?://|\b(?:\d{1,3}\.){3}\d{1,3}\b|\b(?:latitude|longitude|gps)\b)", re.IGNORECASE)
+_FIXTURE_ERROR = "forbidden fixture field"
+
+
+def _raise_fixture_error() -> None:
+    raise ValueError(_FIXTURE_ERROR)
+
+
+def _validate_fixture_scalar(value: Any) -> None:
+    """Allow only safe presentation or technical scalar values."""
+    if value is None:
+        return
+    if not isinstance(value, str):
+        _raise_fixture_error()
+    if urlsplit(value).scheme:
+        _raise_fixture_error()
+    try:
+        ip_address(value.strip("[]"))
+    except ValueError:
+        return
+    _raise_fixture_error()
 
 
 def validate_fixture_input(value: Any) -> Any:
-    """Reject personal, location, endpoint, credential, and access fixture data."""
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            normalized_key = re.sub(r"[^a-z0-9]", "", str(key).casefold())
-            if any(part in normalized_key for part in _FORBIDDEN_KEY_PARTS):
-                raise ValueError("forbidden fixture field")
+    """Accept only explicitly allowlisted safe scalar fixture fields."""
+    if not isinstance(value, Mapping):
+        _raise_fixture_error()
+    for key, item in value.items():
+        if not isinstance(key, str) or key not in _ALLOWED_FIXTURE_FIELDS:
+            _raise_fixture_error()
+        if isinstance(item, Mapping):
             validate_fixture_input(item)
-    elif isinstance(value, (list, tuple, set, frozenset)):
-        for item in value:
-            validate_fixture_input(item)
-    elif isinstance(value, str) and _URL_OR_ADDRESS.search(value):
-        raise ValueError("forbidden fixture field")
+            _raise_fixture_error()
+        if isinstance(item, (list, tuple, set, frozenset)):
+            for nested_item in item:
+                _validate_fixture_scalar(nested_item)
+            _raise_fixture_error()
+        _validate_fixture_scalar(item)
     return value
 
 

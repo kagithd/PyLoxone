@@ -108,10 +108,16 @@ _CHANNEL_TYPES = frozenset(
     {
         "weatherdata",
         "sysvar",
+        "digitalin",
         "digitalinput",
+        "voltagein",
         "analoginput",
+        "actor",
+        "analogout",
         "status",
         "online",
+        "devicestatus",
+        "deviceonline",
     }
 )
 _STRUCTURAL_TYPES = frozenset(

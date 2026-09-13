@@ -12,6 +12,8 @@ from custom_components.loxone.engineering_config import (
     _decompress_loxcc,
     parse_engineering_xml,
 )
+from custom_components.loxone.engineering_entities import build_engineering_sensor_specs
+from custom_components.loxone.engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
 
 
 def _literal_loxcc(payload: bytes) -> bytes:
@@ -71,3 +73,34 @@ def test_generic_inventory_keeps_unknown_onewire_hardware_and_topology():
     assert sensor.category == "Temperature"
     assert sensor.suggested_platform == "sensor"
     assert inventory.summary()["candidate_count"] == 2
+
+
+def test_uuidless_containers_preserve_legacy_uuid_ancestry_for_sensor_grouping():
+    """Opaque immediate keys must not break the legacy UUID ownership consumer."""
+    xml = b"""<ControlList>
+  <C Type="LoxLIVE" U="miniserver-uuid" />
+  <C Type="TreeDevice" U="device-uuid">
+    <C Type="TreeCaption"><C Type="TreeCaption">
+      <C Type="WeatherData" U="channel-uuid" IName="AI1" />
+    </C></C>
+  </C>
+</ControlList>"""
+    inventory = parse_engineering_xml(
+        xml,
+        source_archive="sps_7_20260913120000.zip",
+        config_version=7,
+        config_timestamp=datetime(2026, 9, 13, 12, tzinfo=UTC),
+    )
+    captions = [item for item in inventory.elements if item.loxone_type == "TreeCaption"]
+    channel = next(item for item in inventory.elements if item.uuid == "channel-uuid")
+    runtime = EngineeringRuntimeInventory(
+        bindings=(
+            EngineeringRuntimeBinding(
+                "channel-uuid", "AI1", "WeatherData", None, None, "sensor", "bound", numeric_value=1.0
+            ),
+        )
+    )
+
+    assert channel.parent_uuid == "device-uuid"
+    assert channel.parent_key == captions[-1].key
+    assert build_engineering_sensor_specs(inventory, runtime)[0].device.uuid == "device-uuid"

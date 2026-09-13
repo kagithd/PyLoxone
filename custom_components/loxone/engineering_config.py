@@ -320,7 +320,7 @@ def parse_engineering_xml(
         )
 
         for child in node:
-            walk(child, node_uuid, node_key, room_uuid, category_uuid)
+            walk(child, node_uuid or parent_uuid, node_key, room_uuid, category_uuid)
 
     walk(root)
     return EngineeringInventory(
