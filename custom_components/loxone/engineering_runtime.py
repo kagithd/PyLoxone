@@ -407,9 +407,17 @@ async def _probe_element(
                     numeric_states=parsed.numeric_states,
                     state_uuid=None,
                 )
-            except aiohttp.ClientError, TimeoutError:
+            except (
+                aiohttp.ClientError,
+                TimeoutError,
+            ):
                 failures.add("transport_error")
-            except ET.ParseError, json.JSONDecodeError, TypeError, ValueError:
+            except (
+                ET.ParseError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
                 failures.add("malformed_response")
 
     status = next(
