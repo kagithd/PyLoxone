@@ -130,3 +130,33 @@ def test_transport_and_auth_failures_remain_distinct_from_unbound():
     auth = replace(numeric_binding("ai2", 2.4), status="auth_error")
     assert resolve_capability(resolved_node("ai1", "VoltageIn"), transport).reason == "runtime_transport_failure"
     assert resolve_capability(resolved_node("ai2", "VoltageIn"), auth).reason == "runtime_auth_failure"
+
+
+def test_semantic_platform_is_stable_without_a_runtime_result():
+    rows = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("ai1", "VoltageIn"),)), None
+    )
+    assert rows[0].semantic_platform == "sensor"
+    assert rows[0].capability.exposure is ExposureStatus.INVENTORY_ONLY
+
+
+def test_sensitive_rows_never_keep_a_safe_binding_descriptor():
+    row = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("code", "NfcCode"),)),
+        EngineeringRuntimeInventory((numeric_binding("code", 1.0, "NfcCode"),)),
+    )[0]
+    assert row.binding is None
+
+
+def test_descriptor_drops_unknown_units_and_cached_invalid_rebind_is_unavailable():
+    binding = replace(numeric_binding("ai1", 2.4), unit="unknown-unit")
+    rows = resolve_engineering_capabilities(
+        ResolvedEngineeringInventory(source(), (resolved_node("ai1", "VoltageIn"),)),
+        EngineeringRuntimeInventory((binding,)),
+    )
+    assert rows[0].binding is not None
+    assert rows[0].binding.safe_unit is None
+    failed = replace(binding, status="transport_error")
+    spec = build_engineering_entity_specs(rows, EngineeringRuntimeInventory((failed,)))[0]
+    assert spec.available is False
+    assert spec.native_value is None

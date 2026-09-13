@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import TYPE_CHECKING, Literal
 
 from homeassistant.helpers.storage import Store
@@ -79,7 +80,47 @@ def build_engineering_entity_specs(
             if runtime is None
             else next((item for item in runtime.bindings if item.engineering_uuid == node.element.uuid), None)
         )
-        numeric = None if live is None else live.numeric_value
+        live_is_compatible = (
+            live is not None
+            and live.status == "bound"
+            and live.binding_method == binding.binding_method
+            and live.state_uuid == binding.state_uuid
+            and live.value_kind == binding.value_kind
+            and live.numeric_value is not None
+            and math.isfinite(live.numeric_value)
+            and (
+                live.unit
+                if live.unit
+                in {
+                    None,
+                    "%",
+                    "°",
+                    "°C",
+                    "°F",
+                    "C",
+                    "F",
+                    "V",
+                    "A",
+                    "W",
+                    "kW",
+                    "Wh",
+                    "kWh",
+                    "Hz",
+                    "lx",
+                    "Pa",
+                    "bar",
+                    "ppm",
+                    "s",
+                    "min",
+                    "h",
+                }
+                else None
+            )
+            == binding.safe_unit
+        )
+        if row.semantic_platform == "binary_sensor" and live_is_compatible:
+            live_is_compatible = live.numeric_value in {0.0, 1.0}
+        numeric = live.numeric_value if live_is_compatible else None
         native_value: float | bool | None = numeric
         if row.semantic_platform == "binary_sensor" and numeric is not None:
             native_value = bool(numeric)
@@ -91,15 +132,15 @@ def build_engineering_entity_specs(
                 name=node.element.title or node.element.io_name or node.element.uuid,
                 native_value=native_value,
                 unit=binding.safe_unit,
-                available=live is not None,
+                available=live_is_compatible,
                 owner_identifier=node.device_identifier,
-                owner_name=node.element.title or node.element.loxone_type or node.device_identifier,
-                owner_model=node.element.loxone_type or "Engineering device",
+                owner_name=row.owner_name or node.device_identifier,
+                owner_model=row.owner_model or "Engineering device",
                 room=node.element.room,
                 loxone_type=node.element.loxone_type,
                 io_name=node.element.io_name,
-                config_version=0,
-                runtime_binding=binding.binding_method if live is not None else None,
+                config_version=row.config_version,
+                runtime_binding=binding.binding_method if live_is_compatible else None,
             )
         )
     return tuple(specs)

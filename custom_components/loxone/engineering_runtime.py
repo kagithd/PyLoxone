@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from .engineering_topology import ResolvedEngineeringInventory
 
 HTTP_OK = 200
+HTTP_SERVER_ERROR = 500
 _FIRST_CONTROL_CHARACTER = 32
 MAX_RUNTIME_RESPONSE_BYTES = 64 * 1024
 RUNTIME_PROBE_CONCURRENCY = 4
@@ -318,7 +319,7 @@ async def _probe_element(
 ) -> EngineeringRuntimeBinding:
     """Probe one engineering channel without issuing a state-changing command."""
     last_code: int | None = None
-    last_error: str | None = None
+    failures: set[str] = set()
     targets = _probe_targets(element, unique_io_name=unique_io_name)
     if not targets:
         return EngineeringRuntimeBinding(
@@ -343,12 +344,50 @@ async def _probe_element(
                 ) as response:
                     if response.status != HTTP_OK:
                         last_code = response.status
+                        failures.add(
+                            "auth_error"
+                            if response.status in {401, 403}
+                            else "transport_error"
+                            if response.status >= HTTP_SERVER_ERROR
+                            else "not_found"
+                        )
                         continue
                     payload = await response.content.read(MAX_RUNTIME_RESPONSE_BYTES + 1)
                 parsed = _parse_runtime_response(payload)
                 last_code = parsed.code
                 if parsed.code != HTTP_OK:
+                    failures.add(
+                        "auth_error"
+                        if parsed.code in {401, 403}
+                        else "transport_error"
+                        if parsed.code >= HTTP_SERVER_ERROR
+                        else "not_found"
+                    )
                     continue
+                if method == "uuid_all":
+                    states = tuple(state for state in parsed.numeric_states if state.state_uuid)
+                    if len(states) != 1:
+                        failures.add("malformed_response")
+                        continue
+                    state = states[0]
+                    return EngineeringRuntimeBinding(
+                        engineering_uuid=element.uuid or "",
+                        io_name=element.io_name or "",
+                        loxone_type=element.loxone_type,
+                        title=element.title,
+                        room=element.room,
+                        suggested_platform=element.suggested_platform,
+                        status="bound",
+                        binding_method=method,
+                        response_code=parsed.code,
+                        response_control=parsed.control,
+                        value_kind="number",
+                        numeric_value=state.numeric_value,
+                        unit=state.unit,
+                        substate_count=parsed.substate_count,
+                        numeric_states=parsed.numeric_states,
+                        state_uuid=state.state_uuid,
+                    )
                 return EngineeringRuntimeBinding(
                     engineering_uuid=element.uuid or "",
                     io_name=element.io_name or "",
@@ -366,23 +405,19 @@ async def _probe_element(
                     unit=parsed.unit,
                     substate_count=parsed.substate_count,
                     numeric_states=parsed.numeric_states,
-                    state_uuid=(
-                        parsed.numeric_states[0].state_uuid
-                        if method == "uuid_all" and len(parsed.numeric_states) == 1
-                        else None
-                    ),
+                    state_uuid=None,
                 )
-            except (aiohttp.ClientError, TimeoutError) as err:
-                last_error = type(err).__name__
-            except (ET.ParseError, json.JSONDecodeError, TypeError, ValueError) as err:
-                last_error = str(err)
+            except aiohttp.ClientError, TimeoutError:
+                failures.add("transport_error")
+            except ET.ParseError, json.JSONDecodeError, TypeError, ValueError:
+                failures.add("malformed_response")
 
-    status = "not_found" if last_code is not None else "transport_error"
-    if last_code in {401, 403}:
-        status = "auth_error"
-    if not unique_io_name and element.io_name:
+    status = next(
+        (item for item in ("auth_error", "transport_error", "malformed_response", "not_found") if item in failures),
+        "not_found",
+    )
+    if not failures and not unique_io_name and element.io_name:
         status = "ambiguous_io_name"
-        last_error = "UUID endpoints failed and the IO name is not globally unique"
     return EngineeringRuntimeBinding(
         engineering_uuid=element.uuid or "",
         io_name=element.io_name or "",
@@ -392,7 +427,7 @@ async def _probe_element(
         suggested_platform=element.suggested_platform,
         status=status,
         response_code=last_code,
-        error=last_error,
+        error=status,
     )
 
 
@@ -409,13 +444,16 @@ async def async_probe_engineering_runtime(
 
         elements = tuple(item.element for item in select_runtime_probe_candidates(inventory))
     else:
-        elements = tuple(
-            element
-            for element in inventory.candidates
-            if element.uuid and element.io_name and element.suggested_platform is not None
-        )
+        from .engineering_capabilities import select_runtime_probe_elements  # noqa: PLC0415
+
+        elements = select_runtime_probe_elements(inventory)
     io_name_counts: dict[str, int] = {}
-    for element in elements:
+    source_elements = (
+        tuple(item.element for item in inventory.nodes) if hasattr(inventory, "nodes") else inventory.elements
+    )
+    for element in source_elements:
+        if not element.io_name:
+            continue
         key = element.io_name.casefold()
         io_name_counts[key] = io_name_counts.get(key, 0) + 1
 
@@ -424,7 +462,7 @@ async def async_probe_engineering_runtime(
             _probe_element(
                 client,
                 element,
-                unique_io_name=io_name_counts[element.io_name.casefold()] == 1,
+                unique_io_name=io_name_counts.get(element.io_name.casefold(), 0) == 1,
             )
             for element in elements
         )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import StrEnum
 import math
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
@@ -68,6 +68,9 @@ class EngineeringInventoryRow:
     capability: EngineeringCapability
     semantic_platform: Literal["sensor", "binary_sensor"] | None
     binding: SafeRuntimeBindingDescriptor | None
+    owner_name: str | None = None
+    owner_model: str | None = None
+    config_version: int = 0
 
 
 def _type(node: ResolvedEngineeringNode) -> str:
@@ -92,6 +95,34 @@ def select_runtime_probe_candidates(resolved: ResolvedEngineeringInventory) -> t
     )
 
 
+def select_runtime_probe_elements(inventory: Any):
+    """Compatibility selector applying the same type/sensitivity policy to raw XML inventory."""
+    by_key = {item.key: item for item in inventory.elements}
+
+    def sensitive(item: Any) -> bool:
+        seen = set()
+        while item is not None and item.key not in seen:
+            seen.add(item.key)
+            type_value = (item.loxone_type or "").casefold()
+            if type_value in SENSITIVE_TYPES or (
+                type_value != "nfccodetouch"
+                and type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
+            ):
+                return True
+            item = by_key.get(item.parent_key)
+        return False
+
+    return tuple(
+        item
+        for item in inventory.elements
+        if item.uuid and item.io_name and _type_value(item) in PROBE_TYPES and not sensitive(item)
+    )
+
+
+def _type_value(item: Any) -> str:
+    return (item.loxone_type or "").casefold()
+
+
 def _descriptor(binding: EngineeringRuntimeBinding | None) -> SafeRuntimeBindingDescriptor | None:
     if binding is None or binding.status != "bound" or binding.value_kind not in {"number", "boolean"}:
         return None
@@ -100,7 +131,32 @@ def _descriptor(binding: EngineeringRuntimeBinding | None) -> SafeRuntimeBinding
     return SafeRuntimeBindingDescriptor(
         binding_method=binding.binding_method or "read_only",
         value_kind="boolean" if binding.value_kind == "boolean" else "number",
-        safe_unit=binding.unit,
+        safe_unit=binding.unit
+        if binding.unit
+        in {
+            None,
+            "%",
+            "°",
+            "°C",
+            "°F",
+            "C",
+            "F",
+            "V",
+            "A",
+            "W",
+            "kW",
+            "Wh",
+            "kWh",
+            "Hz",
+            "lx",
+            "Pa",
+            "bar",
+            "ppm",
+            "s",
+            "min",
+            "h",
+        }
+        else None,
         state_uuid=binding.state_uuid,
         event_binding_proven=bool(binding.state_uuid and binding.binding_method == "uuid_all"),
     )
@@ -168,9 +224,23 @@ def resolve_engineering_capabilities(
     """Join immutable topology and runtime results without endpoint data."""
     bindings = {} if runtime is None else {item.engineering_uuid: item for item in runtime.bindings}
     rows: list[EngineeringInventoryRow] = []
+    nodes_by_key = resolved.nodes_by_key
     for node in resolved.nodes:
         binding = bindings.get(node.element.uuid or "")
         capability = resolve_capability(node, binding)
-        semantic = capability.platform
-        rows.append(EngineeringInventoryRow(node, capability, semantic, _descriptor(binding)))
+        type_value = _type(node)
+        semantic = "sensor" if type_value in SENSOR_TYPES else "binary_sensor" if type_value in BINARY_TYPES else None
+        descriptor = None if _is_sensitive(node) else _descriptor(binding)
+        owner = nodes_by_key.get(node.owner_key or "")
+        rows.append(
+            EngineeringInventoryRow(
+                node,
+                capability,
+                semantic,
+                descriptor,
+                owner.element.title if owner else resolved.source.title,
+                owner.element.loxone_type if owner else resolved.source.model,
+                resolved.source.config_version,
+            )
+        )
     return tuple(rows)
