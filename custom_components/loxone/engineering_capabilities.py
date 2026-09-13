@@ -79,10 +79,12 @@ def _type(node: ResolvedEngineeringNode) -> str:
 
 def _is_sensitive(node: ResolvedEngineeringNode) -> bool:
     type_value = _type(node)
-    return (
-        node.sensitive
-        or type_value in SENSITIVE_TYPES
-        or type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
+    return node.sensitive or (
+        type_value != "nfccodetouch"
+        and (
+            type_value in SENSITIVE_TYPES
+            or type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
+        )
     )
 
 
@@ -101,16 +103,25 @@ def select_runtime_probe_elements(inventory: Any):
 
     def sensitive(item: Any) -> bool:
         seen = set()
-        while item is not None and item.key not in seen:
+        for _ in range(128):
+            if item is None or item.key in seen:
+                return True
             seen.add(item.key)
             type_value = (item.loxone_type or "").casefold()
+            tag_value = (item.xml_element or "").casefold()
+            if tag_value in SENSITIVE_TYPES or tag_value.startswith(
+                ("access", "keycode", "nfccode", "nfctag", "permission", "user")
+            ):
+                return True
             if type_value in SENSITIVE_TYPES or (
                 type_value != "nfccodetouch"
                 and type_value.startswith(("access", "keycode", "nfccode", "nfctag", "permission", "user"))
             ):
                 return True
+            if item.parent_key is None:
+                return False
             item = by_key.get(item.parent_key)
-        return False
+        return True
 
     return tuple(
         item
@@ -175,7 +186,7 @@ def resolve_capability(  # noqa: PLR0911
         return EngineeringCapability(
             CapabilityState.CONFIGURED_ONLY, None, ExposureStatus.INVENTORY_ONLY, "runtime_auth_failure"
         )
-    if binding is not None and binding.status in {"transport_error", "error"}:
+    if binding is not None and binding.status in {"transport_error", "error", "malformed_response"}:
         return EngineeringCapability(
             CapabilityState.CONFIGURED_ONLY, None, ExposureStatus.INVENTORY_ONLY, "runtime_transport_failure"
         )

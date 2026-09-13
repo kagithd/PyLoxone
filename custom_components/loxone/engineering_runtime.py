@@ -158,7 +158,9 @@ def _classify_value(value: Any) -> tuple[str, float | None, str | None]:
         kind, numeric_value, unit = "boolean", float(value), None
     elif isinstance(value, (int, float)):
         numeric_value = float(value)
-        kind, unit = ("number", None) if math.isfinite(numeric_value) else ("text", None)
+        kind, numeric_value, unit = (
+            ("number", numeric_value, None) if math.isfinite(numeric_value) else ("text", None, None)
+        )
     elif isinstance(value, str):
         if any(ord(character) < _FIRST_CONTROL_CHARACTER for character in value):
             return "text", None, None
@@ -200,7 +202,7 @@ def binding_from_response(engineering_uuid: str, value: Any) -> EngineeringRunti
 def _numeric_state(*, index: int, state_uuid: str | None, value: Any) -> RuntimeNumericState | None:
     """Return a safe numeric state or omit nonnumeric content."""
     _kind, numeric_value, unit = _classify_value(value)
-    if numeric_value is None:
+    if numeric_value is None or not math.isfinite(numeric_value):
         return None
     return RuntimeNumericState(
         index=index,
@@ -364,6 +366,22 @@ async def _probe_element(
                         else "not_found"
                     )
                     continue
+                fatal = next(
+                    (item for item in ("auth_error", "transport_error", "malformed_response") if item in failures),
+                    None,
+                )
+                if fatal is not None:
+                    return EngineeringRuntimeBinding(
+                        engineering_uuid=element.uuid or "",
+                        io_name=element.io_name or "",
+                        loxone_type=element.loxone_type,
+                        title=element.title,
+                        room=element.room,
+                        suggested_platform=element.suggested_platform,
+                        status=fatal,
+                        response_code=parsed.code,
+                        error=fatal,
+                    )
                 if method == "uuid_all":
                     states = tuple(state for state in parsed.numeric_states if state.state_uuid)
                     if len(states) != 1:
