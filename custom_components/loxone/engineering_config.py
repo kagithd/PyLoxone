@@ -55,6 +55,7 @@ class EngineeringElement:
     category: str | None
     suggested_platform: str | None
     attributes: dict[str, str] = field(repr=False)
+    parent_key: str | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
         """Return identity and topology data without arbitrary config values."""
@@ -66,6 +67,7 @@ class EngineeringElement:
             "uuid": self.uuid,
             "io_name": self.io_name,
             "parent_uuid": self.parent_uuid,
+            "parent_key": self.parent_key,
             "room_uuid": self.room_uuid,
             "room": self.room,
             "category_uuid": self.category_uuid,
@@ -84,6 +86,15 @@ class EngineeringInventory:
     downloaded_at: datetime
     xml_size: int
     elements: tuple[EngineeringElement, ...]
+
+    @property
+    def is_complete(self) -> bool:
+        """Return whether this has the minimum safe topology anchor set."""
+        return (
+            bool(self.elements)
+            and any(element.uuid for element in self.elements)
+            and any((element.loxone_type or "").casefold() == "loxlive" for element in self.elements)
+        )
 
     @property
     def candidates(self) -> tuple[EngineeringElement, ...]:
@@ -262,13 +273,24 @@ def parse_engineering_xml(
 
     elements: list[EngineeringElement] = []
 
+    seen_uuids: set[str] = set()
+    document_index = 0
+
     def walk(
         node: ET.Element,
         parent_uuid: str | None = None,
+        parent_key: str | None = None,
         inherited_room: str | None = None,
         inherited_category: str | None = None,
     ) -> None:
+        nonlocal document_index
         node_uuid = node.attrib.get("U")
+        if node_uuid:
+            if node_uuid in seen_uuids:
+                raise EngineeringConfigError("duplicate_engineering_uuid")
+            seen_uuids.add(node_uuid)
+        node_key = node_uuid or f"xml:{document_index:06d}"
+        document_index += 1
         room_uuid = inherited_room
         category_uuid = inherited_category
         io_data = next((child for child in node if child.tag == "IoData"), None)
@@ -276,33 +298,29 @@ def parse_engineering_xml(
             room_uuid = io_data.attrib.get("Pr", room_uuid)
             category_uuid = io_data.attrib.get("Cr", category_uuid)
 
-        if node.attrib:
-            loxone_type = node.attrib.get("Type")
-            io_name = node.attrib.get("IName")
-            key = node_uuid or ":".join(
-                part for part in (parent_uuid, loxone_type, io_name, node.attrib.get("Title")) if part
+        loxone_type = node.attrib.get("Type")
+        io_name = node.attrib.get("IName")
+        elements.append(
+            EngineeringElement(
+                key=node_key,
+                xml_element=node.tag,
+                loxone_type=loxone_type,
+                title=node.attrib.get("Title"),
+                uuid=node_uuid,
+                io_name=io_name,
+                parent_uuid=parent_uuid,
+                room_uuid=room_uuid,
+                room=rooms.get(room_uuid) if room_uuid else None,
+                category_uuid=category_uuid,
+                category=categories.get(category_uuid) if category_uuid else None,
+                suggested_platform=_suggest_platform(loxone_type, io_name),
+                attributes=dict(node.attrib),
+                parent_key=parent_key,
             )
-            elements.append(
-                EngineeringElement(
-                    key=key or f"{node.tag}:{len(elements)}",
-                    xml_element=node.tag,
-                    loxone_type=loxone_type,
-                    title=node.attrib.get("Title"),
-                    uuid=node_uuid,
-                    io_name=io_name,
-                    parent_uuid=parent_uuid,
-                    room_uuid=room_uuid,
-                    room=rooms.get(room_uuid) if room_uuid else None,
-                    category_uuid=category_uuid,
-                    category=categories.get(category_uuid) if category_uuid else None,
-                    suggested_platform=_suggest_platform(loxone_type, io_name),
-                    attributes=dict(node.attrib),
-                )
-            )
+        )
 
-        child_parent_uuid = node_uuid or parent_uuid
         for child in node:
-            walk(child, child_parent_uuid, room_uuid, category_uuid)
+            walk(child, node_uuid, node_key, room_uuid, category_uuid)
 
     walk(root)
     return EngineeringInventory(
