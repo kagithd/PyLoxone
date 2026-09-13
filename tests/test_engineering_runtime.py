@@ -1,11 +1,17 @@
 """Tests for read-only engineering runtime binding helpers."""
 
+import asyncio
+
+import aiohttp
+
 import pytest
 
 from custom_components.loxone.engineering_config import EngineeringElement
 from custom_components.loxone.engineering_runtime import (
     _parse_runtime_response,
     _probe_targets,
+    _probe_element,
+    RuntimeProbeClient,
     binding_from_response,
 )
 
@@ -101,3 +107,55 @@ def test_all_response_keeps_explicit_child_uuid_but_scalar_has_no_state_uuid():
     assert all_response.numeric_states[0].state_uuid == "event-state"
     assert scalar_response.numeric_states == ()
     assert binding_from_response("engineering", "2").state_uuid is None
+
+
+class _Content:
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def read(self, _limit):
+        return self.payload
+
+
+class _Response:
+    def __init__(self, status, payload):
+        self.status, self.content = status, _Content(payload)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+
+class _Session:
+    def __init__(self, replies):
+        self.replies, self.targets = list(replies), []
+
+    def get(self, target, **_kwargs):
+        self.targets.append(target)
+        status, payload = self.replies.pop(0)
+        return _Response(status, payload)
+
+
+def _probe(replies):
+    session = _Session(replies)
+    client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
+    return asyncio.run(_probe_element(client, _element(), unique_io_name=True)), session
+
+
+def test_async_probe_preserves_auth_before_later_scalar_success():
+    binding, session = _probe([(401, b""), (200, b'<LL Code="200" value="2"/>')])
+    assert binding.status == "auth_error"
+    assert len(session.targets) == 2
+
+
+def test_async_probe_uses_explicit_all_state_tuple_not_root_value():
+    binding, _session = _probe([(200, b'<LL Code="200" value="2" u1="event" v1="20.5 C"/>')])
+    assert (binding.state_uuid, binding.numeric_value, binding.unit) == ("event", 20.5, "C")
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_nonfinite_scalar_is_cleared(value):
+    binding = binding_from_response("id", value)
+    assert binding.numeric_value is None
