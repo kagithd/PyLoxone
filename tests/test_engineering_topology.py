@@ -13,14 +13,22 @@ from custom_components.loxone.engineering_config import (
 from custom_components.loxone.engineering_topology import (
     EngineeringSourceContext,
     NodeKind,
+    ResolutionStatus,
     classify_node_kind,
+    resolve_engineering_topology,
     scoped_engineering_identifier,
 )
 from tests.engineering_fixtures import (
     DUPLICATE_UUID_XML,
     SYNTHETIC_PARSE_CONTEXT,
     UUIDLESS_CONTAINER_XML,
+    cyclic_inventory,
     element,
+    inventory_of,
+    node,
+    provider_inventory,
+    reference_link_inventory,
+    source,
     validate_fixture_input,
 )
 
@@ -225,3 +233,156 @@ def test_duplicate_stable_uuid_invalidates_inventory():
     """A duplicate stable UUID makes a candidate unsafe to resolve."""
     with pytest.raises(EngineeringConfigError, match="duplicate_engineering_uuid"):
         parse_engineering_xml(DUPLICATE_UUID_XML, **SYNTHETIC_PARSE_CONTEXT)
+
+
+def test_tree_caption_stays_in_path_but_is_not_a_device():
+    """Structural captions form a diagnostic path but never an owner identity."""
+    resolved = resolve_engineering_topology(
+        inventory_of(
+            element("ms", "LoxLIVE"),
+            element("tree", "LoxTree", parent_uuid="ms"),
+            element("branch", "TreeCaption", parent_uuid="tree", title="Branch A"),
+            element("nfc", "TreeDevice", parent_uuid="branch", title="ST-F03"),
+        ),
+        source(),
+    )
+
+    nfc = node(resolved, "nfc")
+    assert nfc.device_identifier == "serial-a:nfc"
+    assert nfc.via_device_identifier == "serial-a:tree"
+    assert nfc.bus_kind == "tree"
+    assert nfc.topology_path == ("LoxLIVE", "LoxTree", "Branch A", "ST-F03")
+    assert node(resolved, "branch").kind is NodeKind.STRUCTURAL
+
+
+def test_air_and_onewire_endpoints_use_the_nearest_extension():
+    """Link endpoints attach to their nearest proven bridge or extension."""
+    resolved = resolve_engineering_topology(reference_link_inventory(), source())
+
+    assert node(resolved, "air-device").via_device_identifier == "serial-a:air-extension"
+    assert node(resolved, "air-extension").via_device_identifier == "serial-a:link"
+    assert node(resolved, "wire-sensor").via_device_identifier == "serial-a:wire-extension"
+    assert node(resolved, "wire-extension").via_device_identifier == "serial-a:link"
+
+
+def test_internal_io_and_document_services_belong_to_source_miniserver():
+    """Internal channels and document service modules have source-scoped owners."""
+    resolved = resolve_engineering_topology(provider_inventory(), source())
+
+    assert node(resolved, "digital-i1").device_identifier == "serial-a"
+    assert node(resolved, "analog-ai1").device_identifier == "serial-a"
+    assert node(resolved, "relay-q1").device_identifier == "serial-a"
+    assert node(resolved, "weather-server").via_device_identifier == "serial-a"
+    assert node(resolved, "weather-value").device_identifier == "serial-a:weather-server"
+    assert node(resolved, "global-states").via_device_identifier == "serial-a"
+    assert node(resolved, "system-variable").device_identifier == "serial-a:global-states"
+
+
+def test_cycle_and_missing_or_overdeep_parents_are_unresolved_without_guesses():
+    """Broken ancestry never produces a fabricated owner or transport path."""
+    cyclic = node(resolve_engineering_topology(cyclic_inventory(), source()), "cycle-a")
+    missing = node(
+        resolve_engineering_topology(inventory_of(element("missing", "TreeDevice", parent_key="absent")), source()),
+        "missing",
+    )
+    deep = node(
+        resolve_engineering_topology(
+            inventory_of(
+                element("first", "TreeCaption", parent_key="second"),
+                element("second", "TreeCaption", parent_key="third"),
+                element("third", "TreeDevice"),
+            ),
+            source(),
+        ),
+        "first",
+    )
+
+    assert cyclic.resolution_reason == "parent_cycle"
+    assert missing.resolution_reason == "missing_parent"
+    assert missing.via_device_identifier is None
+    assert deep.resolution_status is ResolutionStatus.RESOLVED
+    assert deep.device_identifier is None
+
+
+def test_depth_limit_is_reported_without_owner_guess():
+    """A custom bounded resolver reports chains that exceed its traversal limit."""
+    from custom_components.loxone.engineering_topology import OwnerResolver
+
+    resolved = OwnerResolver(max_depth=1).resolve(
+        inventory_of(
+            element("a", "TreeDevice", parent_key="b"),
+            element("b", "TreeCaption", parent_key="c"),
+            element("c", "LoxTree"),
+        ),
+        source(),
+    )
+
+    item = node(resolved, "a")
+    assert item.resolution_status is ResolutionStatus.UNRESOLVED
+    assert item.resolution_reason == "parent_depth_exceeded"
+    assert item.via_device_identifier is None
+
+
+def test_same_uuid_on_two_entries_produces_distinct_registry_identifiers():
+    """Provider identity scopes otherwise identical engineering UUIDs."""
+    inventory = inventory_of(element("shared", "TreeDevice"))
+
+    assert (
+        node(resolve_engineering_topology(inventory, source("entry-a", "serial-a")), "shared").device_identifier
+        == "serial-a:shared"
+    )
+    assert (
+        node(resolve_engineering_topology(inventory, source("entry-b", "serial-b")), "shared").device_identifier
+        == "serial-b:shared"
+    )
+
+
+def test_singleton_and_duplicate_uuidless_services_have_safe_identity_rules():
+    """Only a singleton type gets a typed UUID-less provider service identifier."""
+    singleton = resolve_engineering_topology(
+        inventory_of(element("ms", "LoxLIVE", room=None), element(None, "WeatherServer", key="xml:000002", room=None)),
+        source(),
+    )
+    duplicate = resolve_engineering_topology(
+        inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element(None, "WeatherServer", key="xml:000002", room=None),
+            element(None, "WeatherServer", key="xml:000003", room=None),
+        ),
+        source(),
+    )
+
+    assert singleton.nodes[1].device_identifier == "serial-a:service:weatherserver"
+    assert {item.resolution_reason for item in duplicate.nodes[1:]} == {"ambiguous_uuidless_service"}
+
+
+def test_uuidless_singleton_service_owns_its_typed_channel():
+    """Typed child ownership follows the same UUID-less singleton rule."""
+    resolved = resolve_engineering_topology(
+        inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element(None, "WeatherServer", key="xml:000002", room=None),
+            element("weather", "WeatherData", parent_key="xml:000002"),
+        ),
+        source(),
+    )
+
+    assert node(resolved, "weather").device_identifier == "serial-a:service:weatherserver"
+
+
+def test_parser_to_resolver_keeps_uuidless_sensitive_ancestry_opaque_and_sanitized():
+    """Sensitivity crosses UUID-less parents before name/path projection."""
+    xml = b"""<?xml version="1.0"?>
+<ControlList>
+  <C Type="LoxLIVE" U="ms" Title="Miniserver" />
+  <C Type="NfcCode" Title="Private caption">
+    <C Type="TreeDevice" U="child" Title="ST-F04" />
+  </C>
+</ControlList>"""
+
+    resolved = resolve_engineering_topology(parse_engineering_xml(xml, **SYNTHETIC_PARSE_CONTEXT), source())
+    child = node(resolved, "child")
+
+    assert child.sensitive is True
+    assert child.element.title is None
+    assert child.topology_path == ()

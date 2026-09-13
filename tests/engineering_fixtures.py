@@ -174,3 +174,39 @@ def source(entry_id: str = "entry-a", serial: str = "serial-a") -> EngineeringSo
 def node(resolved: ResolvedEngineeringInventory, uuid: str):
     """Return the resolved node with a stable engineering UUID."""
     return next(item for item in resolved.nodes if item.element.uuid == uuid)
+
+
+def reference_link_inventory() -> EngineeringInventory:
+    """Build a Link graph with Air and 1-Wire endpoint chains."""
+    return inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("link", "LoxLink", parent_uuid="ms", title="Link", room=None),
+        element("air-extension", "AirBaseExtension", parent_uuid="link", title="Air bridge"),
+        element("air-device", "AirDevice", parent_uuid="air-extension", title="ST-F01"),
+        element("wire-extension", "Lox1WireExtension", parent_uuid="link", title="Wire extension"),
+        element("wire-sensor", "Lox1wireDevice", parent_uuid="wire-extension", title="ST-F02"),
+    )
+
+
+def provider_inventory() -> EngineeringInventory:
+    """Build internal I/O and document-level provider services."""
+    return inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("io", "IoData", parent_uuid="ms", room=None),
+        element("digital-i1", "DigitalIn", parent_uuid="io", io_name="I1"),
+        element("analog-ai1", "VoltageIn", parent_uuid="io", io_name="AI1"),
+        element("relay-q1", "Actor", parent_uuid="io", io_name="Q1"),
+        element("weather-server", "WeatherServer", room=None),
+        element("weather-value", "WeatherData", parent_uuid="weather-server", io_name="WDC1"),
+        element("global-states", "GlobalStates", room=None),
+        element("system-variable", "SysVar", parent_uuid="global-states", io_name="SYS1"),
+    )
+
+
+def cyclic_inventory() -> EngineeringInventory:
+    """Build a cycle that cannot be resolved to a physical owner."""
+    return inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("cycle-a", "TreeDevice", parent_uuid="cycle-b"),
+        element("cycle-b", "TreeCaption", parent_uuid="cycle-a"),
+    )
