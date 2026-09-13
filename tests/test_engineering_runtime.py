@@ -6,6 +6,7 @@ from custom_components.loxone.engineering_config import EngineeringElement
 from custom_components.loxone.engineering_runtime import (
     _parse_runtime_response,
     _probe_targets,
+    binding_from_response,
 )
 
 
@@ -51,9 +52,9 @@ def test_runtime_probe_does_not_fallback_to_ambiguous_io_name():
         (b'{"LL":{"control":"dev/sps/io/AWI1/state","value":"21,75","Code":"200"}}', 21.75, None, 0),
         (b'<LL control="dev/sps/io/x/all" value="0" Code="200"><S value="1"/></LL>', 0.0, None, 1),
         (
-            '<LL control="dev/sps/io/AWI1/state" value="21,75 \\N{DEGREE SIGN}C" Code="200"/>'.encode(),
+            '<LL control="dev/sps/io/AWI1/state" value="21,75 °C" Code="200"/>'.encode(),
             21.75,
-            "\\N{DEGREE SIGN}C",
+            "°C",
             0,
         ),
     ],
@@ -92,3 +93,11 @@ def test_runtime_response_rejects_entity_declarations():
     """Untrusted endpoint XML must not enable entity expansion."""
     with pytest.raises(ValueError, match="forbidden"):
         _parse_runtime_response(b'<!DOCTYPE LL [<!ENTITY x "boom">]><LL Code="200" value="&x;"/>')
+
+
+def test_all_response_keeps_explicit_child_uuid_but_scalar_has_no_state_uuid():
+    all_response = _parse_runtime_response(b'<LL Code="200" value="2" u1="event-state" v1="2"/>')
+    scalar_response = _parse_runtime_response(b'<LL Code="200" value="2"/>')
+    assert all_response.numeric_states[0].state_uuid == "event-state"
+    assert scalar_response.numeric_states == ()
+    assert binding_from_response("engineering", "2").state_uuid is None

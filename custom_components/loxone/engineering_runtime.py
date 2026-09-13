@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -14,8 +15,10 @@ import aiohttp
 
 if TYPE_CHECKING:
     from .engineering_config import EngineeringElement, EngineeringInventory
+    from .engineering_topology import ResolvedEngineeringInventory
 
 HTTP_OK = 200
+_FIRST_CONTROL_CHARACTER = 32
 MAX_RUNTIME_RESPONSE_BYTES = 64 * 1024
 RUNTIME_PROBE_CONCURRENCY = 4
 RUNTIME_PROBE_TIMEOUT = 10.0
@@ -25,6 +28,9 @@ ERR_JSON_LL_MISSING = "Runtime JSON does not contain an LL response"
 ERR_XML_DECLARATIONS = "Runtime XML contains forbidden declarations"
 ERR_XML_ROOT = "Runtime XML root is not LL"
 _NUMBER_WITH_UNIT = re.compile(r"^\s*(?P<number>[+-]?(?:\d+(?:[.,]\d*)?|[.,]\d+)(?:[eE][+-]?\d+)?)\s*(?P<unit>.*?)\s*$")
+SAFE_RUNTIME_UNITS = frozenset(
+    {"%", "°", "°C", "°F", "C", "F", "V", "A", "W", "kW", "Wh", "kWh", "Hz", "lx", "Pa", "bar", "ppm", "s", "min", "h"}
+)
 
 
 class EngineeringRuntimeError(ValueError):
@@ -94,6 +100,7 @@ class EngineeringRuntimeBinding:
     unit: str | None = None
     substate_count: int = 0
     numeric_states: tuple[RuntimeNumericState, ...] = ()
+    state_uuid: str | None = None
     error: str | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
@@ -115,6 +122,7 @@ class EngineeringRuntimeBinding:
             "unit": self.unit,
             "substate_count": self.substate_count,
             "numeric_states": [state.as_public_dict() for state in self.numeric_states],
+            "state_uuid": self.state_uuid,
             "error": self.error,
         }
 
@@ -148,13 +156,19 @@ def _classify_value(value: Any) -> tuple[str, float | None, str | None]:
     elif isinstance(value, bool):
         kind, numeric_value, unit = "boolean", float(value), None
     elif isinstance(value, (int, float)):
-        kind, numeric_value, unit = "number", float(value), None
+        numeric_value = float(value)
+        kind, unit = ("number", None) if math.isfinite(numeric_value) else ("text", None)
     elif isinstance(value, str):
+        if any(ord(character) < _FIRST_CONTROL_CHARACTER for character in value):
+            return "text", None, None
         match = _NUMBER_WITH_UNIT.fullmatch(value)
         if match:
-            kind = "number"
-            numeric_value = float(match.group("number").replace(",", "."))
+            candidate = float(match.group("number").replace(",", "."))
             unit = match.group("unit") or None
+            if math.isfinite(candidate) and (unit is None or unit in SAFE_RUNTIME_UNITS):
+                kind, numeric_value = "number", candidate
+            else:
+                kind, numeric_value, unit = "text", None, None
         else:
             kind, numeric_value, unit = "text", None, None
     elif isinstance(value, (dict, list)):
@@ -162,6 +176,24 @@ def _classify_value(value: Any) -> tuple[str, float | None, str | None]:
     else:
         kind, numeric_value, unit = "unknown", None, None
     return kind, numeric_value, unit
+
+
+def binding_from_response(engineering_uuid: str, value: Any) -> EngineeringRuntimeBinding:
+    """Build a rebind-only scalar binding; a scalar never proves event identity."""
+    value_kind, numeric_value, unit = _classify_value(value)
+    return EngineeringRuntimeBinding(
+        engineering_uuid=engineering_uuid,
+        io_name="",
+        loxone_type=None,
+        title=None,
+        room=None,
+        suggested_platform=None,
+        status="bound",
+        binding_method="uuid_state",
+        value_kind=value_kind,
+        numeric_value=numeric_value,
+        unit=unit,
+    )
 
 
 def _numeric_state(*, index: int, state_uuid: str | None, value: Any) -> RuntimeNumericState | None:
@@ -334,13 +366,20 @@ async def _probe_element(
                     unit=parsed.unit,
                     substate_count=parsed.substate_count,
                     numeric_states=parsed.numeric_states,
+                    state_uuid=(
+                        parsed.numeric_states[0].state_uuid
+                        if method == "uuid_all" and len(parsed.numeric_states) == 1
+                        else None
+                    ),
                 )
             except (aiohttp.ClientError, TimeoutError) as err:
                 last_error = type(err).__name__
             except (ET.ParseError, json.JSONDecodeError, TypeError, ValueError) as err:
                 last_error = str(err)
 
-    status = "not_found" if last_code is not None else "error"
+    status = "not_found" if last_code is not None else "transport_error"
+    if last_code in {401, 403}:
+        status = "auth_error"
     if not unique_io_name and element.io_name:
         status = "ambiguous_io_name"
         last_error = "UUID endpoints failed and the IO name is not globally unique"
@@ -358,16 +397,23 @@ async def _probe_element(
 
 
 async def async_probe_engineering_runtime(
-    inventory: EngineeringInventory,
+    inventory: EngineeringInventory | ResolvedEngineeringInventory,
     *,
     client: RuntimeProbeClient,
 ) -> EngineeringRuntimeInventory:
-    """Probe all direct engineering channels through read-only Miniserver endpoints."""
-    elements = tuple(
-        element
-        for element in inventory.candidates
-        if element.uuid and element.io_name and element.suggested_platform is not None
-    )
+    """Probe candidates from the shared capability policy through GET-only endpoints."""
+    # The resolved form is the authoritative route.  Retain the inventory form
+    # only for callers that have not yet moved to owner resolution.
+    if hasattr(inventory, "nodes"):
+        from .engineering_capabilities import select_runtime_probe_candidates  # noqa: PLC0415
+
+        elements = tuple(item.element for item in select_runtime_probe_candidates(inventory))
+    else:
+        elements = tuple(
+            element
+            for element in inventory.candidates
+            if element.uuid and element.io_name and element.suggested_platform is not None
+        )
     io_name_counts: dict[str, int] = {}
     for element in elements:
         key = element.io_name.casefold()

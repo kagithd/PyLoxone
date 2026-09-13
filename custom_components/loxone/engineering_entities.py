@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers import area_registry as ar
@@ -18,6 +18,30 @@ if TYPE_CHECKING:
 
     from .engineering_config import EngineeringElement, EngineeringInventory
     from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
+    from .engineering_capabilities import EngineeringInventoryRow
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringEntitySpec:
+    """Platform-neutral entity definition from a proven safe event binding."""
+
+    unique_id: str
+    state_uuid: str
+    platform: Literal["sensor", "binary_sensor"]
+    name: str
+    native_value: float | bool | None
+    unit: str | None
+    available: bool
+    owner_identifier: str
+    owner_name: str
+    owner_model: str
+    room: str | None
+    loxone_type: str | None
+    io_name: str | None
+    config_version: int
+    runtime_binding: str | None
+    enabled_by_default: bool = False
+
 
 ENGINEERING_REGISTRY_STORAGE_VERSION = 1
 ENGINEERING_REGISTRY_STORAGE_KEY = "loxone.engineering_registry"
@@ -31,6 +55,54 @@ class EngineeringSensorSpec:
     binding: EngineeringRuntimeBinding
     device: EngineeringElement | None
     config_version: int
+
+
+def build_engineering_entity_specs(
+    rows: tuple[EngineeringInventoryRow, ...], runtime: EngineeringRuntimeInventory | None
+) -> tuple[EngineeringEntitySpec, ...]:
+    """Prepare only explicit event mappings; scalar reads remain inventory-only."""
+    specs: list[EngineeringEntitySpec] = []
+    for row in rows:
+        node, binding = row.node, row.binding
+        if (
+            row.capability.exposure.value != "prepared_disabled"
+            or row.semantic_platform is None
+            or not node.element.uuid
+            or binding is None
+            or not binding.event_binding_proven
+            or not binding.state_uuid
+            or not node.device_identifier
+        ):
+            continue
+        live = (
+            None
+            if runtime is None
+            else next((item for item in runtime.bindings if item.engineering_uuid == node.element.uuid), None)
+        )
+        numeric = None if live is None else live.numeric_value
+        native_value: float | bool | None = numeric
+        if row.semantic_platform == "binary_sensor" and numeric is not None:
+            native_value = bool(numeric)
+        specs.append(
+            EngineeringEntitySpec(
+                unique_id=node.element.uuid,
+                state_uuid=binding.state_uuid,
+                platform=row.semantic_platform,
+                name=node.element.title or node.element.io_name or node.element.uuid,
+                native_value=native_value,
+                unit=binding.safe_unit,
+                available=live is not None,
+                owner_identifier=node.device_identifier,
+                owner_name=node.element.title or node.element.loxone_type or node.device_identifier,
+                owner_model=node.element.loxone_type or "Engineering device",
+                room=node.element.room,
+                loxone_type=node.element.loxone_type,
+                io_name=node.element.io_name,
+                config_version=0,
+                runtime_binding=binding.binding_method if live is not None else None,
+            )
+        )
+    return tuple(specs)
 
 
 def engineering_inventory_updated_signal(entry_id: str) -> str:
@@ -99,8 +171,29 @@ def normalize_engineering_unit(
     loxone_type: str | None,
 ) -> str | None:
     """Normalize only units whose meaning can be established conservatively."""
+    safe_units = {
+        "%",
+        "°C",
+        "°F",
+        "C",
+        "F",
+        "V",
+        "A",
+        "W",
+        "kW",
+        "Wh",
+        "kWh",
+        "Hz",
+        "lx",
+        "Pa",
+        "bar",
+        "ppm",
+        "s",
+        "min",
+        "h",
+    }
     if unit != "°":
-        return unit
+        return unit if unit in safe_units else None
     context = f"{title or ''} {loxone_type or ''}".casefold()
     if any(keyword in context for keyword in ("temperatur", "temperature", "temp")):
         return "°C"

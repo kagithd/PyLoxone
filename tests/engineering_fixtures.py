@@ -13,6 +13,10 @@ from custom_components.loxone.engineering_topology import (
     EngineeringSourceContext,
     ResolvedEngineeringInventory,
 )
+from custom_components.loxone.engineering_runtime import (
+    EngineeringRuntimeBinding,
+    EngineeringRuntimeInventory,
+)
 
 SYNTHETIC_PARSE_CONTEXT = {
     "source_archive": "sps_7_20260913120000.zip",
@@ -209,4 +213,57 @@ def cyclic_inventory() -> EngineeringInventory:
         element("ms", "LoxLIVE", title="Miniserver", room=None),
         element("cycle-a", "TreeDevice", parent_uuid="cycle-b"),
         element("cycle-b", "TreeCaption", parent_uuid="cycle-a"),
+    )
+
+
+def numeric_binding(uuid: str, value: float, element_type: str = "VoltageIn") -> EngineeringRuntimeBinding:
+    """Create a synthetic explicitly event-mapped numeric runtime binding."""
+    return EngineeringRuntimeBinding(
+        engineering_uuid=uuid,
+        io_name="AI1",
+        loxone_type=element_type,
+        title=element_type,
+        room="Office",
+        suggested_platform=None,
+        status="bound",
+        binding_method="uuid_all",
+        value_kind="number",
+        numeric_value=value,
+        state_uuid=f"{uuid}-state",
+    )
+
+
+def text_binding(uuid: str = "text", element_type: str = "SysVar") -> EngineeringRuntimeBinding:
+    """Create a synthetic arbitrary-text binding which must never be exposed."""
+    return EngineeringRuntimeBinding(
+        engineering_uuid=uuid,
+        io_name="SYS1",
+        loxone_type=element_type,
+        title=element_type,
+        room="Office",
+        suggested_platform=None,
+        status="bound",
+        binding_method="uuid_state",
+        value_kind="text",
+    )
+
+
+def resolved_node(uuid: str, element_type: str, *, io_name: str = "AI1"):
+    """Create a resolved channel without relying on a legacy platform hint."""
+    from custom_components.loxone.engineering_topology import (
+        NodeKind,
+        ResolvedEngineeringNode,
+        ResolutionStatus,
+    )
+
+    return ResolvedEngineeringNode(
+        element=element(uuid, element_type, io_name=io_name),
+        kind=NodeKind.CHANNEL,
+        owner_key="ms",
+        device_identifier="serial-a",
+        via_device_identifier=None,
+        bus_kind=None,
+        topology_path=("Miniserver", element_type),
+        resolution_status=ResolutionStatus.RESOLVED,
+        resolution_reason="internal_miniserver_channel",
     )
