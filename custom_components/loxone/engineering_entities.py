@@ -10,6 +10,7 @@ from homeassistant.core import callback
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
 
 from .const import DOMAIN
 
@@ -19,7 +20,10 @@ if TYPE_CHECKING:
     from .engineering_capabilities import EngineeringInventoryRow
     from .engineering_config import EngineeringElement, EngineeringInventory
     from .engineering_registry import EngineeringRegistryMetadata
-    from .engineering_runtime import EngineeringRuntimeBinding, EngineeringRuntimeInventory
+    from .engineering_runtime import (
+        EngineeringRuntimeBinding,
+        EngineeringRuntimeInventory,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,10 @@ class EngineeringEntitySpec:
     enabled_by_default: bool = False
 
 
+ENGINEERING_REGISTRY_STORAGE_VERSION = 1
+ENGINEERING_REGISTRY_STORAGE_KEY = "loxone.engineering_registry"
+
+
 @dataclass(frozen=True, slots=True)
 class EngineeringSensorSpec:
     """A verified numeric engineering channel safe to prepare as a sensor."""
@@ -55,7 +63,8 @@ class EngineeringSensorSpec:
 
 
 def build_engineering_entity_specs(
-    rows: tuple[EngineeringInventoryRow, ...], runtime: EngineeringRuntimeInventory | None
+    rows: tuple[EngineeringInventoryRow, ...],
+    runtime: EngineeringRuntimeInventory | None,
 ) -> tuple[EngineeringEntitySpec, ...]:
     """Prepare only explicit event mappings; scalar reads remain inventory-only."""
     specs: list[EngineeringEntitySpec] = []
@@ -74,7 +83,10 @@ def build_engineering_entity_specs(
         live = (
             None
             if runtime is None
-            else next((item for item in runtime.bindings if item.engineering_uuid == node.element.uuid), None)
+            else next(
+                (item for item in runtime.bindings if item.engineering_uuid == node.element.uuid),
+                None,
+            )
         )
         live_unit = (
             None
@@ -222,7 +234,7 @@ async def async_store_engineering_registry_metadata(
     entry_id: str,
     metadata: object,
 ) -> None:
-    """Compatibility adapter storing only fully applied Task 4 metadata."""
+    """Store applied metadata or the unchanged coordinator's legacy audit scope."""
     from dataclasses import replace  # noqa: PLC0415
 
     from .engineering_registry import EngineeringRegistryMetadata  # noqa: PLC0415
@@ -232,12 +244,25 @@ async def async_store_engineering_registry_metadata(
     )
 
     if not isinstance(metadata, EngineeringRegistryMetadata):
+        if not isinstance(metadata, tuple) or not all(isinstance(item, EngineeringSensorSpec) for item in metadata):
+            return
+        identifiers = sorted({identifier for spec in metadata if (identifier := (spec.device or spec.element).uuid)})
+        room_names = sorted({spec.element.room for spec in metadata if spec.element.room})
+        legacy_store: Store[dict[str, list[str]]] = Store(
+            hass,
+            ENGINEERING_REGISTRY_STORAGE_VERSION,
+            f"{ENGINEERING_REGISTRY_STORAGE_KEY}.{entry_id}",
+            private=True,
+        )
+        await legacy_store.async_save(
+            {
+                "active_device_identifiers": identifiers,
+                "room_names": room_names,
+            }
+        )
         return
     state = await async_load_engineering_state(hass, entry_id)
-    if (
-        state.snapshot is None
-        or metadata.applied_generation != state.snapshot.generation_id
-    ):
+    if state.snapshot is None or metadata.applied_generation != state.snapshot.generation_id:
         return
     await async_store_engineering_state(
         hass,
@@ -261,17 +286,41 @@ async def async_load_engineering_registry_metadata(
     from .engineering_snapshot import async_load_engineering_state  # noqa: PLC0415
 
     state = await async_load_engineering_state(hass, entry_id)
-    if state.snapshot is None:
-        return EngineeringRegistryMetadata.empty()
-    applied = (
-        state.snapshot.generation_id
-        if state.registry_applied_generation == state.snapshot.generation_id
-        else None
+    legacy_store: Store[dict[str, list[str]]] = Store(
+        hass,
+        ENGINEERING_REGISTRY_STORAGE_VERSION,
+        f"{ENGINEERING_REGISTRY_STORAGE_KEY}.{entry_id}",
+        private=True,
     )
-    return registry_metadata_from_snapshot(
+    legacy = await legacy_store.async_load() or {}
+    legacy_identifiers = frozenset(
+        item for item in legacy.get("active_device_identifiers", ()) if isinstance(item, str) and item
+    )
+    legacy_rooms = frozenset(item for item in legacy.get("room_names", ()) if isinstance(item, str) and item)
+    if state.snapshot is None:
+        return EngineeringRegistryMetadata(
+            legacy_identifiers,
+            legacy_rooms,
+            {},
+            None,
+            None,
+        )
+    applied = (
+        state.snapshot.generation_id if state.registry_applied_generation == state.snapshot.generation_id else None
+    )
+    current = registry_metadata_from_snapshot(
         state.snapshot,
         managed_area_ids=state.managed_area_ids,
         applied_generation=applied,
+    )
+    if applied is not None:
+        return current
+    return EngineeringRegistryMetadata(
+        current.active_device_identifiers | legacy_identifiers,
+        current.room_names | legacy_rooms,
+        current.managed_area_ids,
+        None,
+        current.provider_identifier,
     )
 
 

@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from custom_components.loxone.const import DOMAIN
-from custom_components.loxone.engineering_entities import build_engineering_entity_specs
+from custom_components.loxone.coordinator import LoxoneCoordinator
+from custom_components.loxone.engineering_capabilities import (
+    resolve_engineering_capabilities,
+)
+from custom_components.loxone.engineering_entities import (
+    async_load_engineering_registry_metadata,
+    async_store_engineering_registry_metadata,
+    build_engineering_entity_specs,
+    build_engineering_sensor_specs,
+)
 from custom_components.loxone.engineering_registry import (
     EngineeringRegistryMetadata,
     async_apply_engineering_registry_plan,
@@ -18,16 +28,58 @@ from custom_components.loxone.engineering_registry import (
     async_sync_engineering_devices,
 )
 from custom_components.loxone.engineering_runtime import EngineeringRuntimeInventory
-from custom_components.loxone.engineering_snapshot import StoredEngineeringState
+from custom_components.loxone.engineering_snapshot import (
+    EngineeringSnapshot,
+    StoredEngineeringState,
+    engineering_configuration_revision_id,
+    engineering_generation_id,
+    engineering_safe_content_digest,
+)
+from custom_components.loxone.engineering_topology import resolve_engineering_topology
 from tests.engineering_fixtures import (
     element,
     inventory_of,
     make_snapshot,
     numeric_binding,
     reference_link_inventory,
+    source,
+    text_binding,
 )
 
 _UNDEFINED = object()
+
+
+class FakeIntentStore:
+    """Cold-restart fake for the acknowledged registry intent journal."""
+
+    data: dict[str, object] | None = None
+    fail_save = False
+
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    async def async_load(self):
+        return deepcopy(self.__class__.data)
+
+    async def async_save_acknowledged(self, data):
+        if self.__class__.fail_save:
+            raise RuntimeError("injected registry intent store failure")
+        self.__class__.data = deepcopy(data)
+
+
+class FakeLegacyMetadataStore:
+    """Pre-Task-5 metadata store fake used by the unchanged coordinator path."""
+
+    data: dict[str, object] | None = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        del args, kwargs
+
+    async def async_load(self):
+        return deepcopy(self.__class__.data)
+
+    async def async_save(self, data):
+        self.__class__.data = deepcopy(data)
 
 
 class FakeAreaRegistry:
@@ -238,6 +290,8 @@ class RegistryHarness:
 
 @pytest.fixture
 def registries(monkeypatch) -> RegistryHarness:
+    FakeIntentStore.data = None
+    FakeIntentStore.fail_save = False
     harness = RegistryHarness()
     monkeypatch.setattr(
         "custom_components.loxone.engineering_registry.ar.async_get",
@@ -251,7 +305,54 @@ def registries(monkeypatch) -> RegistryHarness:
         "custom_components.loxone.engineering_registry.er.async_get",
         lambda hass: harness.entities,
     )
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.EngineeringRegistryIntentStore",
+        FakeIntentStore,
+    )
     return harness
+
+
+def _snapshot_for(
+    entry_id: str,
+    serial: str | None,
+    *,
+    inventory=None,
+    runtime: EngineeringRuntimeInventory | None = None,
+) -> EngineeringSnapshot:
+    """Build a valid snapshot for claimant and provider-isolation tests."""
+    raw = inventory or inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("global-states", "GlobalStates", room=None),
+        element(
+            "shared-channel",
+            "SysVar",
+            parent_uuid="global-states",
+            io_name="SYS1",
+        ),
+    )
+    context = replace(source(entry_id, serial or "temporary"), serial_number=serial)
+    resolved = resolve_engineering_topology(raw, context)
+    bindings = runtime or EngineeringRuntimeInventory(bindings=(numeric_binding("shared-channel", 1.0, "SysVar"),))
+    rows = resolve_engineering_capabilities(resolved, bindings)
+    return EngineeringSnapshot(
+        source=context,
+        nodes=resolved.nodes,
+        rows=rows,
+        configuration_revision_id=engineering_configuration_revision_id(context),
+        safe_content_digest=engineering_safe_content_digest(
+            context,
+            resolved.nodes,
+            rows,
+        ),
+        read_sequence=1,
+        generation_id=engineering_generation_id(
+            context,
+            resolved.nodes,
+            rows,
+            read_sequence=1,
+        ),
+        captured_at=make_snapshot().captured_at,
+    )
 
 
 def test_registry_creates_entityless_tree_device_with_full_via_chain(registries):
@@ -528,3 +629,697 @@ def test_state_metadata_is_persisted_only_after_complete_application(registries,
         registry_applied_generation=snapshot.generation_id,
         managed_area_ids=result.metadata.managed_area_ids,
     )
+
+
+def test_serialless_snapshot_carries_entry_provider_identity(registries):
+    """The config-entry fallback is the authoritative root when serial is absent."""
+    snapshot = _snapshot_for("entry-a", None)
+
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert plan.metadata.provider_identifier == "entry-a"
+    assert plan.device_operations[0].identifier == "entry-a"
+
+
+@pytest.mark.parametrize(
+    ("binding", "expected"),
+    (
+        (text_binding("service-value"), False),
+        (replace(numeric_binding("service-value", 1.0, "SysVar"), unit="invalid"), False),
+        (None, False),
+        (
+            replace(
+                numeric_binding("service-value", 1.0, "SysVar"),
+                binding_method="uuid_state",
+                state_uuid=None,
+            ),
+            True,
+        ),
+        (numeric_binding("service-value", 1.0, "SysVar"), True),
+    ),
+)
+def test_service_module_requires_a_supported_safe_read_capability(
+    registries,
+    binding,
+    expected,
+):
+    """Semantic type alone must not create configured-only or unsupported services."""
+    runtime = EngineeringRuntimeInventory(bindings=() if binding is None else (binding,))
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element("service", "GlobalStates", room=None),
+            element(
+                "service-value",
+                "SysVar",
+                parent_uuid="service",
+                io_name="SYS1",
+            ),
+        ),
+        runtime=runtime,
+    )
+
+    result = asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    identifier = "serial-a:service"
+    assert (registries.device(identifier) is not None) is expected
+    assert (identifier in result.metadata.active_device_identifiers) is expected
+
+
+def test_mixed_service_keeps_supported_scalar_and_ignores_unsupported_child(registries):
+    """One safe scalar keeps its service useful without promoting a text sibling."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element("service", "GlobalStates", room=None),
+            element("safe-value", "SysVar", parent_uuid="service", io_name="SYS1"),
+            element("text-value", "SysVar", parent_uuid="service", io_name="SYS2"),
+        ),
+        runtime=EngineeringRuntimeInventory(
+            bindings=(
+                replace(
+                    numeric_binding("safe-value", 1.0, "SysVar"),
+                    binding_method="uuid_state",
+                    state_uuid=None,
+                ),
+                text_binding("text-value"),
+            )
+        ),
+    )
+
+    asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert registries.device("serial-a:service") is not None
+
+
+def test_sensitive_only_service_is_not_created(registries):
+    """Suppressed descendants cannot make a logical service registry-visible."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element("service", "GlobalStates", room=None),
+            element("private", "Credential", parent_uuid="service", room=None),
+            element(
+                "service-value",
+                "SysVar",
+                parent_uuid="private",
+                io_name="SYS1",
+            ),
+        ),
+        runtime=EngineeringRuntimeInventory(bindings=(numeric_binding("service-value", 1.0, "SysVar"),)),
+    )
+
+    asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert registries.device("serial-a:service") is None
+
+
+def test_area_intent_survives_metadata_failure_and_fresh_replan(registries, monkeypatch):
+    """A cold replan must retain ownership of an integration-made room move."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+        model="TreeDevice",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    first_snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+    state = StoredEngineeringState(snapshot=first_snapshot)
+
+    async def fail_metadata_save(hass, candidate):
+        del hass, candidate
+        raise RuntimeError("injected metadata failure")
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        fail_metadata_save,
+    )
+    first_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            first_snapshot,
+            previous,
+        )
+    )
+    with pytest.raises(RuntimeError, match="injected metadata failure"):
+        asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                first_plan,
+                committed_state=state,
+            )
+        )
+    workshop = registries.areas.async_get_area_by_name("Workshop")
+    assert device.area_id == workshop.id
+    assert FakeIntentStore.data
+
+    saved: list[StoredEngineeringState] = []
+
+    async def save_metadata(hass, candidate):
+        del hass
+        saved.append(candidate)
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        save_metadata,
+    )
+    cold_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            first_snapshot,
+            previous,
+        )
+    )
+    recovered = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=state,
+        )
+    )
+    assert recovered.metadata.managed_area_ids["serial-a:device"] == workshop.id
+    assert FakeIntentStore.data == {}
+
+    second_snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Living Room",
+            ),
+        ),
+        read_sequence=2,
+    )
+    second_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            second_snapshot,
+            recovered.metadata,
+        )
+    )
+    second = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            second_plan,
+            committed_state=StoredEngineeringState(snapshot=second_snapshot),
+        )
+    )
+    living = registries.areas.async_get_area_by_name("Living Room")
+    assert device.area_id == living.id
+    assert second.metadata.managed_area_ids["serial-a:device"] == living.id
+    assert saved
+
+
+@pytest.mark.parametrize("user_room", ("User Area", "Workshop"))
+def test_user_area_change_between_plan_and_apply_is_never_claimed(
+    registries,
+    monkeypatch,
+    user_room,
+):
+    """A current-area recheck preserves a user override made after planning."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    user_area = registries.areas.async_get_or_create(user_room)
+    device.area_id = user_area.id
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+
+    result = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in result.metadata.managed_area_ids
+
+
+def test_user_area_change_before_cold_replan_cancels_persisted_intent(
+    registries,
+    monkeypatch,
+):
+    """A user override after partial apply wins when the pending plan is rebuilt."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+
+    async def fail_metadata_save(hass, candidate):
+        del hass, candidate
+        raise RuntimeError("injected metadata failure")
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        fail_metadata_save,
+    )
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    with pytest.raises(RuntimeError, match="injected metadata failure"):
+        asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                plan,
+                committed_state=StoredEngineeringState(snapshot=snapshot),
+            )
+        )
+    user_area = registries.areas.async_get_or_create("User Area")
+    device.area_id = user_area.id
+
+    cold_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+    recovered = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in recovered.metadata.managed_area_ids
+
+
+def test_area_intent_store_failure_precedes_all_registry_mutations(
+    registries,
+):
+    """An unacknowledged intent cannot authorize an area mutation."""
+    snapshot = make_snapshot(inventory=reference_link_inventory())
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+    before = registries.mutations
+    FakeIntentStore.fail_save = True
+
+    with pytest.raises(RuntimeError, match="intent store failure"):
+        asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                plan,
+                committed_state=StoredEngineeringState(snapshot=snapshot),
+            )
+        )
+
+    assert registries.mutations == before
+
+
+def _install_legacy_entity(registries, snapshot):
+    spec = build_engineering_entity_specs(snapshot.rows, None)[0]
+    legacy = registries.devices.add(spec.unique_id, "entry-a", name=spec.name)
+    entity = registries.entities.add(
+        domain=spec.platform,
+        platform=DOMAIN,
+        unique_id=spec.unique_id,
+        config_entry_id="entry-a",
+        device_id=legacy.id,
+    )
+    return spec, legacy, entity
+
+
+@pytest.mark.parametrize("entry_order", (("entry-a", "entry-b"), ("entry-b", "entry-a")))
+def test_unloaded_snapshot_claimant_blocks_legacy_reassociation(
+    registries,
+    monkeypatch,
+    entry_order,
+):
+    """Persisted snapshots, not coordinator load order, establish claimants."""
+    snapshot_a = _snapshot_for("entry-a", "serial-a")
+    snapshot_b = _snapshot_for("entry-b", "serial-b")
+    spec, legacy, entity = _install_legacy_entity(registries, snapshot_a)
+    states = {
+        "entry-b": StoredEngineeringState(snapshot=snapshot_b),
+    }
+    registries.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [SimpleNamespace(entry_id=item) for item in entry_order]
+    )
+
+    async def load_state(hass, entry_id):
+        del hass
+        return states.get(entry_id, StoredEngineeringState(snapshot=None))
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_load_engineering_state",
+        load_state,
+    )
+
+    result = asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot_a,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert entity.device_id == legacy.id
+    assert spec.unique_id in result.ambiguous_legacy_identifiers
+
+
+def test_existing_scoped_claimant_blocks_legacy_reassociation(registries):
+    """A persisted scoped device claim is evidence even without a loaded snapshot."""
+    snapshot = _snapshot_for("entry-a", "serial-a")
+    spec, legacy, entity = _install_legacy_entity(registries, snapshot)
+    registries.devices.add(
+        f"serial-b:{spec.unique_id}",
+        "entry-b",
+        name=spec.name,
+    )
+
+    result = asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert entity.device_id == legacy.id
+    assert spec.unique_id in result.ambiguous_legacy_identifiers
+
+
+def test_unavailable_other_snapshot_blocks_legacy_reassociation(
+    registries,
+    monkeypatch,
+):
+    """A configured entry without claimant evidence makes migration ambiguous."""
+    snapshot = _snapshot_for("entry-a", "serial-a")
+    spec, legacy, entity = _install_legacy_entity(registries, snapshot)
+    registries.hass.config_entries = SimpleNamespace(
+        async_entries=lambda domain: [
+            SimpleNamespace(entry_id="entry-a"),
+            SimpleNamespace(entry_id="entry-b"),
+        ]
+    )
+
+    async def load_state(hass, entry_id):
+        del hass, entry_id
+        return StoredEngineeringState(snapshot=None)
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_load_engineering_state",
+        load_state,
+    )
+
+    result = asyncio.run(
+        async_sync_engineering_devices(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+
+    assert entity.device_id == legacy.id
+    assert spec.unique_id in result.ambiguous_legacy_identifiers
+
+
+def test_entity_identity_change_after_plan_is_rejected(registries):
+    """The global entity identity is resolved again immediately before mutation."""
+    snapshot = _snapshot_for("entry-a", "serial-a")
+    spec, legacy, entity = _install_legacy_entity(registries, snapshot)
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+    entity.unique_id = "changed-identity"
+
+    result = asyncio.run(async_apply_engineering_registry_plan(registries.hass, plan))
+
+    assert entity.device_id == legacy.id
+    assert spec.unique_id in {rejection.spec.unique_id for rejection in result.rejected_entities}
+
+
+def test_new_claimant_after_plan_blocks_legacy_reassociation(registries):
+    """A claimant appearing across the plan/apply boundary prevents takeover."""
+    snapshot = _snapshot_for("entry-a", "serial-a")
+    spec, legacy, entity = _install_legacy_entity(registries, snapshot)
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+    )
+    registries.devices.add(
+        f"serial-b:{spec.unique_id}",
+        "entry-b",
+        name=spec.name,
+    )
+
+    result = asyncio.run(async_apply_engineering_registry_plan(registries.hass, plan))
+
+    assert entity.device_id == legacy.id
+    assert spec.unique_id in result.ambiguous_legacy_identifiers
+
+
+def test_legacy_metadata_round_trip_preserves_audit_scope_without_generation(
+    monkeypatch,
+):
+    """The unchanged coordinator payload remains readable during Task-5 migration."""
+    FakeLegacyMetadataStore.data = None
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("device", "Lox1wireDevice", parent_uuid="ms", title="ST-F07"),
+        element(
+            "temperature",
+            "Lox1wireAsensor",
+            parent_uuid="device",
+            title="Temperature",
+            io_name="AI1",
+            platform="sensor",
+        ),
+    )
+    specs = build_engineering_sensor_specs(
+        inventory,
+        EngineeringRuntimeInventory(bindings=(numeric_binding("temperature", 21.0, "Lox1wireAsensor"),)),
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_entities.Store",
+        FakeLegacyMetadataStore,
+    )
+
+    async def no_snapshot(hass, entry_id):
+        del hass, entry_id
+        return StoredEngineeringState(snapshot=None)
+
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_snapshot.async_load_engineering_state",
+        no_snapshot,
+    )
+
+    asyncio.run(
+        async_store_engineering_registry_metadata(
+            SimpleNamespace(),
+            "entry-a",
+            specs,
+        )
+    )
+    metadata = asyncio.run(async_load_engineering_registry_metadata(SimpleNamespace(), "entry-a"))
+
+    assert metadata.active_device_identifiers == frozenset({"device"})
+    assert metadata.room_names == frozenset({"Office"})
+    assert metadata.applied_generation is None
+    assert metadata.provider_identifier is None
+
+
+def test_unchanged_coordinator_still_passes_legacy_specs_to_metadata_adapter(
+    monkeypatch,
+):
+    """The current manual-refresh caller remains compatible before Task 7 wiring."""
+    inventory = inventory_of(
+        element("ms", "LoxLIVE", title="Miniserver", room=None),
+        element("device", "Lox1wireDevice", parent_uuid="ms", title="ST-F07"),
+        element(
+            "temperature",
+            "Lox1wireAsensor",
+            parent_uuid="device",
+            title="Temperature",
+            io_name="AI1",
+            platform="sensor",
+        ),
+    )
+    runtime = EngineeringRuntimeInventory(bindings=(numeric_binding("temperature", 21.0, "Lox1wireAsensor"),))
+    stored: list[object] = []
+
+    class FakeHass:
+        async def async_add_executor_job(self, job):
+            return job()
+
+    coordinator = object.__new__(LoxoneCoordinator)
+    coordinator.hass = FakeHass()
+    coordinator._host = ""
+    coordinator._username = ""
+    coordinator._password = ""
+    coordinator._verify_ssl = True
+    coordinator.api = SimpleNamespace(scheme="https", url="example.invalid")
+    coordinator.config_entry = SimpleNamespace(entry_id="entry-a")
+    monkeypatch.setattr(
+        "custom_components.loxone.coordinator.download_engineering_inventory",
+        lambda *args, **kwargs: inventory,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.coordinator.async_get_clientsession",
+        lambda hass: object(),
+    )
+
+    async def probe(*args, **kwargs):
+        return runtime
+
+    async def store(hass, entry_id, payload):
+        del hass
+        stored.append((entry_id, payload))
+
+    monkeypatch.setattr(
+        "custom_components.loxone.coordinator.async_probe_engineering_runtime",
+        probe,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.coordinator.async_store_engineering_registry_metadata",
+        store,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.coordinator.async_dispatcher_send",
+        lambda *args: None,
+    )
+
+    asyncio.run(coordinator.async_refresh_engineering_inventory())
+
+    assert stored[0][0] == "entry-a"
+    assert stored[0][1] == build_engineering_sensor_specs(inventory, runtime)

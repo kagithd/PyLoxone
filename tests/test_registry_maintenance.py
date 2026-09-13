@@ -18,6 +18,7 @@ class FakeStore:
 
     data = None
     engineering_generation = "generation-a"
+    engineering_provider = None
     fail_save = False
     fail_save_attempt = None
     save_attempts = 0
@@ -70,9 +71,7 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
     device_registry = FakeDeviceRegistry(devices)
     entity_registry = FakeEntityRegistry(entities)
     area_registry = SimpleNamespace(
-        async_get_area_by_name=lambda name: next(
-            (area for area in areas if area.name == name), None
-        )
+        async_get_area_by_name=lambda name: next((area for area in areas if area.name == name), None)
     )
     notifications = []
     dismissed = []
@@ -84,11 +83,10 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
             frozenset(),
             {},
             FakeStore.engineering_generation,
+            FakeStore.engineering_provider,
         )
 
-    monkeypatch.setattr(
-        "custom_components.loxone.registry_maintenance.Store", FakeStore
-    )
+    monkeypatch.setattr("custom_components.loxone.registry_maintenance.Store", FakeStore)
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
         load_engineering_metadata,
@@ -111,27 +109,19 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.er.async_entries_for_device",
-        lambda registry, device_id: [
-            entity for entity in registry.entities if entity.device_id == device_id
-        ],
+        lambda registry, device_id: [entity for entity in registry.entities if entity.device_id == device_id],
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.dr.async_entries_for_area",
-        lambda registry, area_id: [
-            device for device in registry.devices if device.area_id == area_id
-        ],
+        lambda registry, area_id: [device for device in registry.devices if device.area_id == area_id],
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.er.async_entries_for_area",
-        lambda registry, area_id: [
-            entity for entity in registry.entities if entity.area_id == area_id
-        ],
+        lambda registry, area_id: [entity for entity in registry.entities if entity.area_id == area_id],
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.persistent_notification.async_create",
-        lambda hass, message, title, notification_id: notifications.append(
-            (message, title, notification_id)
-        ),
+        lambda hass, message, title, notification_id: notifications.append((message, title, notification_id)),
     )
     monkeypatch.setattr(
         "custom_components.loxone.registry_maintenance.persistent_notification.async_dismiss",
@@ -152,6 +142,7 @@ def _install_registry_fakes(monkeypatch, devices, entities=(), areas=()):
 def _reset_fake_store():
     FakeStore.data = None
     FakeStore.engineering_generation = "generation-a"
+    FakeStore.engineering_provider = None
     FakeStore.fail_save = False
     FakeStore.fail_save_attempt = None
     FakeStore.save_attempts = 0
@@ -210,35 +201,21 @@ def test_cleanup_requires_two_consecutive_successful_structure_loads(monkeypatch
     FakeStore.data = None
     stale = _device("stale-device", "stale-uuid", "Old switch")
     entity = _entity("switch.old", "stale-device")
-    device_registry, entity_registry, notifications, _ = _install_registry_fakes(
-        monkeypatch, [stale], [entity]
-    )
+    device_registry, entity_registry, notifications, _ = _install_registry_fakes(monkeypatch, [stale], [entity])
 
-    first = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    first = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
     assert first.removed == ()
     assert first.pending[0].observations == 1
     assert device_registry.removed == []
     assert "1/2" in notifications[-1][0]
 
-    same_generation = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    same_generation = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
     assert same_generation.pending[0].observations == 1
     assert device_registry.removed == []
 
     FakeStore.engineering_generation = "generation-b"
-    second = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    second = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
     assert second.pending == ()
     assert second.removed[0].identifier == "stale-uuid"
@@ -255,11 +232,7 @@ def test_audit_only_mode_never_removes_confirmed_devices(monkeypatch):
         monkeypatch, [stale], [_entity("switch.old", "stale-device")]
     )
 
-    result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(auto_cleanup=False), _lox_config()
-        )
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(auto_cleanup=False), _lox_config()))
 
     assert result.audit_only is True
     assert result.pending[0].observations == 2
@@ -273,9 +246,7 @@ def test_confirmed_engineering_device_is_not_reported_as_stale(monkeypatch):
     """A persisted engineering UUID supplements the public structure safely."""
     FakeStore.data = None
     engineering = _device("engineering-device", "engineering-uuid")
-    _, _, notifications, dismissed = _install_registry_fakes(
-        monkeypatch, [engineering]
-    )
+    _, _, notifications, dismissed = _install_registry_fakes(monkeypatch, [engineering])
 
     async def load_engineering_metadata(hass, entry_id):
         del hass, entry_id
@@ -291,11 +262,7 @@ def test_confirmed_engineering_device_is_not_reported_as_stale(monkeypatch):
         load_engineering_metadata,
     )
 
-    result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
     assert result.pending == ()
     assert result.removed == ()
@@ -315,9 +282,7 @@ def test_cleanup_defaults_to_audit_only_when_option_is_absent(monkeypatch):
     )
 
     result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), SimpleNamespace(entry_id="entry-id", options={}), _lox_config()
-        )
+        async_run_registry_maintenance(object(), SimpleNamespace(entry_id="entry-id", options={}), _lox_config())
     )
 
     assert result.audit_only is True
@@ -336,27 +301,19 @@ def test_time_mode_waits_for_elapsed_time_and_a_new_structure_load(monkeypatch):
         lambda: now,
     )
     stale = _device("stale-device", "stale-uuid")
-    device_registry, _, notifications, _ = _install_registry_fakes(
-        monkeypatch, [stale]
-    )
+    device_registry, _, notifications, _ = _install_registry_fakes(monkeypatch, [stale])
     config_entry = _config_entry(mode="time", hours=1)
 
-    first = asyncio.run(
-        async_run_registry_maintenance(object(), config_entry, _lox_config())
-    )
+    first = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     assert first.pending[0].missing_since == 1_000.0
 
     now = 4_599.0
-    second = asyncio.run(
-        async_run_registry_maintenance(object(), config_entry, _lox_config())
-    )
+    second = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     assert second.removed == ()
     assert device_registry.removed == []
 
     now = 4_600.0
-    third = asyncio.run(
-        async_run_registry_maintenance(object(), config_entry, _lox_config())
-    )
+    third = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     assert third.removed[0].identifier == "stale-uuid"
     assert device_registry.removed == ["stale-device"]
     assert "1 elapsed hours" in notifications[-1][0]
@@ -377,16 +334,12 @@ def test_combined_mode_requires_observations_and_elapsed_time(monkeypatch):
     asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     FakeStore.engineering_generation = "generation-b"
     now = 2_000.0
-    second = asyncio.run(
-        async_run_registry_maintenance(object(), config_entry, _lox_config())
-    )
+    second = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     assert second.pending[0].observations == 2
     assert device_registry.removed == []
 
     now = 4_600.0
-    third = asyncio.run(
-        async_run_registry_maintenance(object(), config_entry, _lox_config())
-    )
+    third = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
     assert third.removed[0].identifier == "stale-uuid"
     assert device_registry.removed == ["stale-device"]
 
@@ -394,9 +347,7 @@ def test_combined_mode_requires_observations_and_elapsed_time(monkeypatch):
 def test_pending_engineering_generation_does_not_advance_grace(monkeypatch):
     """A snapshot whose registry phase is pending must not count as an observation."""
     stale = _device("stale-device", "stale-uuid")
-    device_registry, _, notifications, dismissed = _install_registry_fakes(
-        monkeypatch, [stale]
-    )
+    device_registry, _, notifications, dismissed = _install_registry_fakes(monkeypatch, [stale])
 
     async def load_pending_metadata(hass, entry_id):
         del hass, entry_id
@@ -407,14 +358,14 @@ def test_pending_engineering_generation_does_not_advance_grace(monkeypatch):
         load_pending_metadata,
     )
 
-    result = asyncio.run(
-        async_run_registry_maintenance(object(), _config_entry(), _lox_config())
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
-    assert result.skipped is True
+    assert result.skipped is False
+    assert result.audit_only is True
+    assert result.pending[0].observations == 0
     assert device_registry.removed == []
-    assert FakeStore.data is None
-    assert notifications == []
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 0}
+    assert notifications
     assert dismissed == []
 
 
@@ -481,13 +432,149 @@ def test_cleanup_replays_after_counted_token_was_saved(monkeypatch):
     assert attempts == 2
 
 
-def test_restart_prunes_counted_state_after_post_cleanup_save_failure(monkeypatch):
-    """A crash after deletion must not leave an already-removed device pending forever."""
+def test_successful_cleanup_retains_replay_authorization_until_uuid_is_active(
+    monkeypatch,
+):
+    """A tombstone survives absence and is pruned only by authoritative reappearance."""
     stale = _device("stale-device", "stale-uuid")
     device_registry, _, _, _ = _install_registry_fakes(monkeypatch, [stale])
-    FakeStore.fail_save_attempt = 2
 
-    with pytest.raises(RuntimeError, match="injected maintenance store failure"):
+    asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1),
+            _lox_config(),
+        )
+    )
+    assert device_registry.removed == ["stale-device"]
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+    assert FakeStore.data["cleanup_authorizations"] == ["stale-uuid"]
+
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1),
+            {
+                **_lox_config(),
+                "controls": {"stale-uuid": {"name": "Active"}},
+            },
+        )
+    )
+
+    assert result.pending == ()
+    assert result.removed == ()
+    assert FakeStore.data["missing_observations"] == {}
+    assert FakeStore.data["cleanup_authorizations"] == []
+
+
+@pytest.mark.parametrize("mode", ("observations", "time", "combined"))
+@pytest.mark.parametrize(
+    ("root_identifier", "serial"),
+    (("serial", "serial"), ("entry-id", None)),
+)
+def test_authoritative_miniserver_root_is_never_counted_or_deleted(
+    monkeypatch,
+    mode,
+    root_identifier,
+    serial,
+):
+    """Serial and entry-ID provider roots stay protected in every grace mode."""
+    now = 5_000.0
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance._utc_timestamp",
+        lambda: now,
+    )
+    FakeStore.engineering_provider = root_identifier
+    FakeStore.data = {
+        "missing_observations": {root_identifier: 9, "stale-uuid": 1},
+        "missing_since": {root_identifier: 1_000.0, "stale-uuid": 1_000.0},
+        "loxone_rooms": [],
+        "last_counted_engineering_generation": "generation-a",
+    }
+    root = _device("root-device", root_identifier, "Miniserver")
+    stale = _device("stale-device", "stale-uuid")
+    root_entity = _entity("sensor.root", "root-device")
+    stale_entity = _entity("switch.stale", "stale-device")
+    device_registry, entity_registry, _, _ = _install_registry_fakes(
+        monkeypatch,
+        [root, stale],
+        [root_entity, stale_entity],
+    )
+    lox_config = _lox_config()
+    lox_config["msInfo"] = {} if serial is None else {"serialNr": serial}
+
+    result = asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1, mode=mode, hours=1),
+            lox_config,
+        )
+    )
+
+    assert [item.identifier for item in result.removed] == ["stale-uuid"]
+    assert device_registry.removed == ["stale-device"]
+    assert entity_registry.removed == ["switch.stale"]
+    assert root_identifier not in FakeStore.data["missing_observations"]
+    assert root_identifier not in FakeStore.data["missing_since"]
+
+
+def test_cleanup_authorization_replays_after_old_ha_registry_is_restored(monkeypatch):
+    """A delayed HA registry save cannot erase an already-authorized decision."""
+    stale = _device("stale-device", "stale-uuid")
+    first_registry, _, _, _ = _install_registry_fakes(
+        monkeypatch,
+        [stale],
+        [_entity("switch.stale", "stale-device")],
+    )
+    config_entry = _config_entry(auto_cleanup=True, grace=1)
+
+    first = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
+    assert first_registry.removed == ["stale-device"]
+    assert first.removed[0].observations == 1
+    assert FakeStore.data["cleanup_authorizations"] == ["stale-uuid"]
+
+    restored_registry, restored_entities, _, _ = _install_registry_fakes(
+        monkeypatch,
+        [_device("stale-device", "stale-uuid")],
+        [_entity("switch.stale", "stale-device")],
+    )
+    replay = asyncio.run(async_run_registry_maintenance(object(), config_entry, _lox_config()))
+
+    assert replay.removed[0].observations == 1
+    assert restored_registry.removed == ["stale-device"]
+    assert restored_entities.removed == ["switch.stale"]
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+    assert FakeStore.data["cleanup_authorizations"] == ["stale-uuid"]
+
+
+def test_cleanup_authorization_replays_partial_entity_deletion(monkeypatch):
+    """A crash between entity and device deletion resumes from the tombstone."""
+    stale = _device("stale-device", "stale-uuid")
+    entity = _entity("switch.stale", "stale-device")
+    device_registry, entity_registry, _, _ = _install_registry_fakes(
+        monkeypatch,
+        [stale],
+        [entity],
+    )
+    attempts = 0
+
+    def partial_cleanup(hass, config_entry, lox_config, identifiers_to_remove):
+        nonlocal attempts
+        del hass, config_entry, lox_config
+        attempts += 1
+        assert identifiers_to_remove == {"stale-uuid"}
+        if attempts == 1:
+            entity_registry.async_remove("switch.stale")
+            raise RuntimeError("injected partial cleanup failure")
+        device_registry.async_remove_device("stale-device")
+        return (1, 0)
+
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_cleanup_stale_devices",
+        partial_cleanup,
+    )
+
+    with pytest.raises(RuntimeError, match="injected partial cleanup failure"):
         asyncio.run(
             async_run_registry_maintenance(
                 object(),
@@ -495,10 +582,45 @@ def test_restart_prunes_counted_state_after_post_cleanup_save_failure(monkeypatc
                 _lox_config(),
             )
         )
-    assert device_registry.removed == ["stale-device"]
-    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+    assert FakeStore.data["cleanup_authorizations"] == ["stale-uuid"]
+    assert entity_registry.removed == ["switch.stale"]
 
-    FakeStore.fail_save_attempt = None
+    replay = asyncio.run(
+        async_run_registry_maintenance(
+            object(),
+            _config_entry(auto_cleanup=True, grace=1),
+            _lox_config(),
+        )
+    )
+    assert replay.removed[0].identifier == "stale-uuid"
+    assert device_registry.removed == ["stale-device"]
+    assert attempts == 2
+
+
+def test_no_engineering_snapshot_keeps_public_registry_audit_read_only(monkeypatch):
+    """The unchanged startup remains useful without inventing a generation token."""
+    FakeStore.data = {
+        "missing_observations": {"stale-uuid": 1},
+        "missing_since": {"stale-uuid": 1_000.0},
+        "loxone_rooms": ["Old Room"],
+    }
+    stale = _device("stale-device", "stale-uuid")
+    old_area = SimpleNamespace(id="old-area", name="Old Room")
+    device_registry, _, notifications, _ = _install_registry_fakes(
+        monkeypatch,
+        [stale],
+        areas=[old_area],
+    )
+
+    async def no_engineering_snapshot(hass, entry_id):
+        del hass, entry_id
+        return EngineeringRegistryMetadata.empty()
+
+    monkeypatch.setattr(
+        "custom_components.loxone.registry_maintenance.async_load_engineering_registry_metadata",
+        no_engineering_snapshot,
+    )
+
     result = asyncio.run(
         async_run_registry_maintenance(
             object(),
@@ -507,24 +629,23 @@ def test_restart_prunes_counted_state_after_post_cleanup_save_failure(monkeypatc
         )
     )
 
-    assert result.pending == ()
+    assert result.skipped is False
+    assert result.audit_only is True
+    assert result.pending[0].observations == 1
     assert result.removed == ()
-    assert FakeStore.data["missing_observations"] == {}
+    assert result.orphan_rooms[0].name == "Old Room"
+    assert device_registry.removed == []
+    assert FakeStore.data["missing_observations"] == {"stale-uuid": 1}
+    assert "audit only" in notifications[-1][0]
 
 
 def test_empty_structure_skips_storage_notifications_and_cleanup(monkeypatch):
     """An empty structure is never considered an authoritative deletion."""
     FakeStore.data = {"missing_observations": {"stale-uuid": 1}}
     stale = _device("stale-device", "stale-uuid")
-    device_registry, _, notifications, dismissed = _install_registry_fakes(
-        monkeypatch, [stale]
-    )
+    device_registry, _, notifications, dismissed = _install_registry_fakes(monkeypatch, [stale])
 
-    result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), {"controls": {}}
-        )
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), {"controls": {}}))
 
     assert result.skipped is True
     assert device_registry.removed == []
@@ -540,15 +661,9 @@ def test_reappearing_uuid_clears_its_missing_observation(monkeypatch):
         "loxone_rooms": ["Wohnzimmer"],
     }
     active = _device("active-device", "active-uuid")
-    device_registry, _, notifications, dismissed = _install_registry_fakes(
-        monkeypatch, [active]
-    )
+    device_registry, _, notifications, dismissed = _install_registry_fakes(monkeypatch, [active])
 
-    result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
     assert result.pending == ()
     assert result.removed == ()
@@ -566,15 +681,9 @@ def test_removed_empty_loxone_room_is_reported_but_not_deleted(monkeypatch):
         "loxone_rooms": ["Alter Raum", "Wohnzimmer"],
     }
     area = SimpleNamespace(id="old-area", name="Alter Raum")
-    _, _, notifications, _ = _install_registry_fakes(
-        monkeypatch, [], areas=[area]
-    )
+    _, _, notifications, _ = _install_registry_fakes(monkeypatch, [], areas=[area])
 
-    result = asyncio.run(
-        async_run_registry_maintenance(
-            object(), _config_entry(), _lox_config()
-        )
-    )
+    result = asyncio.run(async_run_registry_maintenance(object(), _config_entry(), _lox_config()))
 
     assert result.orphan_rooms[0].name == "Alter Raum"
     assert result.orphan_rooms[0].automations == ("automation.old_room",)

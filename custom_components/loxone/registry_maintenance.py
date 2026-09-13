@@ -72,6 +72,16 @@ class RegistryMaintenanceResult:
     skipped: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _MaintenancePolicy:
+    """Normalized cleanup options for one audit pass."""
+
+    auto_cleanup: bool
+    grace_observations: int
+    grace_mode: str
+    grace_hours: int
+
+
 def room_names_from_lox_config(lox_config: Mapping[str, Any]) -> set[str]:
     """Return configured Loxone room names."""
     rooms = lox_config.get("rooms", {})
@@ -81,9 +91,7 @@ def room_names_from_lox_config(lox_config: Mapping[str, Any]) -> set[str]:
     return {
         name
         for room in rooms.values()
-        if isinstance(room, Mapping)
-        and isinstance((name := room.get("name")), str)
-        and name
+        if isinstance(room, Mapping) and isinstance((name := room.get("name")), str) and name
     }
 
 
@@ -94,25 +102,24 @@ def _stale_devices(  # noqa: PLR0913
     observations: Mapping[str, int],
     missing_since: Mapping[str, float],
     additional_active_identifiers: set[str] | None = None,
+    protected_identifiers: set[str] | None = None,
 ) -> list[StaleDevice]:
     """Return registry devices absent from the current Loxone structure."""
     active_identifiers = control_identifiers_from_lox_config(lox_config)
     active_identifiers.update(additional_active_identifiers or set())
     miniserver_serial = lox_config.get("msInfo", {}).get("serialNr")
+    protected = set(protected_identifiers or set())
+    if isinstance(miniserver_serial, str) and miniserver_serial:
+        protected.add(miniserver_serial)
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
     stale: list[StaleDevice] = []
 
-    for device in dr.async_entries_for_config_entry(
-        device_registry, config_entry.entry_id
-    ):
-        identifiers = sorted(
-            identifier
-            for domain, identifier in device.identifiers
-            if domain == DOMAIN
-            and identifier != miniserver_serial
-            and identifier not in active_identifiers
-        )
+    for device in dr.async_entries_for_config_entry(device_registry, config_entry.entry_id):
+        loxone_identifiers = {identifier for domain, identifier in device.identifiers if domain == DOMAIN}
+        if loxone_identifiers & (active_identifiers | protected):
+            continue
+        identifiers = sorted(identifier for identifier in loxone_identifiers if identifier not in protected)
         if not identifiers:
             continue
 
@@ -126,8 +133,7 @@ def _stale_devices(  # noqa: PLR0913
                     sorted(
                         entity.entity_id
                         for entity in entities
-                        if entity.config_entry_id == config_entry.entry_id
-                        and entity.platform == DOMAIN
+                        if entity.config_entry_id == config_entry.entry_id and entity.platform == DOMAIN
                     )
                 ),
                 observations=observations.get(identifier, 0),
@@ -160,9 +166,7 @@ def _orphan_rooms(
         orphaned.append(
             OrphanRoom(
                 name=room_name,
-                automations=tuple(
-                    sorted(automation.automations_with_area(hass, area.id))
-                ),
+                automations=tuple(sorted(automation.automations_with_area(hass, area.id))),
                 scripts=tuple(sorted(script.scripts_with_area(hass, area.id))),
             )
         )
@@ -180,10 +184,7 @@ def format_registry_maintenance_message(
     grace_description = {
         "observations": f"{grace_observations} consecutive observations",
         "time": f"{grace_hours} elapsed hours",
-        "combined": (
-            f"both {grace_observations} consecutive observations and "
-            f"{grace_hours} elapsed hours"
-        ),
+        "combined": (f"both {grace_observations} consecutive observations and {grace_hours} elapsed hours"),
     }[grace_mode]
     mode = (
         f"audit only; automatic deletion is disabled (configured grace: {grace_description})"
@@ -204,15 +205,10 @@ def format_registry_maintenance_message(
                 )
             )
             if grace_mode in {"observations", "combined"}:
-                lines.append(
-                    "  - Confirmed in "
-                    f"{device.observations}/{grace_observations} successful structure loads"
-                )
+                lines.append(f"  - Confirmed in {device.observations}/{grace_observations} successful structure loads")
             if grace_mode in {"time", "combined"}:
                 missing_hours = max(0.0, (now - device.missing_since) / 3600)
-                lines.append(
-                    f"  - Missing for {missing_hours:.1f}/{grace_hours} hours"
-                )
+                lines.append(f"  - Missing for {missing_hours:.1f}/{grace_hours} hours")
         sections.append("\n".join(lines))
 
     if result.removed:
@@ -232,15 +228,9 @@ def format_registry_maintenance_message(
         for room in result.orphan_rooms:
             lines.append(f"- **{room.name}**")
             if room.automations:
-                lines.append(
-                    "  - Automations: "
-                    + ", ".join(f"`{item}`" for item in room.automations)
-                )
+                lines.append("  - Automations: " + ", ".join(f"`{item}`" for item in room.automations))
             if room.scripts:
-                lines.append(
-                    "  - Scripts: "
-                    + ", ".join(f"`{item}`" for item in room.scripts)
-                )
+                lines.append("  - Scripts: " + ", ".join(f"`{item}`" for item in room.scripts))
         lines.append(
             "\nThese areas were not deleted because other Home Assistant configuration may still refer to them."
         )
@@ -275,56 +265,24 @@ def _grace_reached(  # noqa: PLR0913
     return observations_reached
 
 
-async def async_run_registry_maintenance(
-    hass: HomeAssistant,
+def _maintenance_policy(
     config_entry: ConfigEntry,
-    lox_config: Mapping[str, Any],
-) -> RegistryMaintenanceResult:
-    """Audit and optionally clean registry entries after a grace period."""
-    engineering_metadata = await async_load_engineering_registry_metadata(
-        hass,
-        config_entry.entry_id,
-    )
-    engineering_identifiers = set(engineering_metadata.active_device_identifiers)
-    engineering_rooms = set(engineering_metadata.room_names)
-    active_identifiers = control_identifiers_from_lox_config(lox_config)
-    active_identifiers.update(engineering_identifiers)
-    if not active_identifiers:
-        return RegistryMaintenanceResult(
-            audit_only=not config_entry.options.get(
-                CONF_STALE_DEVICE_AUTO_CLEANUP,
-                DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
-            ),
-            pending=(),
-            removed=(),
-            orphan_rooms=(),
-            skipped=True,
-        )
-
-    engineering_generation = engineering_metadata.applied_generation
-    if engineering_generation is None:
-        return RegistryMaintenanceResult(
-            audit_only=not config_entry.options.get(
-                CONF_STALE_DEVICE_AUTO_CLEANUP,
-                DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
-            ),
-            pending=(),
-            removed=(),
-            orphan_rooms=(),
-            skipped=True,
-        )
-
-    auto_cleanup = config_entry.options.get(
+    engineering_generation: str | None,
+) -> _MaintenancePolicy:
+    """Normalize options while forcing legacy/pending reads to audit-only."""
+    configured_auto_cleanup = config_entry.options.get(
         CONF_STALE_DEVICE_AUTO_CLEANUP,
         DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
     )
-    grace_observations = int(
-        config_entry.options.get(
-            CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
-            DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
-        )
+    grace_observations = max(
+        1,
+        int(
+            config_entry.options.get(
+                CONF_STALE_DEVICE_GRACE_OBSERVATIONS,
+                DEFAULT_STALE_DEVICE_GRACE_OBSERVATIONS,
+            )
+        ),
     )
-    grace_observations = max(1, grace_observations)
     grace_mode = config_entry.options.get(
         CONF_STALE_DEVICE_GRACE_MODE,
         DEFAULT_STALE_DEVICE_GRACE_MODE,
@@ -340,6 +298,72 @@ async def async_run_registry_maintenance(
             )
         ),
     )
+    return _MaintenancePolicy(
+        configured_auto_cleanup and engineering_generation is not None,
+        grace_observations,
+        grace_mode,
+        grace_hours,
+    )
+
+
+def _stored_tracking_state(
+    stored: Mapping[str, Any],
+) -> tuple[dict[str, int], dict[str, float], set[str], object]:
+    """Decode the bounded maintenance fields used for safe replay."""
+    observations = {str(identifier): int(count) for identifier, count in stored.get("missing_observations", {}).items()}
+    missing_since = {
+        str(identifier): float(timestamp) for identifier, timestamp in stored.get("missing_since", {}).items()
+    }
+    authorizations = {
+        identifier
+        for identifier in stored.get("cleanup_authorizations", ())
+        if isinstance(identifier, str) and identifier
+    }
+    return (
+        observations,
+        missing_since,
+        authorizations,
+        stored.get("last_counted_engineering_generation"),
+    )
+
+
+async def async_run_registry_maintenance(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    lox_config: Mapping[str, Any],
+) -> RegistryMaintenanceResult:
+    """Audit and optionally clean registry entries after a grace period."""
+    engineering_metadata = await async_load_engineering_registry_metadata(
+        hass,
+        config_entry.entry_id,
+    )
+    engineering_identifiers = set(engineering_metadata.active_device_identifiers)
+    engineering_rooms = set(engineering_metadata.room_names)
+    protected_identifiers = (
+        {engineering_metadata.provider_identifier} if engineering_metadata.provider_identifier is not None else set()
+    )
+    active_identifiers = control_identifiers_from_lox_config(lox_config)
+    active_identifiers.update(engineering_identifiers)
+    if not active_identifiers:
+        return RegistryMaintenanceResult(
+            audit_only=not config_entry.options.get(
+                CONF_STALE_DEVICE_AUTO_CLEANUP,
+                DEFAULT_STALE_DEVICE_AUTO_CLEANUP,
+            ),
+            pending=(),
+            removed=(),
+            orphan_rooms=(),
+            skipped=True,
+        )
+
+    engineering_generation = engineering_metadata.applied_generation
+    # Without an applied engineering generation, retain the legacy/public audit
+    # but never authorize destructive work or advance engineering observations.
+    policy = _maintenance_policy(config_entry, engineering_generation)
+    auto_cleanup = policy.auto_cleanup
+    grace_observations = policy.grace_observations
+    grace_mode = policy.grace_mode
+    grace_hours = policy.grace_hours
     store: Store[dict[str, Any]] = Store(
         hass,
         STORAGE_VERSION,
@@ -347,16 +371,13 @@ async def async_run_registry_maintenance(
         private=True,
     )
     stored = await store.async_load() or {}
-    previous_observations = {
-        str(identifier): int(count)
-        for identifier, count in stored.get("missing_observations", {}).items()
-    }
-    previous_missing_since = {
-        str(identifier): float(timestamp)
-        for identifier, timestamp in stored.get("missing_since", {}).items()
-    }
-    last_counted_generation = stored.get("last_counted_engineering_generation")
-    count_generation = last_counted_generation != engineering_generation
+    (
+        previous_observations,
+        previous_missing_since,
+        previous_cleanup_authorizations,
+        last_counted_generation,
+    ) = _stored_tracking_state(stored)
+    count_generation = engineering_generation is not None and last_counted_generation != engineering_generation
     stale_before = _stale_devices(
         hass,
         config_entry,
@@ -364,8 +385,10 @@ async def async_run_registry_maintenance(
         previous_observations,
         previous_missing_since,
         engineering_identifiers,
+        protected_identifiers,
     )
     current_stale_ids = {device.identifier for device in stale_before}
+    cleanup_authorizations = previous_cleanup_authorizations - (active_identifiers | protected_identifiers)
     now = _utc_timestamp()
     observations = {
         identifier: min(
@@ -374,11 +397,17 @@ async def async_run_registry_maintenance(
         )
         for identifier in current_stale_ids
     }
+    for identifier in cleanup_authorizations - current_stale_ids:
+        if identifier in previous_observations:
+            observations[identifier] = previous_observations[identifier]
     missing_since = {
         identifier: previous_missing_since.get(identifier, now)
         for identifier in current_stale_ids
         if count_generation or identifier in previous_missing_since
     }
+    for identifier in cleanup_authorizations - current_stale_ids:
+        if identifier in previous_missing_since:
+            missing_since[identifier] = previous_missing_since[identifier]
     stale_confirmed = tuple(
         StaleDevice(
             name=device.name,
@@ -390,7 +419,7 @@ async def async_run_registry_maintenance(
         for device in stale_before
     )
 
-    removable_ids = {
+    newly_authorized = {
         device.identifier
         for device in stale_confirmed
         if auto_cleanup
@@ -405,12 +434,10 @@ async def async_run_registry_maintenance(
             grace_hours,
         )
     }
-    removed = tuple(
-        device for device in stale_confirmed if device.identifier in removable_ids
-    )
-    pending = tuple(
-        device for device in stale_confirmed if device.identifier not in removable_ids
-    )
+    cleanup_authorizations.update(newly_authorized)
+    removable_ids = cleanup_authorizations & current_stale_ids if auto_cleanup else set()
+    removed = tuple(device for device in stale_confirmed if device.identifier in removable_ids)
+    pending = tuple(device for device in stale_confirmed if device.identifier not in removable_ids)
     current_rooms = room_names_from_lox_config(lox_config) | engineering_rooms
     previous_rooms = set(stored.get("loxone_rooms", []))
     orphan_rooms = _orphan_rooms(hass, previous_rooms, current_rooms)
@@ -421,6 +448,7 @@ async def async_run_registry_maintenance(
         "last_counted_engineering_generation": (
             engineering_generation if count_generation else last_counted_generation
         ),
+        "cleanup_authorizations": sorted(cleanup_authorizations),
     }
     if count_generation or counted_state != stored:
         await store.async_save_acknowledged(counted_state)
@@ -433,17 +461,6 @@ async def async_run_registry_maintenance(
             config_entry,
             lox_config,
             identifiers_to_remove=removable_ids,
-        )
-        for identifier in removable_ids:
-            observations.pop(identifier, None)
-            missing_since.pop(identifier, None)
-        await store.async_save_acknowledged(
-            {
-                "missing_observations": observations,
-                "missing_since": missing_since,
-                "loxone_rooms": sorted(current_rooms),
-                "last_counted_engineering_generation": engineering_generation,
-            }
         )
 
     result = RegistryMaintenanceResult(
