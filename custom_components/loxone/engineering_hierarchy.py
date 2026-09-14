@@ -31,6 +31,7 @@ HierarchyStatus = Literal[
 
 _ENTITY_ID_PATTERN = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
 _MISSING_PROVIDER = "engineering snapshot has no safe provider root"
+_UNASSIGNED_IDENTIFIER = "unassigned"
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +178,7 @@ def _attach_nodes(
     by_key: dict[str, _MutableHierarchyNode],
     by_identifier: dict[str, _MutableHierarchyNode],
 ) -> None:
+    orphans: list[_MutableHierarchyNode] = []
     for row in rows:
         node = row.node
         builder = by_key.get(node.element.key)
@@ -187,6 +189,19 @@ def _attach_nodes(
             parent = by_key.get(node.owner_key or "")
         if parent is not None:
             parent.children.append(builder)
+        else:
+            orphans.append(builder)
+    if orphans:
+        root.children.append(
+            _MutableHierarchyNode(
+                identifier=_UNASSIGNED_IDENTIFIER,
+                role="structural",
+                label=None,
+                technical_type=None,
+                bus_kind=None,
+                children=orphans,
+            )
+        )
 
 
 def _attach_functions(
@@ -294,8 +309,10 @@ def _function_to_dict(item: HierarchyFunction) -> dict[str, object]:
 
 
 def _node_to_dict(node: HierarchyNode, *, root: bool = False) -> dict[str, object]:
-    sections = tuple(child for child in node.children if child.role == "internal_service")
-    children = tuple(child for child in node.children if child.role != "internal_service")
+    sections = tuple(child for child in node.children if child.role == "internal_service") + tuple(
+        child for child in node.children if child.role == "structural"
+    )
+    children = tuple(child for child in node.children if child.role not in {"internal_service", "structural"})
     result: dict[str, object] = {
         "identifier": node.identifier,
         "role": node.role,

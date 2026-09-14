@@ -30,6 +30,7 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
             element("link", "LoxLink", parent_uuid="ms", title="Link", room=None),
             element("bridge", "AirBaseExtension", parent_uuid="link", title="Bridge", room=None),
             element("future-device", "FutureDevice", parent_uuid="bridge", title="Unknown hardware"),
+            element("orphan-device", "FutureDevice", title="Standalone hardware", room=None),
             element(
                 "prepared-input",
                 "VoltageIn",
@@ -58,6 +59,13 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
                 parent_uuid="touch",
                 title="Synthetic private value",
                 io_name="PRIVATE1",
+            ),
+            element(
+                "private-state",
+                "VoltageIn",
+                parent_uuid="synthetic-secret",
+                title="Synthetic private state",
+                io_name="PRIVATE2",
             ),
         ),
         runtime=EngineeringRuntimeInventory(
@@ -114,7 +122,28 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
                     ],
                     "children": [],
                     "protected_count": 0,
-                }
+                },
+                {
+                    "identifier": "unassigned",
+                    "role": "structural",
+                    "label": None,
+                    "technical_type": None,
+                    "bus_kind": None,
+                    "functions": [],
+                    "children": [
+                        {
+                            "identifier": "serial-a:orphan-device",
+                            "role": "physical_device",
+                            "label": "Standalone hardware",
+                            "technical_type": "FutureDevice",
+                            "bus_kind": None,
+                            "functions": [],
+                            "children": [],
+                            "protected_count": 0,
+                        }
+                    ],
+                    "protected_count": 0,
+                },
             ],
             "children": [
                 {
@@ -141,7 +170,7 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
                                     "bus_kind": "link",
                                     "functions": [],
                                     "children": [],
-                                    "protected_count": 0,
+                                    "protected_count": 1,
                                 },
                                 {
                                     "identifier": "serial-a:future-device",
@@ -192,13 +221,16 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
             "prepared": 2,
             "inventory_only": 1,
             "unsupported": 1,
-            "protected": 1,
+            "protected": 2,
         },
     }
     rendered = json.dumps(payload, sort_keys=True)
     assert "synthetic-secret" not in rendered
     assert "Synthetic private value" not in rendered
     assert "PRIVATE1" not in rendered
+    assert "private-state" not in rendered
+    assert "Synthetic private state" not in rendered
+    assert "PRIVATE2" not in rendered
     assert '"NfcCode"' not in rendered
     assert "topology_path" not in rendered
     assert "owner_key" not in rendered
