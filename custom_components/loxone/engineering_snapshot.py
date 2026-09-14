@@ -54,6 +54,7 @@ if TYPE_CHECKING:
 ENGINEERING_SNAPSHOT_STORAGE_VERSION = 3
 _PREVIOUS_STATE_VERSION = 2
 _MAX_AREA_NAME_LENGTH = 160
+_ROOM_MAPPING_SCOPE_LENGTH = 2
 ENGINEERING_SNAPSHOT_STORAGE_KEY = "loxone.engineering_snapshot"
 _DIGEST_PATTERN = re.compile(r"^(?:rev|safe|gen):[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -1576,6 +1577,22 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
         )
         for key, area_id in raw_areas.items()
     }
+    raw_mappings = data.get("room_area_mappings", {})
+    mappings = _require_dict(
+        raw_mappings,
+        "room_area_mappings",
+        required=frozenset(),
+        allowed=frozenset(raw_mappings) if isinstance(raw_mappings, dict) else frozenset(),
+    )
+    mappings = {
+        _required_identifier(room_uuid, "mapped room UUID"): _required_identifier(area_id, "mapped area ID")
+        for room_uuid, area_id in mappings.items()
+    }
+    scope = data.get("room_area_mapping_scope")
+    if scope is not None:
+        if not isinstance(scope, list) or len(scope) != _ROOM_MAPPING_SCOPE_LENGTH:
+            raise EngineeringSnapshotError("room mapping scope is invalid")
+        scope = tuple(_required_identifier(item, "room mapping scope") for item in scope)
     state = StoredEngineeringState(
         snapshot=snapshot,
         registry_applied_generation=(
@@ -1600,8 +1617,8 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
             )
         ),
         managed_area_ids=areas,
-        room_area_mappings=data.get("room_area_mappings", {}),
-        room_area_mapping_scope=data.get("room_area_mapping_scope"),
+        room_area_mappings=mappings,
+        room_area_mapping_scope=scope,
         pending_area_batch=_batch_from_dict(data["pending_area_batch"])
         if data.get("pending_area_batch") is not None
         else None,

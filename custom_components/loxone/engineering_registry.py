@@ -1016,12 +1016,31 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
         # Replacing an interrupted batch is explicit, but may not discard its
         # successful effects. A new full preflight must bind all current tokens.
         replacement = _batch_prepare(stored, area_state, entry_id, decisions)
+        obsolete = set()
+        snapshot = stored.snapshot
+        if (
+            snapshot is not None
+            and snapshot.generation_id != batch.generation_id
+            and (snapshot.source.entry_id, snapshot.source.provider_identifier)
+            == (batch.entry_id, batch.provider_identifier)
+        ):
+            # Only a newer source-scoped inventory can terminally retire old
+            # members. Missing registry devices or conflict tokens are not proof.
+            owners = {
+                node.device_identifier for node in snapshot.nodes if node.element.key in _eligible_device_keys(snapshot)
+            }
+            obsolete = {
+                member.device_identifier
+                for group in batch.groups
+                for member in group.members
+                if member.device_identifier not in owners
+            }
         outstanding = {
             member.device_identifier
             for group in batch.groups
             if not group.mapping_committed
             for member in group.members
-            if not (member.completed and _batch_keep(group, member))
+            if not (member.completed and _batch_keep(group, member)) and member.device_identifier not in obsolete
         }
         selected = {member.device_identifier for group in replacement.groups for member in group.members}
         if not outstanding <= selected:
@@ -1058,6 +1077,18 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
     async def withdraw_unverified_mapping(reason: str) -> EngineeringBatchAreaResolutionResult:
         """Withdraw only our mapping authority, never roll back registry changes."""
         nonlocal stored, batch, area_state
+        snapshot = stored.snapshot
+        if snapshot is None or (snapshot.source.entry_id, snapshot.source.provider_identifier) != (
+            batch.entry_id,
+            batch.provider_identifier,
+        ):
+            return result(reason)
+        owners = {
+            node.device_identifier: node
+            for node in snapshot.nodes
+            if node.element.key in _eligible_device_keys(snapshot)
+        }
+        generation_changed = snapshot.generation_id != batch.generation_id
         mappings = dict(stored.room_area_mappings)
         groups = []
         for original_group in batch.groups:
@@ -1073,15 +1104,40 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
                 conflicts = dict(area_state.conflicts)
                 baselines = dict(area_state.baselines)
                 for member in group.members:
+                    if generation_changed:
+                        node = owners.get(member.device_identifier)
+                        if node is None:
+                            # Reconciliation may already have removed this owner.
+                            # Never recreate a choice from an obsolete journal UUID.
+                            conflicts.pop(member.device_identifier, None)
+                            baselines.pop(member.device_identifier, None)
+                            continue
+                        existing = conflicts.get(member.device_identifier)
+                        if existing is not None and (
+                            existing.entry_id == entry_id
+                            and existing.generation_id == snapshot.generation_id
+                            and existing.room_uuid == node.element.room_uuid
+                        ):
+                            # Preserve current choices byte-for-byte, including tokens.
+                            continue
+                    else:
+                        node = None
                     if _batch_keep(group, member):
-                        if member.completed:
+                        if member.completed and not generation_changed:
                             area_state = _resolution_state(
                                 area_state, member.device_identifier, baseline=None, release=True
                             )
                             conflicts.pop(member.device_identifier, None)
                             baselines.pop(member.device_identifier, None)
-                        continue
+                        if not generation_changed:
+                            continue
                     device = _batch_device(hass, entry_id, member.device_identifier)
+                    mapped = mappings.get(node.element.room_uuid) if node is not None else None
+                    desired = (
+                        _desired_area_id(ar.async_get(hass), node.element.room, mapped)
+                        if node is not None
+                        else _batch_target(group)
+                    )
                     conflict = EngineeringAreaConflict(
                         member.token,
                         entry_id,
@@ -1089,13 +1145,16 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
                         None,
                         member.from_area_id,
                         None,
-                        _batch_target(group),
-                        group.decision.area_name,
-                        batch.generation_id,
+                        desired,
+                        node.element.room if node is not None else group.decision.area_name,
+                        snapshot.generation_id,
                         "area_user_override_preserved",
-                        room_uuid=group.decision.room_uuid,
-                        desired_action_valid=_batch_target(group) is None
-                        or _batch_area_by_id(ar.async_get(hass), _batch_target(group)) is not None,
+                        room_uuid=node.element.room_uuid if node is not None else group.decision.room_uuid,
+                        desired_action_valid=(
+                            mapped is None or _batch_area_by_id(ar.async_get(hass), mapped) is not None
+                        )
+                        if node is not None
+                        else desired is None or _batch_area_by_id(ar.async_get(hass), desired) is not None,
                     )
                     conflicts[member.device_identifier] = _refresh_area_conflict(
                         conflict, ar.async_get(hass), getattr(device, "area_id", None), "area_user_override_preserved"

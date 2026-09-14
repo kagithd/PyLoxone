@@ -119,6 +119,15 @@ def test_v2_state_migration_preserves_recovery_cursors_and_unknown_rooms():
     assert stored_state_to_dict(stored_state_from_dict(wire, "entry-a")) == wire
 
 
+@pytest.mark.parametrize("field,value", [("room_area_mappings", None), ("room_area_mapping_scope", 7)])
+def test_room_state_decoder_rejects_invalid_shapes(field, value):
+    """Malformed persisted containers must fail at the snapshot error boundary."""
+    wire = stored_state_to_dict(StoredEngineeringState(make_snapshot()))
+    wire[field] = value
+    with pytest.raises(EngineeringSnapshotError):
+        stored_state_from_dict(wire, "entry-a")
+
+
 def test_room_state_is_detached_scoped_and_integrity_checked():
     """Caller mutations and provider-changing replacements cannot redirect durable authority."""
     from custom_components.loxone.engineering_snapshot import (

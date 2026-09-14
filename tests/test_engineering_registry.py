@@ -541,6 +541,129 @@ def test_batch_partial_groups_commit_independently_and_resume(registries, monkey
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("reconciled", [True, False])
+def test_partial_batch_fresh_read_replay_preserves_current_recovery_choices(registries, monkeypatch, reconciled):
+    """An old journal cannot replace current-generation room identities or strand renewed choices."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in case.conflicts),
+        )
+        registries.devices.fail_mutation_number = registries.devices.mutations + 2
+        interrupted = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert interrupted.reason == "registry_write_failed"
+        stored = await case.load(registries.hass, "entry-a")
+        assert sum(member.completed for member in stored.pending_area_batch.groups[0].members) == 1
+        registries.devices.fail_mutation_number = None
+        updated = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", room=None),
+                *(
+                    replace(element(key, "TreeDevice", parent_uuid="ms", room="Renamed"), room_uuid="room-b")
+                    for key in ("device", "second")
+                ),
+            ),
+            read_sequence=2,
+        )
+        current = replace(stored, snapshot=updated)
+        await engineering_registry.async_store_engineering_state(registries.hass, current)
+        if reconciled:
+            await _record_override(registries, updated, current)
+        conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+        assert len(conflicts) == 2
+        if reconciled:
+            assert {item.generation_id for item in conflicts} == {updated.generation_id}
+            assert {item.room_uuid for item in conflicts} == {"room-b"}
+        before = registries.mutations
+        replayed = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert replayed.reason == "snapshot_changed"
+        assert registries.mutations == before
+        recovered = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+        if reconciled:
+            assert recovered == conflicts
+        assert {item.generation_id for item in recovered} == {updated.generation_id}
+        assert {item.room_uuid for item in recovered} == {"room-b"}
+        renewed = engineering_registry.EngineeringAreaDecision(
+            "room-b",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in recovered),
+        )
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (renewed,), is_current=lambda: True
+        )
+        assert (result.resolved_groups, result.unresolved_groups) == (1, 0)
+        final = await case.load(registries.hass, "entry-a")
+        assert final.pending_area_batch is None
+        assert final.room_area_mappings == {"room-b": case.target.id}
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("removed", [True, False])
+def test_fresh_snapshot_removal_releases_only_obsolete_pending_members(registries, monkeypatch, removed):
+    """A fresh snapshot can retire an absent owner, never a still-current unselected owner."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch, ("room-a", "room-b"))
+        decisions = tuple(
+            engineering_registry.EngineeringAreaDecision(
+                item.room_uuid, "use_existing", area_id=case.target.id, conflict_tokens=(item.token,)
+            )
+            for item in case.conflicts
+        )
+        registries.devices.fail_mutation_number = registries.devices.mutations + 1
+        await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions, is_current=lambda: True
+        )
+        stored = await case.load(registries.hass, "entry-a")
+        registries.devices.fail_mutation_number = None
+        updated = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", room=None),
+                *(
+                    replace(element(key, "TreeDevice", parent_uuid="ms", room="Workshop"), room_uuid=room)
+                    for key, room in (("device", "room-a"), ("second", "room-b"))
+                    if key != "second" or not removed
+                ),
+            ),
+            read_sequence=2,
+        )
+        current = replace(stored, snapshot=updated)
+        await engineering_registry.async_store_engineering_state(registries.hass, current)
+        await _record_override(registries, updated, current)
+        conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+        first = next(item for item in conflicts if item.device_identifier == "serial-a:device")
+        replacement = engineering_registry.EngineeringAreaDecision(
+            "room-a", "use_existing", area_id=case.target.id, conflict_tokens=(first.token,)
+        )
+        before = registries.mutations
+        pending = (await case.load(registries.hass, "entry-a")).pending_area_batch
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (replacement,), is_current=lambda: True
+        )
+        assert registries.device("serial-a:second").area_id == case.office.id
+        final = await case.load(registries.hass, "entry-a")
+        if removed:
+            assert (result.resolved_groups, result.unresolved_groups) == (1, 0)
+            assert final.pending_area_batch is None
+            assert final.room_area_mappings == {"room-a": case.target.id}
+        else:
+            assert result.reason == "pending_batch_exists"
+            assert registries.mutations == before
+            assert final.pending_area_batch == pending
+
+    asyncio.run(scenario())
+
+
 def test_new_decisions_cannot_discard_an_unfinished_pending_group(registries, monkeypatch):
     """A replacement selection must cover outstanding intent, not silently erase it."""
 
