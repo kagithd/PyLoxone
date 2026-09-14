@@ -677,6 +677,9 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     async def schedule():
         events.append("schedule")
 
+    async def prepare_view(_hass):
+        pass
+
     def finish(*args):
         raise Finished
 
@@ -690,6 +693,7 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     entry = SimpleNamespace(entry_id="entry-a", options={"host": "", "port": 0})
     monkeypatch.setattr(integration, "LoxoneCoordinator", lambda *args: coordinator)
     monkeypatch.setattr(integration, "async_migrate_version_sensor_unique_id", lambda *args: 0)
+    monkeypatch.setattr(integration, "async_prepare_engineering_view", prepare_view)
     monkeypatch.setattr(integration, "LOXONE_PLATFORMS", ())
     monkeypatch.setattr(integration, "async_warn_about_config_impacts", finish)
     with pytest.raises(Finished):

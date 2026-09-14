@@ -70,6 +70,11 @@ from .device_sync import (
     async_sync_device_names,
 )
 from .engineering_entities import async_dispatch_engineering_state_updates
+from .engineering_websocket import (
+    async_activate_engineering_view,
+    async_deactivate_engineering_view,
+    async_prepare_engineering_view,
+)
 from .miniserver import get_miniserver_from_hass
 from .pyloxone_api.exceptions import (
     LoxoneConnectionClosedOk,
@@ -185,6 +190,8 @@ async def async_unload_entry(hass, config_entry):
 
     # Unload
     unload_ok = await hass.config_entries.async_unload_platforms(config_entry, LOXONE_PLATFORMS)
+    if unload_ok:
+        await async_deactivate_engineering_view(hass, config_entry.entry_id)
     return unload_ok
 
 
@@ -298,6 +305,8 @@ async def create_group_for_loxone_entities(hass, entities, name, object_id):
 async def async_setup_entry(hass, config_entry):
     if DOMAIN not in hass.data:
         hass.data[DOMAIN] = {}
+
+    await async_prepare_engineering_view(hass)
 
     if not config_entry.options:
         await async_set_options(hass, config_entry)
@@ -696,6 +705,8 @@ async def async_setup_entry(hass, config_entry):
     ]
 
     await start_event()
+
+    await async_activate_engineering_view(hass, config_entry.entry_id)
 
     return True
 
