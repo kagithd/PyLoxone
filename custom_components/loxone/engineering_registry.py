@@ -793,7 +793,7 @@ def _device_config_entries(device: object) -> frozenset[str]:
 
 def _all_devices(device_registry: object) -> tuple[object, ...]:
     """Return persisted registry entries without consulting loaded coordinators."""
-    return tuple(device_registry)
+    return tuple(device_registry.devices)
 
 
 def _registry_claimants(device_registry: object, unique_id: str) -> frozenset[str]:

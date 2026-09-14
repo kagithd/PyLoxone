@@ -55,13 +55,15 @@ def test_all_devices_uses_public_registry_iteration():
     """A registry mapping lookup would reintroduce HA's deprecated API warning."""
     expected = (SimpleNamespace(id="one"), SimpleNamespace(id="two"))
 
-    class PublicRegistry:
-        @property
-        def devices(self):
-            raise AssertionError("deprecated mapping accessed")
-
+    class PublicItems:
         def __iter__(self):
             return iter(expected)
+
+        def values(self):
+            raise AssertionError("deprecated mapping accessed")
+
+    class PublicRegistry:
+        devices = PublicItems()
 
     assert engineering_registry._all_devices(PublicRegistry()) == expected
 
@@ -454,17 +456,21 @@ class FakeAreaRegistry:
         return area
 
 
+class DeviceEntries(dict[str, SimpleNamespace]):
+    """Match HA's iterable device-entry collection while retaining test lookups."""
+
+    def __iter__(self):
+        return iter(self.values())
+
+
 class FakeDeviceRegistry:
     """In-memory device registry with scoped identifier lookup."""
 
     def __init__(self, areas: FakeAreaRegistry) -> None:
         self._areas = areas
-        self.devices: dict[str, SimpleNamespace] = {}
+        self.devices: DeviceEntries = DeviceEntries()
         self.mutations = 0
         self.fail_mutation_number: int | None = None
-
-    def __iter__(self):
-        return iter(self.devices.values())
 
     def _mutate(self) -> None:
         self.mutations += 1
