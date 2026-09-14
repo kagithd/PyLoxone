@@ -5,9 +5,10 @@ For more details about this component, please refer to the documentation at
 https://github.com/JoDehli/PyLoxone
 """
 
-from functools import cached_property
 import json
 import logging
+from functools import cached_property
+from typing import Any
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
