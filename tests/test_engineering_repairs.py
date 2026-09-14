@@ -376,6 +376,35 @@ def test_real_manager_completes_only_after_empty_reload(monkeypatch, tmp_path, r
     asyncio.run(scenario())
 
 
+def test_real_manager_resolved_result_preserves_original_remaining_conflict(monkeypatch, tmp_path):
+    """A successful batch report cannot authorize deletion while its conflict remains."""
+
+    async def scenario():
+        conflict = _conflict()
+        harness = await _native_manager_harness(monkeypatch, tmp_path, {"entry-a": [conflict]})
+
+        async def resolve(*_args, **kwargs):
+            assert kwargs["is_current"]()
+            return EngineeringBatchAreaResolutionResult(1, 0, "resolved")
+
+        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
+        registry = ir.async_get(harness.hass)
+        issue_key = next(iter(registry.issues))
+        issue_data = registry.issues[issue_key].data.copy()
+        form = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_key[1]})
+        form = await harness.manager.async_configure(
+            form["flow_id"], {"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}
+        )
+        result = await harness.manager.async_configure(form["flow_id"], {"devices": _rows(form, "devices")})
+
+        assert result["type"] is data_entry_flow.FlowResultType.ABORT
+        assert set(registry.issues) == {issue_key}
+        assert registry.issues[issue_key].data == issue_data
+
+    asyncio.run(scenario())
+
+
 def test_old_flow_resynchronizes_changed_fingerprint_without_deleting_new(monkeypatch):
     harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
 
