@@ -92,7 +92,10 @@ def _reconciler(hass: HomeAssistant, entry_id: str) -> _EntryReconciler:
 def _provider_identifier(coordinator: object) -> str | None:
     config_entry = getattr(coordinator, "config_entry", None)
     entry_id = getattr(config_entry, "entry_id", None)
-    serial = getattr(getattr(coordinator, "miniserver", None), "serial", None)
+    miniserver = getattr(coordinator, "miniserver", None)
+    if miniserver is None:
+        return None
+    serial = getattr(miniserver, "serial", None)
     provider = serial or entry_id
     if not isinstance(provider, str) or not provider:
         return None

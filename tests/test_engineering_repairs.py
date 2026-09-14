@@ -1551,6 +1551,114 @@ def test_current_provider_and_serialless_cold_start_open_repairs(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("serial", "provider"),
+    (
+        pytest.param("serial-entry-a", "serial-entry-a", id="serial-backed"),
+        pytest.param(None, "entry-a", id="initialized-serialless"),
+    ),
+)
+def test_real_coordinator_constructor_defers_first_provider_until_setup_sync(
+    monkeypatch,
+    tmp_path,
+    serial,
+    provider,
+):
+    """Constructor registration defers identity until a provider is initialized."""
+    from custom_components.loxone import repairs
+    from custom_components.loxone.coordinator import LoxoneCoordinator
+
+    conflict = replace(
+        _conflict(),
+        device_identifier=f"{provider}:device",
+    )
+    loader_calls = []
+
+    async def load(_hass, entry_id):
+        loader_calls.append(entry_id)
+        return (conflict,)
+
+    class _Platforms:
+        async def async_get_platform(self, handler):
+            assert handler == DOMAIN
+            return repairs
+
+    monkeypatch.setattr(
+        "homeassistant.helpers.frame.report_usage",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(repairs, "async_load_engineering_area_conflicts", load)
+
+    async def scenario():
+        hass = HomeAssistant(str(tmp_path))
+        unload_callbacks = []
+        entry = SimpleNamespace(
+            entry_id="entry-a",
+            domain=DOMAIN,
+            state=ConfigEntryState.SETUP_IN_PROGRESS,
+            options={"username": "", "password": "", "host": "", "port": 0},
+            async_on_unload=unload_callbacks.append,
+        )
+        entries = _ConfigEntries()
+        entries._entries[entry.entry_id] = entry
+        hass.config_entries = entries
+
+        coordinator = LoxoneCoordinator(hass, entry)
+        coordinator.miniserver = SimpleNamespace(serial=serial)
+        coordinator.engineering_snapshot = SimpleNamespace(source=SimpleNamespace(provider_identifier=provider))
+        hass.data[DOMAIN] = {entry.entry_id: coordinator}
+        hass.data[REPAIRS_DOMAIN] = {"platforms": _Platforms()}
+
+        await repairs.async_sync_engineering_area_conflict_issues(
+            hass,
+            entry.entry_id,
+            config_entry=entry,
+            coordinator=coordinator,
+        )
+        issue_id = repairs.engineering_area_conflict_issue_id(
+            entry.entry_id,
+            conflict.token,
+        )
+        assert (DOMAIN, issue_id) in ir.async_get(hass).issues
+
+        await repairs.async_sync_engineering_area_conflict_issues(
+            hass,
+            entry.entry_id,
+            config_entry=entry,
+            coordinator=coordinator,
+        )
+        assert loader_calls == [entry.entry_id, entry.entry_id]
+        assert sum(domain == DOMAIN and current_id == issue_id for domain, current_id in ir.async_get(hass).issues) == 1
+
+        entry.state = ConfigEntryState.LOADED
+        opened = await RepairsFlowManager(hass).async_init(
+            DOMAIN,
+            data={"issue_id": issue_id},
+        )
+        assert opened["type"] is data_entry_flow.FlowResultType.FORM
+        assert opened["description_placeholders"]["device"] == "ST-F07"
+
+        coordinator.miniserver.serial = "serial-replacement"
+        before_issues = set(ir.async_get(hass).issues)
+        before_loads = len(loader_calls)
+        await repairs.async_sync_engineering_area_conflict_issues(
+            hass,
+            entry.entry_id,
+        )
+        assert len(loader_calls) == before_loads
+        assert set(ir.async_get(hass).issues) == before_issues
+        assert (
+            repairs._active_binding(
+                hass,
+                entry.entry_id,
+                require_loaded=True,
+            )
+            is None
+        )
+
+    asyncio.run(scenario())
+
+
 def test_current_serial_mismatch_with_retained_snapshot_blocks_sync_and_open(
     monkeypatch,
 ):
