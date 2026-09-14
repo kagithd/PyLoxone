@@ -190,9 +190,13 @@ def test_config_entry_unload_callback_suspends_without_deleting_repairs(
 @pytest.mark.parametrize(
     "value,want",
     [
-        ("revision-7", "revision-7"),
-        (7, "7"),
-        (7.5, "7.5"),
+        ("revision-7", "source:766bf8758e1ca18bbbcf477eff1bf58e59bb4c3f296a3b57e9d30cb3faa7a638"),
+        (7, "source:7902699be42c8a8e46fbbb4501726517e86b22c56a189f7625a6da49081b2451"),
+        (7.5, "source:c4495da75095c64bf4e0587e45d7426f496ca4fc9fe72111715005361cfe0041"),
+        (
+            "2026-09-14 13:00:00",
+            "source:6c18b22ee55883e4e58d00006960638ad68bac7fa4ec699ce9929691ebd193a7",
+        ),
         (True, None),
         ({"name": "unsafe"}, None),
         ([], None),

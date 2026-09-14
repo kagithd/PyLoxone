@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 from contextlib import suppress
@@ -73,13 +74,16 @@ if TYPE_CHECKING:
 
 
 def extract_loxapp_last_modified(lox_config: Mapping) -> str | None:
-    """Normalize only finite scalar revisions, never stringify containers."""
+    """Normalize finite scalar revisions into a private stable token."""
     value = lox_config.get("lastModified")
     if isinstance(value, bool) or not isinstance(value, (str, int, float)):
         return None
     if isinstance(value, float) and not math.isfinite(value):
         return None
-    return str(value).strip() or None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    return f"source:{hashlib.sha256(normalized.encode()).hexdigest()}"
 
 
 class LoxoneCoordinator(DataUpdateCoordinator):
