@@ -113,6 +113,26 @@ async def _record_override(registries, snapshot, committed):
     return (await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))[0]
 
 
+async def _prepare_resolution_conflict(registries, snapshot, committed, office):
+    """Apply once, then create a real user-override conflict at Office."""
+    plan = await async_plan_engineering_registry_sync(
+        registries.hass,
+        "entry-a",
+        snapshot,
+        EngineeringRegistryMetadata.empty(),
+    )
+    await async_apply_engineering_registry_plan(
+        registries.hass,
+        plan,
+        committed_state=committed,
+    )
+    registries.devices.async_update_device(
+        registries.device("serial-a:device").id,
+        area_id=office.id,
+    )
+    return await _record_override(registries, snapshot, committed)
+
+
 @pytest.mark.parametrize("room", ["Workshop", None])
 @pytest.mark.parametrize("race", ["none", "move", "clear", "disappear", "before-disappear", "twice"])
 def test_apply_resolution_refetches_replacing_device_entries(registries, monkeypatch, race, room):
@@ -373,9 +393,11 @@ class FakeIntentStore:
     async def async_load(self):
         return deepcopy(self.__class__.data)
 
-    async def async_save_acknowledged(self, data):
+    async def async_save_acknowledged(self, data, *, before_commit=None):
         if self.__class__.fail_save:
             raise RuntimeError("injected registry intent store failure")
+        if before_commit is not None:
+            before_commit()
         self.__class__.data = deepcopy(data)
         self.__class__.save_count += 1
         if self.__class__.save_callbacks:
@@ -2439,3 +2461,314 @@ def test_legacy_metadata_round_trip_preserves_audit_scope_without_generation(
     assert metadata.room_names == frozenset({"Office"})
     assert metadata.applied_generation is None
     assert metadata.provider_identifier is None
+
+
+@pytest.mark.parametrize(
+    ("action", "room", "boundary"),
+    (
+        ("apply_loxone_room", "Workshop", "task5_lock"),
+        ("apply_loxone_room", None, "intent_commit"),
+        ("apply_loxone_room", "Workshop", "reload"),
+        ("keep_ha_room", "Workshop", "keep_commit"),
+    ),
+)
+def test_resolution_lifecycle_guard_fences_every_awaited_mutation_boundary(
+    registries,
+    monkeypatch,
+    action,
+    room,
+    boundary,
+):
+    """A revoked caller cannot mutate an area or commit a Keep after waiting."""
+    office, snapshot, committed = _area_recovery_case(
+        registries,
+        monkeypatch,
+        room,
+    )
+    current = True
+
+    async def scenario():
+        nonlocal current
+        conflict = await _prepare_resolution_conflict(
+            registries,
+            snapshot,
+            committed,
+            office,
+        )
+        before = deepcopy(FakeIntentStore.data)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        if boundary == "task5_lock":
+            lock = engineering_registry._area_operation_lock(
+                registries.hass,
+                "entry-a",
+            )
+            await lock.acquire()
+        elif boundary in {"intent_commit", "keep_commit"}:
+            original_save = FakeIntentStore.async_save_acknowledged
+
+            async def held_save(store, data, *, before_commit=None):
+                entered.set()
+                await release.wait()
+                await original_save(
+                    store,
+                    data,
+                    before_commit=before_commit,
+                )
+
+            monkeypatch.setattr(
+                FakeIntentStore,
+                "async_save_acknowledged",
+                held_save,
+            )
+        else:
+            original_load = FakeIntentStore.async_load
+            loads = 0
+
+            async def held_reload(store):
+                nonlocal loads
+                loads += 1
+                if loads == 2:
+                    entered.set()
+                    await release.wait()
+                return await original_load(store)
+
+            monkeypatch.setattr(FakeIntentStore, "async_load", held_reload)
+
+        task = asyncio.create_task(
+            engineering_registry.async_resolve_engineering_area_conflict(
+                registries.hass,
+                "entry-a",
+                conflict.token,
+                action,
+                is_current=lambda: current,
+            )
+        )
+        if boundary == "task5_lock":
+            await asyncio.sleep(0)
+        else:
+            await entered.wait()
+        current = False
+        if boundary == "task5_lock":
+            lock.release()
+        else:
+            release.set()
+        result = await task
+
+        assert not result.resolved
+        assert result.reason == "lifecycle_changed"
+        assert registries.device("serial-a:device").area_id == office.id
+        if boundary in {"task5_lock", "intent_commit", "keep_commit"}:
+            assert FakeIntentStore.data == before
+
+    asyncio.run(scenario())
+
+
+def test_resolution_lifecycle_guard_preserves_cancellation_and_retry(
+    registries,
+    monkeypatch,
+):
+    """Cancellation at the Task 5 lock propagates and leaves its lock reusable."""
+    office, snapshot, committed = _area_recovery_case(
+        registries,
+        monkeypatch,
+    )
+
+    async def scenario():
+        conflict = await _prepare_resolution_conflict(
+            registries,
+            snapshot,
+            committed,
+            office,
+        )
+        lock = engineering_registry._area_operation_lock(
+            registries.hass,
+            "entry-a",
+        )
+        await lock.acquire()
+        task = asyncio.create_task(
+            engineering_registry.async_resolve_engineering_area_conflict(
+                registries.hass,
+                "entry-a",
+                conflict.token,
+                "apply_loxone_room",
+                is_current=lambda: True,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        lock.release()
+
+        result = await engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            conflict.token,
+            "apply_loxone_room",
+            is_current=lambda: True,
+        )
+        assert result.resolved
+        assert registries.device("serial-a:device").area_id != office.id
+
+    asyncio.run(scenario())
+
+
+def test_revocation_during_admitted_intent_write_cannot_authorize_replay(
+    registries,
+    monkeypatch,
+):
+    """A committed prepared intent remains fenced by its durable conflict."""
+    office, snapshot, committed = _area_recovery_case(
+        registries,
+        monkeypatch,
+    )
+    current = True
+
+    async def scenario():
+        nonlocal current
+        old_plan = await async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+        await async_apply_engineering_registry_plan(
+            registries.hass,
+            old_plan,
+            committed_state=committed,
+        )
+        registries.devices.async_update_device(
+            registries.device("serial-a:device").id,
+            area_id=office.id,
+        )
+        conflict = await _record_override(registries, snapshot, committed)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original_save = FakeIntentStore.async_save_acknowledged
+
+        async def admitted_save(store, data, *, before_commit=None):
+            assert before_commit is not None
+            before_commit()
+            entered.set()
+            await release.wait()
+            await original_save(store, data)
+
+        monkeypatch.setattr(
+            FakeIntentStore,
+            "async_save_acknowledged",
+            admitted_save,
+        )
+        resolution = asyncio.create_task(
+            engineering_registry.async_resolve_engineering_area_conflict(
+                registries.hass,
+                "entry-a",
+                conflict.token,
+                "apply_loxone_room",
+                is_current=lambda: current,
+            )
+        )
+        await entered.wait()
+        current = False
+        release.set()
+        result = await resolution
+        assert not result.resolved
+        assert result.reason == "lifecycle_changed"
+        assert registries.device("serial-a:device").area_id == office.id
+        assert FakeIntentStore.data["area_intents"]
+        assert FakeIntentStore.data["area_conflicts"]
+
+        monkeypatch.setattr(
+            FakeIntentStore,
+            "async_save_acknowledged",
+            original_save,
+        )
+        await async_apply_engineering_registry_plan(
+            registries.hass,
+            old_plan,
+            committed_state=committed,
+        )
+        assert registries.device("serial-a:device").area_id == office.id
+        assert FakeIntentStore.data["area_conflicts"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("boundary", ("intent_save", "reload"))
+def test_resolution_guarded_await_cancellation_propagates_and_retries(
+    registries,
+    monkeypatch,
+    boundary,
+):
+    """Cancellation at Task 5 persistence boundaries never becomes success."""
+    office, snapshot, committed = _area_recovery_case(
+        registries,
+        monkeypatch,
+    )
+
+    async def scenario():
+        conflict = await _prepare_resolution_conflict(
+            registries,
+            snapshot,
+            committed,
+            office,
+        )
+        entered = asyncio.Event()
+        if boundary == "intent_save":
+            original = FakeIntentStore.async_save_acknowledged
+
+            async def blocked_save(store, data, *, before_commit=None):
+                del store, data, before_commit
+                entered.set()
+                await asyncio.Event().wait()
+
+            monkeypatch.setattr(
+                FakeIntentStore,
+                "async_save_acknowledged",
+                blocked_save,
+            )
+        else:
+            original = FakeIntentStore.async_load
+            loads = 0
+
+            async def blocked_reload(store):
+                nonlocal loads
+                loads += 1
+                if loads == 2:
+                    entered.set()
+                    await asyncio.Event().wait()
+                return await original(store)
+
+            monkeypatch.setattr(FakeIntentStore, "async_load", blocked_reload)
+
+        task = asyncio.create_task(
+            engineering_registry.async_resolve_engineering_area_conflict(
+                registries.hass,
+                "entry-a",
+                conflict.token,
+                "apply_loxone_room",
+                is_current=lambda: True,
+            )
+        )
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert registries.device("serial-a:device").area_id == office.id
+
+        monkeypatch.setattr(
+            FakeIntentStore,
+            ("async_save_acknowledged" if boundary == "intent_save" else "async_load"),
+            original,
+        )
+        retry = await engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            conflict.token,
+            "apply_loxone_room",
+            is_current=lambda: True,
+        )
+        assert retry.resolved
+
+    asyncio.run(scenario())

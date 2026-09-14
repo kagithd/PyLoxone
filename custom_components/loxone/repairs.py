@@ -256,6 +256,14 @@ def async_remove_engineering_area_conflict_issues(
         return
     for issue_id in _owned_issue_ids(hass, entry_id):
         ir.async_delete_issue(hass, DOMAIN, issue_id)
+    states = hass.data.get(_RECONCILER_DATA, {})
+    state = states.get(entry_id) if isinstance(states, dict) else None
+    if state is not None:
+        state.binding = None
+        state.config_entry = None
+        state.coordinator = None
+        state.provider_identifier = None
+        state.active = False
 
 
 def _create_issue(
@@ -342,14 +350,12 @@ async def async_sync_engineering_area_conflict_issues(
     if active is None:
         return
     async with active.state.lock:
-        active = _active_binding(
+        if not _binding_is_current(
             hass,
             entry_id,
+            active,
             require_loaded=require_loaded,
-            config_entry=config_entry,
-            coordinator=coordinator,
-        )
-        if active is None:
+        ):
             return
         await _async_reconcile_locked(
             hass,
@@ -427,8 +433,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 async_remove_engineering_area_conflict_issues(self.hass, entry_id)
             return self.async_abort(reason="entry_unavailable")
         async with active.state.lock:
-            active = _active_binding(self.hass, entry_id, require_loaded=True)
-            if active is None:
+            if not _binding_is_current(self.hass, entry_id, active):
                 return self.async_abort(reason="entry_unavailable")
             try:
                 conflicts = await async_load_engineering_area_conflicts(self.hass, entry_id)
@@ -469,7 +474,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 )
 
             action = user_input.get("action")
-            if not isinstance(action, str) or action not in _ACTIONS:
+            if set(user_input) != {"action"} or not isinstance(action, str) or action not in _ACTIONS:
                 if not await self._async_secondary_reconcile(entry_id, active):
                     return self.async_abort(reason="repair_unavailable")
                 return self.async_abort(reason="invalid_action")
@@ -485,13 +490,23 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                     entry_id,
                     conflict.token,
                     action,
+                    is_current=lambda: _binding_is_current(
+                        self.hass,
+                        entry_id,
+                        active,
+                    ),
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception:  # noqa: BLE001 -- never surface private storage details.
                 return self.async_abort(reason="resolution_failed")
+            if not _binding_is_current(self.hass, entry_id, active):
+                return self.async_abort(reason="entry_unavailable")
             reason = {
                 "stale_conflict": "conflict_changed",
                 "invalid_desired_area": "invalid_desired_area",
                 "invalid_action": "invalid_action",
+                "lifecycle_changed": "entry_unavailable",
             }.get(result.reason, "resolution_failed")
             reconciled = await self._async_secondary_reconcile(entry_id, active)
             if result.resolved:
@@ -505,6 +520,8 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         user_input: dict[str, Any] | None = None,
     ) -> RepairsFlowResult:
         """Load the exact current conflict and apply only an explicit choice."""
+        if user_input is getattr(self, "init_data", None) and user_input == {"issue_id": self._issue_id}:
+            user_input = None
         return await self._async_step(user_input)
 
     async_step_current_named_desired_named = async_step_init

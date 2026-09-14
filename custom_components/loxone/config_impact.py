@@ -98,6 +98,18 @@ def _area_impact_owner_is_at_destination(
     return getattr(device, "area_id", None) == destination
 
 
+def _area_impact_is_applicable(
+    hass: HomeAssistant,
+    entry_id: str,
+    impact: EngineeringEntityImpact,
+) -> bool:
+    """Verify both the applied owner move and a captured live consumer."""
+    if not _area_impact_owner_is_at_destination(hass, entry_id, impact):
+        return False
+    current = _area_target_references(hass, impact.target_area_ids)
+    return any(values & set(impact.references.get(kind, ())) for kind, values in current.items())
+
+
 async def async_find_engineering_change_impacts(  # noqa: PLR0912, PLR0913, PLR0915 -- keep scoped, mutation-free applicability checks together.
     hass: HomeAssistant,
     config_entry: ConfigEntry,
@@ -244,11 +256,25 @@ async def async_publish_engineering_impact_plan(
     """Idempotently replace one source-scoped count-only impact notification."""
     notification_id = f"loxone_engineering_impact_{config_entry.entry_id}_{provider_identifier}"
     impacts = plan.impacts
-    if recheck and impacts:
-        registry = er.async_get(hass)
-        sources = entity_sources(hass)
+    if impacts and (recheck or any(impact.target_area_ids for impact in impacts)):
+        registry = None
+        sources = None
         applicable = []
         for impact in impacts:
+            if impact.target_area_ids:
+                if _area_impact_is_applicable(
+                    hass,
+                    config_entry.entry_id,
+                    impact,
+                ):
+                    applicable.append(impact)
+                continue
+            if not recheck:
+                applicable.append(impact)
+                continue
+            if registry is None:
+                registry = er.async_get(hass)
+                sources = entity_sources(hass)
             is_applicable = False
             for entity_id in impact.entity_ids:
                 entry = registry.async_get(entity_id)
@@ -266,17 +292,6 @@ async def async_publish_engineering_impact_plan(
                 ):
                     is_applicable = True
                     break
-            if (
-                not is_applicable
-                and impact.target_area_ids
-                and _area_impact_owner_is_at_destination(
-                    hass,
-                    config_entry.entry_id,
-                    impact,
-                )
-            ):
-                current = _area_target_references(hass, impact.target_area_ids)
-                is_applicable = any(values & set(impact.references.get(kind, ())) for kind, values in current.items())
             if is_applicable:
                 applicable.append(impact)
         impacts = tuple(applicable)

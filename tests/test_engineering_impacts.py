@@ -11,8 +11,10 @@ import custom_components.loxone.config_impact as module
 from custom_components.loxone.engineering_changes import EngineeringEntityImpact, EngineeringImpactPlan
 from custom_components.loxone.engineering_registry import (
     EngineeringRegistryMetadata,
+    async_apply_engineering_registry_plan,
     async_plan_engineering_registry_sync,
 )
+from custom_components.loxone.engineering_snapshot import StoredEngineeringState
 from tests.engineering_fixtures import element, inventory_of, make_snapshot
 from tests.test_engineering_registry import FakeIntentStore, registries  # noqa: F401
 
@@ -492,6 +494,198 @@ def test_area_impact_carries_only_while_owner_transition_is_applied(
         assert dismissed == ["loxone_engineering_impact_entry-a_serial-a"]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("timing", ("before_apply", "during_intent_save"))
+@pytest.mark.parametrize("override", ("user_area", "clear"))
+def test_normal_publication_suppresses_task5_vetoed_area_transition(
+    registries,  # noqa: F811
+    monkeypatch,
+    timing,
+    override,
+):
+    """Normal publication verifies the owner move that Task 5 actually applied."""
+    office = registries.areas.async_get_or_create("Office")
+    registries.areas.async_get_or_create("Workshop")
+    user_area = registries.areas.async_get_or_create("User Area")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    FakeIntentStore.data = {
+        "managed_baselines": [
+            {
+                "identifier": "serial-a:device",
+                "area_id": office.id,
+                "process_token": "process-a",
+            }
+        ]
+    }
+    previous = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                room="Office",
+            ),
+        )
+    )
+    current = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                room="Workshop",
+            ),
+        ),
+        read_sequence=2,
+    )
+    monkeypatch.setattr(
+        module.automation,
+        "automations_with_area",
+        lambda _hass, area_id: {"automation.office_rule"} if area_id == office.id else set(),
+    )
+    monkeypatch.setattr(module.script, "scripts_with_area", lambda *_: set())
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_store_engineering_state",
+        lambda _hass, _state: asyncio.sleep(0),
+    )
+    created = []
+    dismissed = []
+    monkeypatch.setattr(
+        module.persistent_notification,
+        "async_create",
+        lambda *args, **kwargs: created.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        module.persistent_notification,
+        "async_dismiss",
+        lambda _hass, notification_id: dismissed.append(notification_id),
+    )
+
+    def change_area():
+        device.area_id = user_area.id if override == "user_area" else None
+
+    async def scenario():
+        registry_plan = await async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            current,
+            EngineeringRegistryMetadata(
+                frozenset({"serial-a:device"}),
+                frozenset({"Office"}),
+                {"serial-a:device": office.id},
+            ),
+        )
+        impact_plan = await module.async_find_engineering_change_impacts(
+            registries.hass,
+            SimpleNamespace(entry_id="entry-a"),
+            previous,
+            current,
+            registry_plan=registry_plan,
+        )
+        assert len(impact_plan.impacts) == 1
+        if timing == "before_apply":
+            change_area()
+        else:
+            FakeIntentStore.save_callbacks = [change_area]
+        await async_apply_engineering_registry_plan(
+            registries.hass,
+            registry_plan,
+            committed_state=StoredEngineeringState(snapshot=current),
+        )
+        await module.async_publish_engineering_impact_plan(
+            registries.hass,
+            SimpleNamespace(entry_id="entry-a"),
+            current.source.provider_identifier,
+            impact_plan,
+        )
+
+    asyncio.run(scenario())
+    assert device.area_id == (user_area.id if override == "user_area" else None)
+    assert created == []
+    assert dismissed == ["loxone_engineering_impact_entry-a_serial-a"]
+
+
+def test_normal_area_publication_keeps_valid_subset_and_rechecks_each_time(
+    registries,  # noqa: F811
+    monkeypatch,
+):
+    """A valid owner warns once while vetoed/removed peers stay excluded."""
+    office = registries.areas.async_get_or_create("Office")
+    workshop = registries.areas.async_get_or_create("Workshop")
+    valid = registries.devices.add(
+        "serial-a:valid",
+        "entry-a",
+        area_id=workshop.id,
+        name="ST-F01",
+    )
+    registries.devices.add(
+        "serial-a:vetoed",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    monkeypatch.setattr(
+        module.automation,
+        "automations_with_area",
+        lambda _hass, _area_id: {"automation.room_rule"},
+    )
+    monkeypatch.setattr(module.script, "scripts_with_area", lambda *_: set())
+    notifications = {}
+    monkeypatch.setattr(
+        module.persistent_notification,
+        "async_create",
+        lambda _hass, message, *, title, notification_id: notifications.update({notification_id: (title, message)}),
+    )
+    monkeypatch.setattr(
+        module.persistent_notification,
+        "async_dismiss",
+        lambda _hass, notification_id: notifications.pop(notification_id, None),
+    )
+    plan = EngineeringImpactPlan(
+        make_snapshot().generation_id,
+        tuple(
+            EngineeringEntityImpact(
+                f"serial-a:{suffix}",
+                (),
+                "area_changed",
+                {"automation": ("automation.room_rule",)},
+                (office.id, workshop.id),
+                office.id,
+                workshop.id,
+                "Workshop",
+            )
+            for suffix in ("valid", "vetoed", "removed")
+        ),
+    )
+
+    async def scenario():
+        for _ in range(2):
+            await module.async_publish_engineering_impact_plan(
+                registries.hass,
+                SimpleNamespace(entry_id="entry-a"),
+                "serial-a",
+                plan,
+            )
+        message = next(iter(notifications.values()))[1]
+        assert "1 engineering" in message
+        registries.devices.devices.pop(valid.id)
+        await module.async_publish_engineering_impact_plan(
+            registries.hass,
+            SimpleNamespace(entry_id="entry-a"),
+            "serial-a",
+            plan,
+        )
+
+    asyncio.run(scenario())
+    assert notifications == {}
 
 
 def test_impact_warning_lists_only_safe_consumer_entity_ids(monkeypatch):

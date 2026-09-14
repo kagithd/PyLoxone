@@ -1115,6 +1115,40 @@ async def test_real_store_surfaces_deferred_pending_write(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_real_store_runs_commit_guard_after_waiting_for_serialization(
+    tmp_path,
+):
+    """A synchronous admission guard runs inside the shared Store locks."""
+    hass = HomeAssistant(str(tmp_path))
+    store = _real_engineering_store(hass)
+    checks = []
+
+    def veto() -> None:
+        checks.append("checked")
+        raise RuntimeError("synthetic lifecycle veto")
+
+    await store._commit_lock.acquire()
+    task = asyncio.create_task(
+        store.async_save_acknowledged(
+            stored_state_to_dict(StoredEngineeringState(snapshot=make_snapshot())),
+            before_commit=veto,
+        )
+    )
+    await asyncio.sleep(0)
+    assert checks == []
+    store._commit_lock.release()
+    with pytest.raises(RuntimeError, match="lifecycle veto"):
+        await task
+    assert checks == ["checked"]
+    assert not Path(store.path).exists()
+
+    assert (
+        await store.async_save_acknowledged(stored_state_to_dict(StoredEngineeringState(snapshot=make_snapshot())))
+        is EngineeringStoreCommitOutcome.COMMITTED
+    )
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize(
     ("read_only", "core_state", "outcome"),
     [

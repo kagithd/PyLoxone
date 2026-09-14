@@ -47,7 +47,7 @@ from .engineering_topology import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
 
     from homeassistant.core import HomeAssistant
 
@@ -1412,6 +1412,8 @@ class EngineeringStateStore(Store[dict[str, Any]]):
     async def async_save_acknowledged(
         self,
         data: dict[str, Any],
+        *,
+        before_commit: Callable[[], None] | None = None,
     ) -> EngineeringStoreCommitOutcome:
         """Atomically save, surfacing every non-commit outcome to the caller."""
         async with self._commit_lock, self._write_lock:
@@ -1421,6 +1423,8 @@ class EngineeringStateStore(Store[dict[str, Any]]):
                 raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.READ_ONLY)
             if self._data is not None or self._delay_handle is not None:
                 raise EngineeringStoreCommitError(EngineeringStoreCommitOutcome.DEFERRED)
+            if before_commit is not None:
+                before_commit()
             self._data = {
                 "version": self.version,
                 "minor_version": self.minor_version,
