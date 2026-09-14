@@ -64,7 +64,7 @@ The hierarchy never invents a writable control. Entity creation still requires a
 
 ## Miniserver-local content
 
-Provider-owned services, system variables, weather data, and integrated I/O are sections of the Miniserver node. They are not loose HA devices. A physical extension or endpoint becomes a device only when the owner resolver proves a physical relationship. Its functions remain part of that device rather than becoming sibling devices.
+Provider-owned services, system variables, weather data, and integrated I/O are sections of the Miniserver node in this hierarchy view. Version 1 preserves existing service-module device-registry entries and entity ownership; it does not delete, migrate, or reassign them. A physical extension or endpoint becomes a hierarchy descendant only when the owner resolver proves a physical relationship. Its functions remain part of that device rather than becoming sibling hierarchy nodes.
 
 HA `via_device_id` mirrors only proven physical relationships. Display grouping does not mutate entity identity, ownership, or automation references.
 
@@ -83,7 +83,7 @@ Missing or invalid fields are omitted. XML document order, titles, parent keys, 
 
 ## Bulk area repair
 
-One persistent issue represents the current conflict set for a config entry. Opening it reloads the current provider-bound snapshot and displays native repeated rows grouped by stable Loxone room identity.
+One active issue represents the current conflict set for a config entry. Its issue identity contains a fingerprint of that immutable conflict set, so an old flow cannot remove a newer issue. Opening it reloads the current provider-bound snapshot and displays native repeated rows grouped by stable Loxone room identity.
 
 Each group shows safe device references, current HA area, and Loxone room. Its explicit target is one of:
 
@@ -92,21 +92,21 @@ Each group shows safe device references, current HA area, and Loxone room. Its e
 - keep current HA assignments as user-owned overrides;
 - remove the HA assignment when Loxone validly requests no room.
 
-The default operation is a room-level mapping `(entry_id, provider_identifier, loxone_room_uuid) -> area_id`, so future devices in that Loxone room follow the same HA area. Per-device keep decisions are exceptions. Names are presentation only and never mapping identity.
+The default operation is a room-level mapping `(entry_id, provider_identifier, loxone_room_uuid) -> area_id`, so future devices in that Loxone room follow the same HA area. A second native step carries explicit per-device keep overrides for mixed decisions inside a room group. Conflicts without a Loxone room are never grouped or persisted under `None`; each device offers only keep or ownership-checked clear. Names are presentation only and never mapping identity.
 
-Before mutation, the backend reloads every conflict, verifies the exact tokens, provider, config-entry lifecycle, room identities, selected area IDs, and normalized new-area names. No mutation occurs when preflight fails. Successful groups are applied through the existing public Task-5 resolution boundary; unresolved groups remain in the aggregate issue. A newly created global HA area is never deleted automatically after a later failure.
+Before mutation, the backend reloads every conflict, verifies exact nonempty token membership, provider, config-entry lifecycle, room identities, selected area IDs, and normalized new-area names. No mutation occurs when preflight fails. The resolver uses one lock owner and persists batch intent/progress before registry mutation. A room mapping becomes effective only after every selected device in that group succeeds; idempotent replay resumes partially applied work. Unresolved or stale work does not complete the Repairs flow, so its current issue remains active. A newly created global HA area is never deleted automatically after a later failure.
 
 ## Hierarchy view
 
-A read-only integration view receives a privacy-safe tree projection from a config-entry-scoped backend command. The initial UI is deliberately small:
+A read-only integration view receives a privacy-safe tree projection from a config-entry-scoped backend command. With multiple loaded entries, the operator explicitly selects the entry. Snapshot generation time and freshness are displayed; a last-known-good snapshot is not rejected merely because of age. The initial UI is deliberately small:
 
 - expand/collapse nodes;
 - text filter;
 - badges with active, prepared, inventory-only, unsupported, and protected counts;
-- optional physical placement lines;
+- optional physical placement lines, also shown read-only beside affected devices in the repair flow;
 - links to existing HA device/entity pages.
 
-The response contains no raw XML and is generated from the validated snapshot. The command rejects an unloaded entry, provider mismatch, stale snapshot, or unauthorized config-entry scope.
+The response contains no raw XML and is generated from the validated snapshot. The command rejects an unloaded entry, provider mismatch, absent snapshot, or unauthorized config-entry scope. It distinguishes projected capability from read-only registry/state enrichment: active, prepared, disabled, and unavailable are never inferred from snapshot names.
 
 ## Change and warning behavior
 
