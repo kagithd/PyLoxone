@@ -189,15 +189,22 @@ def engineering_event_value(
         if isinstance(value, bool):
             return value
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            numeric = float(value)
-            if math.isfinite(numeric) and numeric in {0.0, 1.0}:
+            numeric = _finite_engineering_number(value)
+            if numeric in {0.0, 1.0}:
                 return bool(numeric)
         return None
     if isinstance(value, (int, float)) and not isinstance(value, bool):
-        numeric = float(value)
-        if math.isfinite(numeric):
-            return numeric
+        return _finite_engineering_number(value)
     return None
+
+
+def _finite_engineering_number(value: float) -> float | None:
+    """Convert numeric input at the single authoritative finite boundary."""
+    try:
+        numeric = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
 
 
 @dataclass(slots=True)

@@ -150,10 +150,17 @@ class LoxoneEngineeringBinarySensor(BinarySensorEntity):
         self._spec = spec
         self._config_entry_id = config_entry_id
         self._event_unsub = None
+        self._event_token = None
+        self._lifecycle_active = False
+        self._live_eligible = True
         self._attr_unique_id = spec.unique_id
-        self._attr_name = spec.name
         self._attr_is_on = engineering_event_value("binary_sensor", spec.native_value)
         self._attr_available = spec.available and self._attr_is_on is not None
+        self._apply_spec_metadata(spec)
+
+    def _apply_spec_metadata(self, spec: EngineeringEntitySpec) -> None:
+        """Refresh all metadata derived from the current accepted specification."""
+        self._attr_name = spec.name
         self._attr_entity_registry_enabled_default = spec.enabled_by_default
         self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, spec.owner_identifier)})
         self._update_attributes(spec)
@@ -170,28 +177,46 @@ class LoxoneEngineeringBinarySensor(BinarySensorEntity):
     async def async_added_to_hass(self) -> None:
         """Subscribe only to the source-scoped proven state mapping."""
         await super().async_added_to_hass()
-        self._subscribe_state_updates()
-        self.async_on_remove(self._unsubscribe_state_updates)
+        self._lifecycle_active = True
+        if self._live_eligible:
+            self._subscribe_state_updates()
+        self.async_on_remove(self._deactivate_state_updates)
 
     @callback
     def _subscribe_state_updates(self) -> None:
         self._unsubscribe_state_updates()
-        if self.hass is None or self._config_entry_id is None:
+        if not self._lifecycle_active or not self._live_eligible or self.hass is None or self._config_entry_id is None:
             return
+        token = object()
+        self._event_token = token
+
+        @callback
+        def async_handle_engineering_value(value: object) -> None:
+            self._handle_engineering_value(value, token)
+
         self._event_unsub = async_dispatcher_connect(
             self.hass,
             engineering_state_updated_signal(self._config_entry_id, self._spec.state_uuid),
-            self._handle_engineering_value,
+            async_handle_engineering_value,
         )
 
     @callback
     def _unsubscribe_state_updates(self) -> None:
+        self._event_token = None
         if self._event_unsub is not None:
             self._event_unsub()
             self._event_unsub = None
 
     @callback
-    def _handle_engineering_value(self, value: object) -> None:
+    def _deactivate_state_updates(self) -> None:
+        self._lifecycle_active = False
+        self._live_eligible = False
+        self._unsubscribe_state_updates()
+
+    @callback
+    def _handle_engineering_value(self, value: object, token: object) -> None:
+        if not self._live_eligible or token is not self._event_token:
+            return
         is_on = engineering_event_value("binary_sensor", value)
         if is_on is None:
             return
@@ -207,19 +232,21 @@ class LoxoneEngineeringBinarySensor(BinarySensorEntity):
             raise ValueError("engineering binary sensor specification identity changed")
         state_uuid_changed = spec.state_uuid != self._spec.state_uuid
         self._spec = spec
-        self._attr_name = spec.name
+        self._live_eligible = True
         if (is_on := engineering_event_value("binary_sensor", spec.native_value)) is not None:
             self._attr_is_on = is_on
         self._attr_available = spec.available and is_on is not None
-        self._update_attributes(spec)
-        if state_uuid_changed and self.hass is not None:
+        self._apply_spec_metadata(spec)
+        if self._lifecycle_active and (state_uuid_changed or self._event_unsub is None):
             self._subscribe_state_updates()
         if self.hass is not None:
             self.async_write_ha_state()
 
     @callback
     def mark_unavailable(self) -> None:
-        """Retain the last safe state while disabling the live binding."""
+        """Revoke a channel until an authoritative specification accepts it."""
+        self._live_eligible = False
+        self._unsubscribe_state_updates()
         self._attr_available = False
         if self.hass is not None:
             self.async_write_ha_state()

@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.dispatcher import async_dispatcher_connect, async_dispatcher_send
+from homeassistant.helpers.dispatcher import (
+    DATA_DISPATCHER,
+    async_dispatcher_connect,
+    async_dispatcher_send,
+)
 
 from custom_components.loxone import binary_sensor, sensor
 from custom_components.loxone.engineering_entities import (
     EngineeringEntitySpec,
     EngineeringPlatformReconciler,
     async_dispatch_engineering_state_updates,
+    engineering_event_value,
     engineering_inventory_updated_signal,
     engineering_state_updated_signal,
 )
@@ -83,6 +90,7 @@ def test_failed_rebind_retains_last_safe_value_but_marks_unavailable():
 async def test_scoped_state_event_rebinds_cached_entity_and_rejects_unsafe_values(
     tmp_path,
     monkeypatch,
+    caplog,
 ):
     hass = HomeAssistant(str(tmp_path))
     entity = sensor.LoxoneEngineeringSensor(
@@ -101,9 +109,15 @@ async def test_scoped_state_event_rebinds_cached_entity_and_rejects_unsafe_value
         engineering_state_updated_signal("entry-a", "weather-state"),
         "19.5 private-label",
     )
+    async_dispatcher_send(
+        hass,
+        engineering_state_updated_signal("entry-a", "weather-state"),
+        10**1000,
+    )
 
     assert entity.available is True
     assert entity.native_value == 19.0
+    assert str(10**1000) not in caplog.text
 
     entity._call_on_remove_callbacks()
     async_dispatcher_send(hass, engineering_state_updated_signal("entry-a", "weather-state"), 20.0)
@@ -111,7 +125,11 @@ async def test_scoped_state_event_rebinds_cached_entity_and_rejects_unsafe_value
 
 
 @pytest.mark.anyio
-async def test_binary_event_accepts_only_boolean_or_zero_one(tmp_path, monkeypatch):
+async def test_binary_event_accepts_only_boolean_or_zero_one(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
     hass = HomeAssistant(str(tmp_path))
     entity = binary_sensor.LoxoneEngineeringBinarySensor(
         entity_spec(
@@ -130,7 +148,206 @@ async def test_binary_event_accepts_only_boolean_or_zero_one(tmp_path, monkeypat
     assert entity.is_on is True
     async_dispatcher_send(hass, engineering_state_updated_signal("entry-a", "digital-state"), 2.0)
     async_dispatcher_send(hass, engineering_state_updated_signal("entry-a", "digital-state"), "0")
+    async_dispatcher_send(
+        hass,
+        engineering_state_updated_signal("entry-a", "digital-state"),
+        -(10**1000),
+    )
     assert entity.is_on is True
+    assert str(-(10**1000)) not in caplog.text
+
+
+@pytest.mark.parametrize("platform", ["sensor", "binary_sensor"])
+@pytest.mark.parametrize("value", [10**1000, -(10**1000)])
+def test_engineering_event_rejects_oversized_integers(platform, value):
+    assert engineering_event_value(platform, value) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("platform", ["sensor", "binary_sensor"])
+async def test_removed_spec_revokes_live_and_queued_events_until_accepted_restore(
+    tmp_path,
+    monkeypatch,
+    platform,
+):
+    hass = HomeAssistant(str(tmp_path))
+    spec = _platform_spec(platform)
+    entity = _platform_entity(platform, spec)
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+    signal = engineering_state_updated_signal("entry-a", spec.state_uuid)
+    queued_callback = next(iter(hass.data[DATA_DISPATCHER][signal]))
+    prepared = {spec.unique_id: entity}
+    _install_empty_entity_registry(monkeypatch)
+    reconciler = EngineeringPlatformReconciler(
+        "entry-a",
+        platform,
+        frozenset(),
+        lambda current: _platform_entity(platform, current),
+        lambda entities: None,
+        prepared,
+    )
+
+    await reconciler.async_reconcile(hass, ())
+    rejected_value = 24.0 if platform == "sensor" else True
+    async_dispatcher_send(hass, signal, rejected_value)
+    queued_callback(rejected_value)
+
+    assert entity.available is False
+    assert _platform_value(entity, platform) == spec.native_value
+
+    cached = replace(spec, native_value=None, available=False, runtime_binding=None)
+    await reconciler.async_reconcile(hass, (cached,))
+    restored_value = 22.0 if platform == "sensor" else False
+    async_dispatcher_send(hass, signal, restored_value)
+
+    assert entity.available is True
+    assert _platform_value(entity, platform) == restored_value
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("platform", ["sensor", "binary_sensor"])
+async def test_identity_rejection_revokes_existing_live_entity(
+    tmp_path,
+    monkeypatch,
+    platform,
+):
+    hass = HomeAssistant(str(tmp_path))
+    spec = _platform_spec(platform)
+    entity = _platform_entity(platform, spec)
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+    registry_entry = SimpleNamespace(config_entry_id="entry-b")
+    registry = SimpleNamespace(
+        async_get_entity_id=lambda *args: f"{platform}.persisted",
+        async_get=lambda entity_id: registry_entry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.er.async_get",
+        lambda hass: registry,
+    )
+    reconciler = EngineeringPlatformReconciler(
+        "entry-a",
+        platform,
+        frozenset(),
+        lambda current: _platform_entity(platform, current),
+        lambda entities: None,
+        {spec.unique_id: entity},
+    )
+
+    await reconciler.async_reconcile(hass, (spec,))
+    async_dispatcher_send(
+        hass,
+        engineering_state_updated_signal("entry-a", spec.state_uuid),
+        24.0 if platform == "sensor" else False,
+    )
+
+    assert entity.available is False
+    assert _platform_value(entity, platform) == spec.native_value
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("platform", ["sensor", "binary_sensor"])
+async def test_state_uuid_change_rejects_old_queued_callback(tmp_path, monkeypatch, platform):
+    hass = HomeAssistant(str(tmp_path))
+    spec = _platform_spec(platform)
+    entity = _platform_entity(platform, spec)
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+    old_signal = engineering_state_updated_signal("entry-a", spec.state_uuid)
+    queued_callback = next(iter(hass.data[DATA_DISPATCHER][old_signal]))
+
+    entity.update_spec(replace(spec, state_uuid="replacement-state"))
+    stale_value = 25.0 if platform == "sensor" else False
+    queued_callback(stale_value)
+    async_dispatcher_send(hass, old_signal, stale_value)
+    assert _platform_value(entity, platform) == spec.native_value
+    current_value = 20.0 if platform == "sensor" else True
+    async_dispatcher_send(
+        hass,
+        engineering_state_updated_signal("entry-a", "replacement-state"),
+        current_value,
+    )
+
+    assert _platform_value(entity, platform) == current_value
+
+
+@pytest.mark.anyio
+async def test_active_sensor_update_refreshes_owner_name_and_semantic_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    hass = HomeAssistant(str(tmp_path))
+    spec = entity_spec(state_uuid="weather-state")
+    entity = sensor.LoxoneEngineeringSensor(spec, "entry-a")
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+    assert entity.device_class is SensorDeviceClass.TEMPERATURE
+    assert entity.state_class is SensorStateClass.MEASUREMENT
+    assert entity.native_unit_of_measurement == "°C"
+    entity._sensor_option_unit_of_measurement = "°F"
+
+    entity.update_spec(
+        replace(
+            spec,
+            name="Energy total",
+            native_value=4.0,
+            unit="kWh",
+            owner_identifier="serial-a:meter",
+        )
+    )
+
+    assert entity.name == "Energy total"
+    assert entity.native_value == 4.0
+    assert entity.native_unit_of_measurement == "kWh"
+    assert entity.unit_of_measurement == "kWh"
+    assert entity.device_class is SensorDeviceClass.ENERGY
+    assert entity.state_class is SensorStateClass.TOTAL_INCREASING
+    assert entity.device_info == {"identifiers": {("loxone", "serial-a:meter")}}
+
+    entity.update_spec(
+        replace(
+            spec,
+            name="Analog voltage",
+            native_value=7.5,
+            unit="V",
+            owner_identifier="serial-a:analog-extension",
+        )
+    )
+
+    assert entity.name == "Analog voltage"
+    assert entity.native_value == 7.5
+    assert entity.native_unit_of_measurement == "V"
+    assert entity.unit_of_measurement == "V"
+    assert entity.device_class is None
+    assert entity.state_class is SensorStateClass.MEASUREMENT
+    assert not hasattr(entity, "entity_description")
+    assert entity.device_info == {"identifiers": {("loxone", "serial-a:analog-extension")}}
+
+
+@pytest.mark.anyio
+async def test_active_binary_update_refreshes_owner_and_name(tmp_path, monkeypatch):
+    hass = HomeAssistant(str(tmp_path))
+    spec = _platform_spec("binary_sensor")
+    entity = _platform_entity("binary_sensor", spec)
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+
+    entity.update_spec(
+        replace(
+            spec,
+            name="Input I2",
+            owner_identifier="serial-a:digital-extension",
+        )
+    )
+
+    assert entity.name == "Input I2"
+    assert entity.device_info == {"identifiers": {("loxone", "serial-a:digital-extension")}}
 
 
 @pytest.mark.anyio
@@ -276,6 +493,87 @@ async def test_binary_platform_restores_cached_prepared_channel(tmp_path, monkey
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("platform", ["sensor", "binary_sensor"])
+async def test_pending_generation_revokes_existing_entity_until_applied_restore(
+    tmp_path,
+    monkeypatch,
+    platform,
+):
+    hass = HomeAssistant(str(tmp_path))
+    miniserver = _FakeMiniserver()
+    if platform == "sensor":
+        platform_module = sensor
+        entity_type = sensor.LoxoneEngineeringSensor
+        snapshot = make_snapshot()
+        runtime = EngineeringRuntimeInventory(
+            (
+                numeric_binding("weather-value", 18.5, "WeatherData"),
+                numeric_binding("system-variable", 1.0, "SysVar"),
+            )
+        )
+        target_uuid = "weather-value"
+        live_value = 19.0
+        rejected_value = 24.0
+    else:
+        platform_module = binary_sensor
+        entity_type = binary_sensor.LoxoneEngineeringBinarySensor
+        runtime = EngineeringRuntimeInventory((numeric_binding("digital-i1", 1.0, "DigitalIn"),))
+        snapshot = make_snapshot(inventory=provider_inventory(), runtime=runtime)
+        target_uuid = "digital-i1"
+        live_value = True
+        rejected_value = False
+    applied = StoredEngineeringState(
+        snapshot=snapshot,
+        registry_applied_generation=snapshot.generation_id,
+    )
+    stored = [applied]
+    coordinator = SimpleNamespace(engineering_runtime=runtime)
+    hass.data["loxone"] = {"entry-a": coordinator}
+    config_entry = SimpleNamespace(entry_id="entry-a")
+    monkeypatch.setattr(
+        platform_module,
+        "get_miniserver_from_hass",
+        lambda hass, entry: miniserver,
+    )
+    monkeypatch.setattr(
+        platform_module,
+        "async_load_engineering_state",
+        lambda hass, entry_id: _return(stored[0]),
+    )
+    _install_empty_entity_registry(monkeypatch)
+    added = []
+    await platform_module.async_setup_entry(
+        hass,
+        config_entry,
+        lambda entities, *args, **kwargs: added.extend(entities),
+    )
+    entity = next(item for item in added if isinstance(item, entity_type) and item.unique_id == target_uuid)
+    entity.hass = hass
+    monkeypatch.setattr(entity, "async_write_ha_state", lambda: None)
+    await entity.async_added_to_hass()
+    signal = engineering_state_updated_signal("entry-a", entity._spec.state_uuid)
+    async_dispatcher_send(hass, signal, live_value)
+    assert entity.available is True
+
+    stored[0] = StoredEngineeringState(snapshot=snapshot)
+    async_dispatcher_send(hass, engineering_inventory_updated_signal("entry-a"))
+    await hass.async_block_till_done()
+    async_dispatcher_send(hass, signal, rejected_value)
+
+    assert entity.available is False
+    assert _platform_value(entity, platform) == live_value
+
+    stored[0] = applied
+    async_dispatcher_send(hass, engineering_inventory_updated_signal("entry-a"))
+    await hass.async_block_till_done()
+
+    assert entity.available is True
+    restored_event = 20.0 if platform == "sensor" else False
+    async_dispatcher_send(hass, signal, restored_event)
+    assert _platform_value(entity, platform) == restored_event
+
+
+@pytest.mark.anyio
 async def test_sensor_platform_does_not_expose_registry_pending_generation(tmp_path, monkeypatch):
     """A committed snapshot cannot create entities before its owner topology applies."""
     hass = HomeAssistant(str(tmp_path))
@@ -324,6 +622,27 @@ async def test_websocket_projection_is_private_and_source_scoped(tmp_path):
 
 async def _return(value):
     return value
+
+
+def _platform_spec(platform):
+    if platform == "sensor":
+        return entity_spec(state_uuid="weather-state")
+    return entity_spec(
+        unique_id="digital-i1",
+        state_uuid="digital-state",
+        platform="binary_sensor",
+        value=True,
+    )
+
+
+def _platform_entity(platform, spec):
+    if platform == "sensor":
+        return sensor.LoxoneEngineeringSensor(spec, "entry-a")
+    return binary_sensor.LoxoneEngineeringBinarySensor(spec, "entry-a")
+
+
+def _platform_value(entity, platform):
+    return entity.native_value if platform == "sensor" else entity.is_on
 
 
 def _install_empty_entity_registry(monkeypatch):

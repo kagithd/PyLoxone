@@ -42,7 +42,7 @@ from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
+from homeassistant.helpers.typing import UNDEFINED, ConfigType, DiscoveryInfoType
 from homeassistant.util import dt as dt_util
 
 from . import LoxoneEntity
@@ -384,22 +384,13 @@ class LoxoneEngineeringSensor(SensorEntity):
         self._spec = spec
         self._config_entry_id = config_entry_id
         self._event_unsub = None
+        self._event_token = None
+        self._lifecycle_active = False
+        self._live_eligible = True
         self._attr_unique_id = spec.unique_id
-        self._attr_name = spec.name
         self._attr_native_value = engineering_event_value("sensor", spec.native_value)
-        self._attr_native_unit_of_measurement = spec.unit
-        description = match_sensor_description(
-            self._attr_native_unit_of_measurement or "",
-            self._attr_name or "",
-        )
-        if description:
-            self.entity_description = description
-        else:
-            self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_available = spec.available and self._attr_native_value is not None
-        self._attr_entity_registry_enabled_default = spec.enabled_by_default
-        self._set_device_info(spec)
-        self._update_attributes(spec)
+        self._apply_spec_metadata(spec, refresh_unit_options=False)
 
     def _set_device_info(self, spec: EngineeringEntitySpec) -> None:
         self._attr_device_info = DeviceInfo(
@@ -415,31 +406,84 @@ class LoxoneEngineeringSensor(SensorEntity):
             "runtime_binding": spec.runtime_binding,
         }
 
+    def _apply_spec_metadata(
+        self,
+        spec: EngineeringEntitySpec,
+        *,
+        refresh_unit_options: bool,
+    ) -> None:
+        """Refresh all metadata derived from the current accepted specification."""
+        self._attr_name = spec.name
+        self._attr_native_unit_of_measurement = spec.unit
+        description = match_sensor_description(spec.unit or "", spec.name)
+        if description is None:
+            if hasattr(self, "entity_description"):
+                del self.entity_description
+            self._attr_device_class = None
+            self._attr_state_class = SensorStateClass.MEASUREMENT
+            self._attr_options = None
+            self._attr_last_reset = None
+            self._attr_suggested_display_precision = None
+            self._attr_suggested_unit_of_measurement = None
+        else:
+            self.entity_description = description
+            self._attr_device_class = description.device_class
+            self._attr_state_class = description.state_class
+            self._attr_options = description.options
+            self._attr_last_reset = description.last_reset
+            self._attr_suggested_display_precision = description.suggested_display_precision
+            self._attr_suggested_unit_of_measurement = description.suggested_unit_of_measurement
+        self._attr_entity_registry_enabled_default = spec.enabled_by_default
+        self._set_device_info(spec)
+        self._update_attributes(spec)
+        if refresh_unit_options:
+            self._sensor_option_unit_of_measurement = UNDEFINED
+            if self.registry_entry is not None:
+                self._async_read_entity_options()
+
     async def async_added_to_hass(self) -> None:
         """Subscribe only to the source-scoped proven state mapping."""
         await super().async_added_to_hass()
-        self._subscribe_state_updates()
-        self.async_on_remove(self._unsubscribe_state_updates)
+        self._lifecycle_active = True
+        if self._live_eligible:
+            self._subscribe_state_updates()
+        self.async_on_remove(self._deactivate_state_updates)
 
     @callback
     def _subscribe_state_updates(self) -> None:
         self._unsubscribe_state_updates()
-        if self.hass is None or self._config_entry_id is None:
+        if not self._lifecycle_active or not self._live_eligible or self.hass is None or self._config_entry_id is None:
             return
+        token = object()
+        self._event_token = token
+
+        @callback
+        def async_handle_engineering_value(value: object) -> None:
+            self._handle_engineering_value(value, token)
+
         self._event_unsub = async_dispatcher_connect(
             self.hass,
             engineering_state_updated_signal(self._config_entry_id, self._spec.state_uuid),
-            self._handle_engineering_value,
+            async_handle_engineering_value,
         )
 
     @callback
     def _unsubscribe_state_updates(self) -> None:
+        self._event_token = None
         if self._event_unsub is not None:
             self._event_unsub()
             self._event_unsub = None
 
     @callback
-    def _handle_engineering_value(self, value: object) -> None:
+    def _deactivate_state_updates(self) -> None:
+        self._lifecycle_active = False
+        self._live_eligible = False
+        self._unsubscribe_state_updates()
+
+    @callback
+    def _handle_engineering_value(self, value: object, token: object) -> None:
+        if not self._live_eligible or token is not self._event_token:
+            return
         native_value = engineering_event_value("sensor", value)
         if native_value is None:
             return
@@ -455,20 +499,21 @@ class LoxoneEngineeringSensor(SensorEntity):
             raise ValueError("engineering sensor specification identity changed")
         state_uuid_changed = spec.state_uuid != self._spec.state_uuid
         self._spec = spec
-        self._attr_name = spec.name
+        self._live_eligible = True
         if (native_value := engineering_event_value("sensor", spec.native_value)) is not None:
             self._attr_native_value = native_value
-        self._attr_native_unit_of_measurement = spec.unit
         self._attr_available = spec.available and native_value is not None
-        self._update_attributes(spec)
-        if state_uuid_changed and self.hass is not None:
+        self._apply_spec_metadata(spec, refresh_unit_options=True)
+        if self._lifecycle_active and (state_uuid_changed or self._event_unsub is None):
             self._subscribe_state_updates()
         if self.hass is not None:
             self.async_write_ha_state()
 
     @callback
     def mark_unavailable(self) -> None:
-        """Mark a previously prepared channel unavailable after a refresh."""
+        """Revoke a channel until an authoritative specification accepts it."""
+        self._live_eligible = False
+        self._unsubscribe_state_updates()
         self._attr_available = False
         if self.hass is not None:
             self.async_write_ha_state()
