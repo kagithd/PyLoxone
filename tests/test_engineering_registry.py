@@ -51,6 +51,21 @@ from tests.engineering_fixtures import (
 _UNDEFINED = object()
 
 
+def test_all_devices_uses_public_registry_iteration():
+    """A registry mapping lookup would reintroduce HA's deprecated API warning."""
+    expected = (SimpleNamespace(id="one"), SimpleNamespace(id="two"))
+
+    class PublicRegistry:
+        @property
+        def devices(self):
+            raise AssertionError("deprecated mapping accessed")
+
+        def __iter__(self):
+            return iter(expected)
+
+    assert engineering_registry._all_devices(PublicRegistry()) == expected
+
+
 def _seed_managed_baseline(area_id, identifiers=("serial-a:device",)):
     """Give managed-transition tests explicit acknowledged process evidence."""
     FakeIntentStore.data = {
@@ -447,6 +462,9 @@ class FakeDeviceRegistry:
         self.devices: dict[str, SimpleNamespace] = {}
         self.mutations = 0
         self.fail_mutation_number: int | None = None
+
+    def __iter__(self):
+        return iter(self.devices.values())
 
     def _mutate(self) -> None:
         self.mutations += 1
