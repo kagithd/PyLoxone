@@ -90,12 +90,21 @@ def _reconciler(hass: HomeAssistant, entry_id: str) -> _EntryReconciler:
 
 
 def _provider_identifier(coordinator: object) -> str | None:
-    snapshot = getattr(coordinator, "engineering_snapshot", None)
-    source = getattr(snapshot, "source", None)
-    provider = getattr(source, "provider_identifier", None)
+    config_entry = getattr(coordinator, "config_entry", None)
+    entry_id = getattr(config_entry, "entry_id", None)
+    serial = getattr(getattr(coordinator, "miniserver", None), "serial", None)
+    provider = serial or entry_id
     if not isinstance(provider, str) or not provider:
-        provider = getattr(getattr(coordinator, "miniserver", None), "serial", None)
-    return provider if isinstance(provider, str) and provider else None
+        return None
+    snapshot = getattr(coordinator, "engineering_snapshot", None)
+    snapshot_provider = getattr(
+        getattr(snapshot, "source", None),
+        "provider_identifier",
+        None,
+    )
+    if snapshot is not None and snapshot_provider != provider:
+        return None
+    return provider
 
 
 def async_register_engineering_area_conflict_reconciler(
