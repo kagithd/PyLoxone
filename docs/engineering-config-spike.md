@@ -4,6 +4,10 @@ This experimental path complements `LoxAPP3.json` with the complete engineering
 configuration stored by the Miniserver. It is intentionally read-only and
 manual while real-world hardware coverage is measured.
 
+The exploratory and deferred scope below is superseded by the implemented and
+reviewed feature described in the current
+[engineering inventory and owner resolution guide](engineering-owner-resolution.md).
+
 ## Test flow
 
 1. Home Assistant exposes **Refresh engineering inventory** as a configuration
