@@ -166,10 +166,11 @@ def _decompress_loxcc(data: bytes) -> bytes:
                     break
         if position + literal_length > len(compressed):
             raise EngineeringConfigError("LoxCC literal extends beyond the payload")
+        remaining = MAX_XML_BYTES - len(output)
+        if literal_length > remaining:
+            raise EngineeringConfigError("Decompressed XML exceeds the safety limit")
         output.extend(compressed[position : position + literal_length])
         position += literal_length
-        if len(output) > MAX_XML_BYTES:
-            raise EngineeringConfigError("Decompressed XML exceeds the safety limit")
         if position == len(compressed):
             break
         if position + 2 > len(compressed):
@@ -188,10 +189,11 @@ def _decompress_loxcc(data: bytes) -> bytes:
                 match_length += extra
                 if extra != 255:
                     break
+        remaining = MAX_XML_BYTES - len(output)
+        if match_length > remaining:
+            raise EngineeringConfigError("Decompressed XML exceeds the safety limit")
         for _ in range(match_length):
             output.append(output[-offset])
-        if len(output) > MAX_XML_BYTES:
-            raise EngineeringConfigError("Decompressed XML exceeds the safety limit")
 
     if uncompressed_size and len(output) != uncompressed_size:
         raise EngineeringConfigError(f"LoxCC size mismatch: expected {uncompressed_size}, got {len(output)}")
