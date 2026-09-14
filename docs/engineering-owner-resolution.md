@@ -16,17 +16,19 @@ engineering configuration and never tests an output by changing it.
 
 1. Open the PyLoxone Miniserver device in Home Assistant.
 2. Press the **Refresh engineering inventory** configuration button. A manual
-   refresh always performs a complete read.
+   refresh forces a complete read after pending committed work has been
+   reconciled (see [Refresh and recovery](#refresh-and-recovery)).
 3. Review the bounded Home Assistant notification for the number of discovered
    nodes, prepared read-only channels, and reachable runtime bindings.
 4. Inspect the device registry for the resolved physical and logical hierarchy.
    Download the integration diagnostics when the complete sanitized inventory
    and its exposure reasons are needed.
 
-If a refresh reports an error, correct the displayed authentication, transport,
-download, parse, or runtime-probe condition and press the button again. Do not
-delete the integration entry or its stored state as a recovery step. Every such
-failure preserves the last good cache.
+Authentication, transport, download, parse, or runtime-probe failures can cause
+a refresh error, but the Home Assistant UI deliberately shows only a generic
+error and retry message. Correct the likely cause and press the button again.
+Do not delete the integration entry or its stored state as a recovery step.
+Every such failure preserves the last good cache.
 
 ## Device topology
 
@@ -62,11 +64,13 @@ replace the last safe value.
 
 ## Refresh and recovery
 
-Manual refresh always downloads and evaluates a complete engineering archive.
-Automatic refresh compares the scalar `lastModified` revision with the stored
-revision and downloads an archive only after it changes. When the revision is
-unchanged, no FTPS archive download occurs, but PyLoxone still attempts a
-bounded, read-only runtime rebind so cached entities can recover.
+Before starting a new read, PyLoxone drains any pending work from an earlier
+committed generation. After that succeeds, manual refresh forces a complete
+engineering archive read. Automatic refresh skips the archive download only
+when a cached snapshot exists and a usable scalar `lastModified` revision is
+unchanged. Without that cache or revision, it performs a complete read. When
+the unchanged-revision optimization applies, PyLoxone still attempts a bounded,
+read-only runtime rebind so cached entities can recover.
 
 A validated inventory is committed before registry, publication, and maintenance
 phases are completed. Those phases are idempotent and are replayed in order after
@@ -83,12 +87,15 @@ history are not treated as ownership evidence. Automatic room synchronization
 pauses only for the affected device; other safe registry updates can continue.
 
 Open **Settings → System → Repairs** to resolve a reported room conflict.
-The native repair offers exactly these choices:
+For a normal valid conflict, the native repair offers exactly these choices:
 
 - **Apply Loxone room** applies the desired room for that exact, still-current
   conflict.
 - **Keep HA room** keeps the Home Assistant assignment and records it as
   user-owned.
+
+If the desired Loxone room is invalid or unsafe, **Apply Loxone room** is not
+offered and only **Keep HA room** remains available.
 
 An intentional Loxone no-room assignment can clear a Home Assistant area only
 with matching current-process managed-ownership evidence or the explicit
@@ -117,10 +124,14 @@ unsupported channels remain non-writable and are inventory-only when safe to
 describe. NFC access, tag, and code data, arbitrary text, sensitive descendants,
 and unsafe presentation data are suppressed.
 
-Diagnostics use an explicit safe allowlist. They omit raw engineering
-configuration, runtime values, network endpoints, credentials, private
-identifiers, arbitrary exception text, and sensitive presentation data. The
-archive itself is not persisted as diagnostics or as an inventory snapshot.
+Diagnostics use an explicit safe allowlist, but they are not fully anonymized.
+They can contain technical UUIDs, config-entry and provider identifiers
+(including a Miniserver serial), owner identities, topology paths, and permitted
+device names and rooms. Review and redact diagnostics before sharing them. They
+omit raw engineering configuration, runtime values, network endpoints,
+credentials, arbitrary exception text, and sensitive row metadata; suppressed
+sensitive rows are reduced to fixed structural status. The archive itself is
+not persisted as diagnostics or as an inventory snapshot.
 
 ## Stale-device cleanup
 
@@ -128,18 +139,20 @@ Stale-device handling is audit-only by default. In the PyLoxone integration
 options, automatic cleanup can be enabled explicitly and its grace rule selected:
 
 - **Successful observations** requires a configured number of complete,
-  committed engineering reads.
+  committed and applied engineering generations.
 - **Elapsed time** requires the configured missing duration.
 - **Both** requires both thresholds.
 
 The same committed observation token never increments the observation count
-twice. Replaying it may still re-evaluate elapsed-time eligibility. Failed or
-incomplete reads and runtime-only rebinds do not advance the grace period.
+twice. Failed or incomplete reads and runtime-only rebinds do not increment
+that counter. Wall-clock time still passes, and a later safe maintenance audit
+may satisfy elapsed-time eligibility without counting another observation.
 
 ## Multiple Miniservers
 
-Device and registry identities, runtime events, warnings, consumer impacts,
-Repairs issues, maintenance state, and cached inventory are scoped by Home
-Assistant config entry and source provider. A state or repair belonging to one
-Miniserver cannot be applied to another, even when display names or engineering
-UUID text happen to match.
+Device identities and operational, runtime-event, warning, consumer-impact,
+Repairs, maintenance, and cache state are scoped by Home Assistant config entry
+and source provider. Engineering entity unique IDs remain the globally owned,
+unprefixed engineering UUID. PyLoxone never steals an existing entity owner; a
+competing entry with the same UUID is suppressed. Runtime state and Repairs
+decisions still cannot be applied across Miniservers.
