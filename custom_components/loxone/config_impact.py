@@ -33,38 +33,69 @@ REFERENCE_TYPES = (
     ItemType.GROUP,
     ItemType.PERSON,
 )
+_IMPACT_SCOPE_MISMATCH = "engineering impact evidence does not match its source generation"
 
 
-async def async_find_engineering_change_impacts(
+async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped, mutation-free applicability checks together.
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     previous: EngineeringSnapshot | None,
     candidate: EngineeringSnapshot,
+    previous_plan: EngineeringImpactPlan | None = None,
 ) -> EngineeringImpactPlan:
-    """Discover consumer references against pre-mutation global entity identity."""
+    """Reconcile unresolved and new impacts against pre-mutation source identity."""
+    if candidate.source.entry_id != config_entry.entry_id or (
+        previous_plan is not None and (previous is None or previous_plan.generation_id != previous.generation_id)
+    ):
+        raise ValueError(_IMPACT_SCOPE_MISMATCH)
     if previous is None:
         return EngineeringImpactPlan(candidate.generation_id, ())
+    # The diff validates entry/provider equality before old evidence is reused.
     changes = diff_engineering_snapshots(previous, candidate)
     registry = er.async_get(hass)
-    impacts = []
+    targets: dict[str, set[str]] = {}
+    if previous_plan is not None:
+        for impact in previous_plan.impacts:
+            targets.setdefault(impact.unique_id, set()).update(
+                entity_id.partition(".")[0] for entity_id in impact.entity_ids
+            )
     for change in (*changes.removed, *changes.metadata_changed):
-        removed = change in changes.removed
-        if not removed and change.old_semantic_platform == change.new_semantic_platform:
+        if change in changes.metadata_changed and change.old_semantic_platform == change.new_semantic_platform:
             continue
-        if change.old_semantic_platform is None:
-            continue
-        entity_id = registry.async_get_entity_id(change.old_semantic_platform, DOMAIN, change.unique_id)
-        entry = registry.async_get(entity_id) if entity_id else None
-        if entry is None or entry.config_entry_id != config_entry.entry_id:
-            continue
-        results = Searcher(hass, entity_sources(hass)).async_search(ItemType.ENTITY, entity_id)
-        references = {
-            kind.value: values for kind, values in _relevant_references(results).items() if kind != ItemType.PERSON
-        }
+        if change.old_semantic_platform is not None:
+            targets.setdefault(change.unique_id, set()).add(change.old_semantic_platform)
+    current_platforms = {row.node.element.uuid: row.semantic_platform for row in candidate.rows}
+    impacts = []
+    for unique_id, platforms in sorted(targets.items()):
+        entity_ids = set()
+        references: dict[str, set[str]] = {}
+        for platform in sorted(platforms & {"sensor", "binary_sensor"}):
+            if current_platforms.get(unique_id) == platform:
+                continue
+            entity_id = registry.async_get_entity_id(platform, DOMAIN, unique_id)
+            entry = registry.async_get(entity_id) if entity_id else None
+            if (
+                entry is None
+                or entry.config_entry_id != config_entry.entry_id
+                or entry.unique_id != unique_id
+                or entry.platform != DOMAIN
+            ):
+                continue
+            results = Searcher(hass, entity_sources(hass)).async_search(ItemType.ENTITY, entity_id)
+            current = {
+                kind.value: values for kind, values in _relevant_references(results).items() if kind != ItemType.PERSON
+            }
+            if current:
+                entity_ids.add(entity_id)
+                for kind, values in current.items():
+                    references.setdefault(kind, set()).update(values)
         if references:
             impacts.append(
                 EngineeringEntityImpact(
-                    change.unique_id, (entity_id,), "removed" if removed else "platform_changed", references
+                    unique_id,
+                    tuple(sorted(entity_ids)),
+                    "platform_changed" if unique_id in current_platforms else "removed",
+                    {kind: tuple(sorted(values)) for kind, values in sorted(references.items())},
                 )
             )
     return EngineeringImpactPlan(candidate.generation_id, tuple(impacts))

@@ -109,6 +109,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self._engineering_registry_verified_generation: str | None = None
         self._engineering_signaled_generation: str | None = None
         self._engineering_published_generation: str | None = None
+        self._engineering_published_impact_plan: EngineeringImpactPlan | None = None
 
     async def async_config_entry_first_refresh(self) -> None:
         """Open the connection and initialize the ordinary LoxAPP model."""
@@ -243,13 +244,22 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 self._signal_engineering_generation(generation)
             if startup or state.impact_published_generation != generation:
                 if startup or self._engineering_published_generation != generation:
-                    await async_publish_engineering_impact_plan(
-                        self.hass,
-                        self.config_entry,
-                        snapshot.source.provider_identifier,
-                        state.pending_impact_plan or EngineeringImpactPlan(generation, ()),
-                        recheck=startup,
-                    )
+                    plan = state.pending_impact_plan or EngineeringImpactPlan(generation, ())
+                    if (
+                        startup
+                        or self._engineering_published_impact_plan is None
+                        or self._engineering_published_impact_plan.impacts != plan.impacts
+                    ):
+                        await async_publish_engineering_impact_plan(
+                            self.hass,
+                            self.config_entry,
+                            snapshot.source.provider_identifier,
+                            plan,
+                            recheck=startup,
+                        )
+                    # A new read with unchanged evidence advances the cursor but
+                    # does not undo a current-process user dismissal.
+                    self._engineering_published_impact_plan = plan
                     self._engineering_published_generation = generation
                 if state.impact_published_generation != generation:
                     state = replace(state, impact_published_generation=generation)
@@ -349,7 +359,13 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             )
             # Planning and consumer discovery must both finish before commit.
             await async_plan_engineering_registry_sync(self.hass, self.config_entry.entry_id, candidate, metadata)
-            impacts = await async_find_engineering_change_impacts(self.hass, self.config_entry, previous, candidate)
+            impacts = await async_find_engineering_change_impacts(
+                self.hass,
+                self.config_entry,
+                previous,
+                candidate,
+                state.pending_impact_plan,
+            )
             committed = StoredEngineeringState(
                 snapshot=candidate,
                 pending_impact_plan=impacts,
