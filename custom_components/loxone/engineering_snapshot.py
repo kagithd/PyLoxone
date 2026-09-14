@@ -1131,12 +1131,18 @@ def _impact_to_dict(impact: EngineeringEntityImpact) -> dict[str, Any]:
         "entity_ids": list(impact.entity_ids),
         "change_kind": impact.change_kind,
         "references": {key: list(values) for key, values in sorted(impact.references.items())},
+        "target_area_ids": list(impact.target_area_ids),
     }
 
 
 def _impact_from_dict(value: Any) -> EngineeringEntityImpact:
     fields = frozenset({"unique_id", "entity_ids", "change_kind", "references"})
-    data = _require_dict(value, "impact", required=fields)
+    data = _require_dict(
+        value,
+        "impact",
+        required=fields,
+        allowed=fields | {"target_area_ids"},
+    )
     unique_id = _required_identifier(data["unique_id"], "impact unique_id")
     entity_ids = tuple(
         _required_entity_id(item, "impact entity_id") for item in _require_list(data["entity_ids"], "impact entity_ids")
@@ -1147,6 +1153,7 @@ def _impact_from_dict(value: Any) -> EngineeringEntityImpact:
     if not isinstance(change_kind, str) or change_kind not in {
         "removed",
         "platform_changed",
+        "area_changed",
     }:
         raise EngineeringSnapshotError("impact change_kind is invalid")
     references_data = _require_dict(
@@ -1161,7 +1168,19 @@ def _impact_from_dict(value: Any) -> EngineeringEntityImpact:
         references[reason] = tuple(
             _required_entity_id(item, "impact reference") for item in _require_list(values, "impact reference values")
         )
-    return EngineeringEntityImpact(unique_id, entity_ids, change_kind, references)
+    target_area_ids = tuple(
+        _required_identifier(item, "impact target area")
+        for item in _require_list(data.get("target_area_ids", []), "impact target areas")
+    )
+    if len(target_area_ids) != len(set(target_area_ids)):
+        raise EngineeringSnapshotError("impact target areas contain duplicates")
+    return EngineeringEntityImpact(
+        unique_id,
+        entity_ids,
+        change_kind,
+        references,
+        target_area_ids,
+    )
 
 
 def _required_entity_id(value: Any, field_name: str) -> str:

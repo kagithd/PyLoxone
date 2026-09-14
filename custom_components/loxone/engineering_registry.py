@@ -491,7 +491,19 @@ async def _async_keep_ha_area(
     device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
     current_area = getattr(device, "area_id", None) if device else None
     if device is None or current_area != conflict.current_area_id:
-        return _area_resolution_result("keep_ha_room", "stale_conflict", conflict, resolved=False)
+        refreshed = await _async_persist_resolution_race(
+            hass,
+            entry_id,
+            state,
+            conflict,
+            current_area,
+        )
+        return _area_resolution_result(
+            "keep_ha_room",
+            "stale_conflict",
+            refreshed,
+            resolved=False,
+        )
     resolved_state = _resolution_state(
         state,
         conflict.device_identifier,

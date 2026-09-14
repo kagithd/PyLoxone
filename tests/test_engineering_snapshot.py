@@ -247,6 +247,7 @@ def test_state_envelope_round_trip_is_immutable_and_generation_consistent():
                 ("sensor.weather_value",),
                 "platform_changed",
                 {"automation": ("automation.sample",)},
+                ("area-1", "area-2"),
             ),
         ),
     )
@@ -263,6 +264,10 @@ def test_state_envelope_round_trip_is_immutable_and_generation_consistent():
     assert stored_state_to_dict(restored) == stored_state_to_dict(state)
     assert isinstance(restored.managed_area_ids, MappingProxyType)
     assert isinstance(restored.pending_impact_plan.impacts[0].references, MappingProxyType)
+    assert restored.pending_impact_plan.impacts[0].target_area_ids == (
+        "area-1",
+        "area-2",
+    )
     with pytest.raises(TypeError):
         restored.managed_area_ids["new"] = "area-2"
 
@@ -287,6 +292,33 @@ def test_impact_plan_detaches_all_caller_owned_collections():
 
     assert plan.impacts[0].entity_ids == ("sensor.weather_value",)
     assert plan.impacts[0].references == {"automation": ("automation.sample",)}
+
+
+def test_prior_impact_payload_without_area_targets_remains_loadable():
+    """The Task 8 field is optional when restoring a Task 7 state envelope."""
+    snapshot = make_snapshot()
+    state = StoredEngineeringState(
+        snapshot=snapshot,
+        registry_applied_generation=snapshot.generation_id,
+        pending_impact_plan=EngineeringImpactPlan(
+            snapshot.generation_id,
+            (
+                EngineeringEntityImpact(
+                    "weather-value",
+                    ("sensor.weather_value",),
+                    "removed",
+                    {"automation": ("automation.sample",)},
+                ),
+            ),
+        ),
+    )
+    encoded = stored_state_to_dict(state)
+    encoded["pending_impact_plan"]["impacts"][0].pop("target_area_ids")
+
+    restored = stored_state_from_dict(encoded, "entry-a")
+
+    assert restored.snapshot.generation_id == snapshot.generation_id
+    assert restored.pending_impact_plan.impacts[0].target_area_ids == ()
 
 
 def test_state_envelope_rejects_cross_entry_or_inconsistent_pending_plan():

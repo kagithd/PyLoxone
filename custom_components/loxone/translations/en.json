@@ -77,11 +77,43 @@
     }
   },
   "selector": {
+    "engineering_area_conflict_action": {
+      "options": {
+        "apply_loxone_room": "Apply Loxone room",
+        "keep_ha_room": "Keep HA room"
+      }
+    },
     "stale_device_grace_mode": {
       "options": {
         "observations": "Successful structure loads",
         "time": "Elapsed time",
         "combined": "Both limits"
+      }
+    }
+  },
+  "issues": {
+    "engineering_area_conflict": {
+      "title": "Choose the room for {device}",
+      "description": "Home Assistant currently places **{device}** in **{current_room}**, while Loxone requests **{desired_room}**. Review the current values and choose which assignment should be kept.",
+      "fix_flow": {
+        "abort": {
+          "conflict_changed": "The room assignment changed while this repair was open. Review the current repair and try again.",
+          "entry_unavailable": "The Loxone configuration entry is no longer available.",
+          "invalid_action": "The selected room action is not supported. Open the repair again and choose one of the available actions.",
+          "invalid_desired_area": "The requested Loxone room is no longer valid. Refresh the engineering inventory before trying again.",
+          "invalid_repair": "This repair does not match a current Loxone room conflict.",
+          "repair_unavailable": "The current room conflict could not be loaded. Try again after the integration has refreshed.",
+          "resolution_failed": "The room decision could not be completed. Review the current repair and try again."
+        },
+        "step": {
+          "init": {
+            "title": "Choose the room for {device}",
+            "description": "Current Home Assistant room: **{current_room}**\n\nRequested Loxone room: **{desired_room}**",
+            "data": {
+              "action": "Room assignment"
+            }
+          }
+        }
       }
     }
   },

@@ -8,6 +8,7 @@ import math
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import partial
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -55,6 +56,10 @@ from .engineering_topology import EngineeringSourceContext, resolve_engineering_
 from .miniserver import MiniServer
 from .pyloxone_api.connection import LoxoneConnection
 from .registry_maintenance import async_run_registry_maintenance
+from .repairs import (
+    async_remove_engineering_area_conflict_issues,
+    async_sync_engineering_area_conflict_issues,
+)
 
 _LOGGER = logging.getLogger(__name__)
 _SOURCE_MISMATCH = "engineering source does not match connected provider"
@@ -91,6 +96,13 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             update_method=None,  # Not polling!
         )
         self.config_entry = config_entry
+        config_entry.async_on_unload(
+            partial(
+                async_remove_engineering_area_conflict_issues,
+                hass,
+                config_entry.entry_id,
+            )
+        )
         self._username = config_entry.options[CONF_USERNAME]
         self._password = config_entry.options[CONF_PASSWORD]
         self._host = config_entry.options[CONF_HOST]
@@ -240,6 +252,10 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 if state.registry_applied_generation != generation:
                     raise EngineeringSnapshotError(_REGISTRY_PENDING)  # noqa: TRY301 -- checked inside recovery boundary.
                 self._engineering_registry_verified_generation = generation
+            await async_sync_engineering_area_conflict_issues(
+                self.hass,
+                self.config_entry.entry_id,
+            )
             if not startup:
                 self._signal_engineering_generation(generation)
             if startup or state.impact_published_generation != generation:

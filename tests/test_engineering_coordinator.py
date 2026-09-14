@@ -83,6 +83,15 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
         lambda hass, notification_id: notifications.pop(notification_id, None),
     )
     monkeypatch.setattr(module, "async_dispatcher_send", lambda *args: MemoryStore.events.append("signal"))
+    monkeypatch.setattr(
+        module,
+        "async_sync_engineering_area_conflict_issues",
+        lambda hass, entry_id: asyncio.sleep(
+            0,
+            result=MemoryStore.events.append(f"repairs:{entry_id}"),
+        ),
+        raising=False,
+    )
     monkeypatch.setattr("custom_components.loxone.config_impact.entity_sources", lambda hass: {})
     monkeypatch.setattr(
         "homeassistant.helpers.device_registry.async_entries_for_config_entry",
@@ -98,6 +107,7 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
         element("channel", "VoltageIn", parent_uuid="device", io_name="AI1", room=None),
     )
     calls = []
+    unload_callbacks = []
 
     async def download(self):
         calls.append("download")
@@ -115,7 +125,7 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
         hass = HomeAssistant(str(tmp_path))
         entry = SimpleNamespace(
             entry_id="entry-a",
-            async_on_unload=lambda callback: None,
+            async_on_unload=unload_callbacks.append,
             options={"username": "", "password": "", "host": "", "port": 0},
         )
         hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
@@ -128,8 +138,35 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
         return coordinator
 
     return SimpleNamespace(
-        make=make, registries=registries, calls=calls, notifications=notifications, inventory=inventory
+        make=make,
+        registries=registries,
+        calls=calls,
+        notifications=notifications,
+        inventory=inventory,
+        unload_callbacks=unload_callbacks,
     )
+
+
+def test_config_entry_unload_callback_removes_scoped_repairs(
+    transaction,
+    monkeypatch,
+):
+    """The native config-entry lifecycle cleans only its Repairs namespace."""
+    cleaned = []
+    monkeypatch.setattr(
+        module,
+        "async_remove_engineering_area_conflict_issues",
+        lambda hass, entry_id: cleaned.append((hass, entry_id)),
+    )
+
+    async def scenario():
+        coordinator = transaction.make()
+        transaction.unload_callbacks[-1]()
+        return coordinator
+
+    coordinator = asyncio.run(scenario())
+
+    assert cleaned == [(coordinator.hass, "entry-a")]
 
 
 @pytest.mark.parametrize(
@@ -157,6 +194,7 @@ def test_forced_refresh_and_unchanged_rebind(transaction, monkeypatch):
         assert (
             MemoryStore.events.index("candidate")
             < MemoryStore.events.index("applied")
+            < MemoryStore.events.index("repairs:entry-a")
             < MemoryStore.events.index("signal")
             < MemoryStore.events.index("published")
             < MemoryStore.events.index("maintenance")

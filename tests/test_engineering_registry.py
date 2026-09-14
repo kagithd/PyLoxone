@@ -259,6 +259,58 @@ def test_keep_retires_old_plan_and_pending_intent(registries, monkeypatch, room)
     asyncio.run(scenario())
 
 
+def test_keep_after_preexisting_room_change_refreshes_actionable_conflict(
+    registries,
+    monkeypatch,
+):
+    """Keep cannot loop forever on a token captured before another HA room move."""
+    _, snapshot, committed = _area_recovery_case(registries, monkeypatch)
+    living = registries.areas.async_get_or_create("Living Room")
+
+    async def scenario():
+        initial_plan = await async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            EngineeringRegistryMetadata.empty(),
+        )
+        await async_apply_engineering_registry_plan(
+            registries.hass,
+            initial_plan,
+            committed_state=committed,
+        )
+        office = registries.areas.async_get_area_by_name("Office")
+        registries.devices.async_update_device(
+            registries.device("serial-a:device").id,
+            area_id=office.id,
+        )
+        conflict = await _record_override(registries, snapshot, committed)
+        device = registries.device("serial-a:device")
+        registries.devices.async_update_device(device.id, area_id=living.id)
+        mutations = registries.devices.mutations
+
+        result = await engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            conflict.token,
+            "keep_ha_room",
+        )
+        loaded = await engineering_registry.async_load_engineering_area_conflicts(
+            registries.hass,
+            "entry-a",
+        )
+
+        assert not result.resolved
+        assert result.reason == "stale_conflict"
+        assert result.conflict == loaded[0]
+        assert result.conflict.token != conflict.token
+        assert result.conflict.current_area_id == living.id
+        assert result.conflict.current_area_name == "Living Room"
+        assert registries.devices.mutations == mutations
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("room", ["Workshop", None])
 def test_keep_write_serializes_old_refresh_and_rechecks_user_change(registries, monkeypatch, room):
     """A queued stale refresh cannot overwrite Keep or hide a new HA clear."""

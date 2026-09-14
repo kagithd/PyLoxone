@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,24 @@ REFERENCE_TYPES = (
     ItemType.PERSON,
 )
 _IMPACT_SCOPE_MISMATCH = "engineering impact evidence does not match its source generation"
+_SAFE_CONSUMER_ID = re.compile(r"^(?:automation|script|scene|group)\.[a-z0-9_]{1,128}$")
+
+
+def _area_target_references(
+    hass: HomeAssistant,
+    area_ids: set[str] | tuple[str, ...],
+) -> dict[str, set[str]]:
+    """Return only consumers that explicitly target one of the areas."""
+    automations = {entity_id for area_id in area_ids for entity_id in automation.automations_with_area(hass, area_id)}
+    scripts = {entity_id for area_id in area_ids for entity_id in script.scripts_with_area(hass, area_id)}
+    return {
+        kind: values
+        for kind, values in (
+            (ItemType.AUTOMATION.value, automations),
+            (ItemType.SCRIPT.value, scripts),
+        )
+        if values
+    }
 
 
 async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped, mutation-free applicability checks together.
@@ -53,19 +72,46 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
     # The diff validates entry/provider equality before old evidence is reused.
     changes = diff_engineering_snapshots(previous, candidate)
     registry = er.async_get(hass)
+    area_registry = ar.async_get(hass)
     targets: dict[str, set[str]] = {}
+    area_targets: dict[str, set[str]] = {}
+    area_references: dict[str, dict[str, set[str]]] = {}
     if previous_plan is not None:
         for impact in previous_plan.impacts:
+            if impact.target_area_ids:
+                current = _area_target_references(hass, impact.target_area_ids)
+                retained = {
+                    kind: values & set(impact.references.get(kind, ()))
+                    for kind, values in current.items()
+                    if values & set(impact.references.get(kind, ()))
+                }
+                if retained:
+                    area_targets.setdefault(impact.unique_id, set()).update(impact.target_area_ids)
+                    for kind, values in retained.items():
+                        area_references.setdefault(impact.unique_id, {}).setdefault(kind, set()).update(values)
             targets.setdefault(impact.unique_id, set()).update(
                 entity_id.partition(".")[0] for entity_id in impact.entity_ids
             )
     for change in (*changes.removed, *changes.metadata_changed):
-        if change in changes.metadata_changed and change.old_semantic_platform == change.new_semantic_platform:
-            continue
-        if change.old_semantic_platform is not None:
+        platform_changed = (
+            change not in changes.metadata_changed or change.old_semantic_platform != change.new_semantic_platform
+        )
+        if platform_changed and change.old_semantic_platform is not None:
             targets.setdefault(change.unique_id, set()).add(change.old_semantic_platform)
+        if change in changes.metadata_changed and change.old_room != change.new_room:
+            areas = {
+                area.id
+                for room_name in (change.old_room, change.new_room)
+                if room_name is not None
+                if (area := area_registry.async_get_area_by_name(room_name)) is not None
+            }
+            current = _area_target_references(hass, areas)
+            if current:
+                area_targets.setdefault(change.unique_id, set()).update(areas)
+                for kind, values in current.items():
+                    area_references.setdefault(change.unique_id, {}).setdefault(kind, set()).update(values)
     current_platforms = {row.node.element.uuid: row.semantic_platform for row in candidate.rows}
-    impacts = []
+    impacts: dict[str, EngineeringEntityImpact] = {}
     for unique_id, platforms in sorted(targets.items()):
         entity_ids = set()
         references: dict[str, set[str]] = {}
@@ -90,15 +136,29 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
                 for kind, values in current.items():
                     references.setdefault(kind, set()).update(values)
         if references:
-            impacts.append(
-                EngineeringEntityImpact(
-                    unique_id,
-                    tuple(sorted(entity_ids)),
-                    "platform_changed" if unique_id in current_platforms else "removed",
-                    {kind: tuple(sorted(values)) for kind, values in sorted(references.items())},
-                )
+            impacts[unique_id] = EngineeringEntityImpact(
+                unique_id,
+                tuple(sorted(entity_ids)),
+                "platform_changed" if unique_id in current_platforms else "removed",
+                {kind: tuple(sorted(values)) for kind, values in sorted(references.items())},
             )
-    return EngineeringImpactPlan(candidate.generation_id, tuple(impacts))
+    for unique_id, area_ids in sorted(area_targets.items()):
+        references = area_references[unique_id]
+        existing = impacts.get(unique_id)
+        merged_references = {kind: set(values) for kind, values in (existing.references.items() if existing else ())}
+        for kind, values in references.items():
+            merged_references.setdefault(kind, set()).update(values)
+        impacts[unique_id] = EngineeringEntityImpact(
+            unique_id,
+            existing.entity_ids if existing else (),
+            existing.change_kind if existing else "area_changed",
+            {kind: tuple(sorted(values)) for kind, values in sorted(merged_references.items())},
+            tuple(sorted(area_ids)),
+        )
+    return EngineeringImpactPlan(
+        candidate.generation_id,
+        tuple(impacts[unique_id] for unique_id in sorted(impacts)),
+    )
 
 
 async def async_publish_engineering_impact_plan(
@@ -117,6 +177,7 @@ async def async_publish_engineering_impact_plan(
         sources = entity_sources(hass)
         applicable = []
         for impact in impacts:
+            is_applicable = False
             for entity_id in impact.entity_ids:
                 entry = registry.async_get(entity_id)
                 if (
@@ -131,17 +192,39 @@ async def async_publish_engineering_impact_plan(
                     for kind in REFERENCE_TYPES
                     if kind != ItemType.PERSON
                 ):
-                    applicable.append(impact)
+                    is_applicable = True
                     break
+            if not is_applicable and impact.target_area_ids:
+                current = _area_target_references(hass, impact.target_area_ids)
+                is_applicable = any(values & set(impact.references.get(kind, ())) for kind, values in current.items())
+            if is_applicable:
+                applicable.append(impact)
         impacts = tuple(applicable)
     if not impacts:
         persistent_notification.async_dismiss(hass, notification_id)
         return
+    consumers = sorted(
+        {
+            entity_id
+            for impact in impacts
+            for kind, entity_ids in impact.references.items()
+            if kind in {"automation", "script", "scene", "group"}
+            for entity_id in entity_ids
+            if _SAFE_CONSUMER_ID.fullmatch(entity_id)
+        }
+    )
+    listed = consumers[:50]
+    consumer_summary = (
+        " Affected consumers: " + ", ".join(f"`{entity_id}`" for entity_id in listed) + "." if listed else ""
+    )
+    if len(consumers) > len(listed):
+        consumer_summary += f" {len(consumers) - len(listed)} additional consumer(s) omitted."
     persistent_notification.async_create(
         hass,
         (
             f"{len(impacts)} engineering channel change(s) affect Home Assistant consumers. "
             "Review the affected configuration; entity identifiers were not renamed."
+            f"{consumer_summary}"
         ),
         title="PyLoxone engineering configuration review",
         notification_id=notification_id,

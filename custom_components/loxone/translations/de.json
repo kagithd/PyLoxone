@@ -77,11 +77,43 @@
     }
   },
   "selector": {
+    "engineering_area_conflict_action": {
+      "options": {
+        "apply_loxone_room": "Loxone-Raum übernehmen",
+        "keep_ha_room": "HA-Raum beibehalten"
+      }
+    },
     "stale_device_grace_mode": {
       "options": {
         "observations": "Erfolgreiche Strukturabrufe",
         "time": "Verstrichene Zeit",
         "combined": "Beide Grenzen"
+      }
+    }
+  },
+  "issues": {
+    "engineering_area_conflict": {
+      "title": "Raum für {device} auswählen",
+      "description": "Home Assistant ordnet **{device}** derzeit **{current_room}** zu, während Loxone **{desired_room}** vorgibt. Prüfe die aktuellen Werte und wähle, welche Zuordnung beibehalten werden soll.",
+      "fix_flow": {
+        "abort": {
+          "conflict_changed": "Die Raumzuordnung hat sich geändert, während diese Reparatur geöffnet war. Prüfe die aktuelle Reparatur und versuche es erneut.",
+          "entry_unavailable": "Der Loxone-Konfigurationseintrag ist nicht mehr verfügbar.",
+          "invalid_action": "Die ausgewählte Raumaktion wird nicht unterstützt. Öffne die Reparatur erneut und wähle eine der verfügbaren Aktionen.",
+          "invalid_desired_area": "Der angeforderte Loxone-Raum ist nicht mehr gültig. Aktualisiere das Engineering-Inventar und versuche es erneut.",
+          "invalid_repair": "Diese Reparatur entspricht keinem aktuellen Loxone-Raumkonflikt.",
+          "repair_unavailable": "Der aktuelle Raumkonflikt konnte nicht geladen werden. Versuche es nach der nächsten Aktualisierung der Integration erneut.",
+          "resolution_failed": "Die Raumentscheidung konnte nicht abgeschlossen werden. Prüfe die aktuelle Reparatur und versuche es erneut."
+        },
+        "step": {
+          "init": {
+            "title": "Raum für {device} auswählen",
+            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nAngeforderter Loxone-Raum: **{desired_room}**",
+            "data": {
+              "action": "Raumzuordnung"
+            }
+          }
+        }
       }
     }
   },
