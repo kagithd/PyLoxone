@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
 
+import custom_components.loxone.engineering_registry as engineering_registry
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.coordinator import LoxoneCoordinator
 from custom_components.loxone.engineering_capabilities import (
@@ -301,6 +302,12 @@ def registries(monkeypatch) -> RegistryHarness:
     FakeIntentStore.fail_save = False
     FakeIntentStore.save_callbacks = []
     FakeIntentStore.save_count = 0
+    monkeypatch.setattr(
+        engineering_registry,
+        "_AREA_PROCESS_TOKEN",
+        "process-a",
+        raising=False,
+    )
     harness = RegistryHarness()
     monkeypatch.setattr(
         "custom_components.loxone.engineering_registry.ar.async_get",
@@ -970,11 +977,11 @@ def test_same_plan_replay_retains_managed_area_after_metadata_failure(registries
     assert FakeIntentStore.data
 
 
-def test_retained_area_evidence_recovers_delayed_ha_write_then_allows_next_move(
+def test_cross_process_old_area_is_preserved_for_explicit_resolution(
     registries,
     monkeypatch,
 ):
-    """A cold registry rollback is recovered before a later Loxone room move."""
+    """An older HA area after restart is never inferred to be a rollback."""
     office = registries.areas.async_get_or_create("Office")
     device = registries.devices.add(
         "serial-a:device",
@@ -1030,6 +1037,7 @@ def test_retained_area_evidence_recovers_delayed_ha_write_then_allows_next_move(
     assert FakeIntentStore.data
 
     device.area_id = office.id
+    monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "process-b")
     cold_plan = asyncio.run(
         async_plan_engineering_registry_sync(
             registries.hass,
@@ -1045,10 +1053,39 @@ def test_retained_area_evidence_recovers_delayed_ha_write_then_allows_next_move(
             committed_state=state,
         )
     )
-    assert device.area_id == workshop.id
-    assert recovered.metadata.managed_area_ids["serial-a:device"] == workshop.id
+    conflicts = asyncio.run(
+        engineering_registry.async_load_engineering_area_conflicts(
+            registries.hass,
+            "entry-a",
+        )
+    )
+    assert device.area_id == office.id
+    assert "serial-a:device" not in recovered.metadata.managed_area_ids
+    assert conflicts[0].reason == "area_assignment_unverified"
 
-    second_snapshot = make_snapshot(
+
+@pytest.mark.parametrize("override_room", ("Office", None))
+def test_same_process_unexplained_area_change_is_preserved_and_conflicted(
+    registries,
+    monkeypatch,
+    override_room,
+):
+    """A post-apply user change is never inferred from its area value."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
         inventory=inventory_of(
             element("ms", "LoxLIVE", title="Miniserver", room=None),
             element(
@@ -1056,29 +1093,486 @@ def test_retained_area_evidence_recovers_delayed_ha_write_then_allows_next_move(
                 "TreeDevice",
                 parent_uuid="ms",
                 title="ST-F07",
-                room="Living Room",
+                room="Workshop",
             ),
-        ),
-        read_sequence=2,
+        )
     )
-    second_plan = asyncio.run(
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+    state = StoredEngineeringState(snapshot=snapshot)
+    first_plan = asyncio.run(
         async_plan_engineering_registry_sync(
             registries.hass,
             "entry-a",
-            second_snapshot,
-            recovered.metadata,
+            snapshot,
+            previous,
         )
     )
-    second = asyncio.run(
+    first = asyncio.run(
         async_apply_engineering_registry_plan(
             registries.hass,
-            second_plan,
-            committed_state=StoredEngineeringState(snapshot=second_snapshot),
+            first_plan,
+            committed_state=state,
         )
     )
-    living = registries.areas.async_get_area_by_name("Living Room")
-    assert device.area_id == living.id
-    assert second.metadata.managed_area_ids["serial-a:device"] == living.id
+    override_area = registries.areas.async_get_or_create(override_room) if override_room is not None else None
+    device.area_id = override_area.id if override_area else None
+    mutations = registries.devices.mutations
+
+    replay_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            first.metadata,
+        )
+    )
+    replayed = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            replay_plan,
+            committed_state=state,
+        )
+    )
+    conflicts = asyncio.run(
+        engineering_registry.async_load_engineering_area_conflicts(
+            registries.hass,
+            "entry-a",
+        )
+    )
+
+    assert registries.devices.mutations == mutations
+    assert device.area_id == (override_area.id if override_area else None)
+    assert "serial-a:device" not in replayed.metadata.managed_area_ids
+    assert conflicts[0].reason == "area_user_override_preserved"
+
+
+@pytest.mark.parametrize("durable_room", ("Office", "Workshop"))
+@pytest.mark.parametrize("modified_at", (None, "same", "clock-rollback"))
+def test_rapid_generations_cold_old_area_pauses_without_timestamp_inference(
+    registries,
+    monkeypatch,
+    durable_room,
+    modified_at,
+):
+    """Cold older registry states become conflicts regardless of timestamps."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    device.modified_at = modified_at
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+
+    metadata = previous
+    snapshots = []
+    for sequence, room in enumerate(("Workshop", "Living Room"), 1):
+        snapshot = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", title="Miniserver", room=None),
+                element(
+                    "device",
+                    "TreeDevice",
+                    parent_uuid="ms",
+                    title="ST-F07",
+                    room=room,
+                ),
+            ),
+            read_sequence=sequence,
+        )
+        snapshots.append(snapshot)
+        plan = asyncio.run(
+            async_plan_engineering_registry_sync(
+                registries.hass,
+                "entry-a",
+                snapshot,
+                metadata,
+            )
+        )
+        applied = asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                plan,
+                committed_state=StoredEngineeringState(snapshot=snapshot),
+            )
+        )
+        metadata = applied.metadata
+    durable = registries.areas.async_get_area_by_name(durable_room)
+    device.area_id = durable.id
+    monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "process-b")
+    mutations = registries.devices.mutations
+
+    cold_plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshots[-1],
+            metadata,
+        )
+    )
+    result = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            cold_plan,
+            committed_state=StoredEngineeringState(snapshot=snapshots[-1]),
+        )
+    )
+    conflicts = asyncio.run(
+        engineering_registry.async_load_engineering_area_conflicts(
+            registries.hass,
+            "entry-a",
+        )
+    )
+
+    assert registries.devices.mutations == mutations
+    assert device.area_id == durable.id
+    assert "serial-a:device" not in result.metadata.managed_area_ids
+    assert conflicts[0].reason == "area_assignment_unverified"
+
+
+def test_managed_area_clear_is_explicit_then_allows_following_room_move(
+    registries,
+    monkeypatch,
+):
+    """A managed Office to None to Workshop sequence remains intentional."""
+    office = registries.areas.async_get_or_create("Office")
+    device = registries.devices.add(
+        "serial-a:device",
+        "entry-a",
+        area_id=office.id,
+        name="ST-F07",
+    )
+    metadata = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+
+    snapshots = []
+    for sequence, room in enumerate((None, "Workshop"), 1):
+        snapshot = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", title="Miniserver", room=None),
+                element(
+                    "device",
+                    "TreeDevice",
+                    parent_uuid="ms",
+                    title="ST-F07",
+                    room=room,
+                ),
+            ),
+            read_sequence=sequence,
+        )
+        snapshots.append(snapshot)
+        plan = asyncio.run(
+            async_plan_engineering_registry_sync(
+                registries.hass,
+                "entry-a",
+                snapshot,
+                metadata,
+            )
+        )
+        result = asyncio.run(
+            async_apply_engineering_registry_plan(
+                registries.hass,
+                plan,
+                committed_state=StoredEngineeringState(snapshot=snapshot),
+            )
+        )
+        metadata = result.metadata
+        if room is None:
+            assert device.area_id is None
+            assert "serial-a:device" not in metadata.managed_area_ids
+    workshop = registries.areas.async_get_area_by_name("Workshop")
+    assert device.area_id == workshop.id
+    assert metadata.managed_area_ids["serial-a:device"] == workshop.id
+
+
+def test_managed_clear_after_cold_ambiguous_restart_is_paused(registries, monkeypatch):
+    """A cold mismatch cannot authorize an otherwise managed clear."""
+    office = registries.areas.async_get_or_create("Office")
+    user_area = registries.areas.async_get_or_create("User Area")
+    device = registries.devices.add("serial-a:device", "entry-a", area_id=office.id, name="ST-F07")
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room=None,
+            ),
+        )
+    )
+    FakeIntentStore.data = {
+        "generation_id": "older",
+        "managed_baselines": [
+            {
+                "identifier": "serial-a:device",
+                "area_id": office.id,
+                "process_token": "process-a",
+            }
+        ],
+    }
+    device.area_id = user_area.id
+    monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "process-b")
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+
+    plan = asyncio.run(
+        async_plan_engineering_registry_sync(
+            registries.hass,
+            "entry-a",
+            snapshot,
+            previous,
+        )
+    )
+    result = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in result.metadata.managed_area_ids
+
+
+def test_user_change_during_metadata_await_relinquishes_area_authority(
+    registries,
+    monkeypatch,
+):
+    """The final awaited metadata publication cannot hide a user override."""
+    office = registries.areas.async_get_or_create("Office")
+    user_area = registries.areas.async_get_or_create("User Area")
+    device = registries.devices.add("serial-a:device", "entry-a", area_id=office.id, name="ST-F07")
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Office"}),
+        {"serial-a:device": office.id},
+        "old-generation",
+        "serial-a",
+    )
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+    saves = 0
+
+    async def save_metadata(hass, state):
+        nonlocal saves
+        del hass, state
+        saves += 1
+        if saves == 1:
+            device.area_id = user_area.id
+
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        save_metadata,
+    )
+    plan = asyncio.run(async_plan_engineering_registry_sync(registries.hass, "entry-a", snapshot, previous))
+    result = asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+    conflicts = asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))
+
+    assert saves == 2
+    assert device.area_id == user_area.id
+    assert "serial-a:device" not in result.metadata.managed_area_ids
+    assert conflicts[0].reason == "area_user_override_preserved"
+
+
+def test_area_conflict_round_trip_and_explicit_resolution_actions(
+    registries,
+    monkeypatch,
+):
+    """Task 8 gets immutable, stale-safe Apply and Keep resolution contracts."""
+    office = registries.areas.async_get_or_create("Office")
+    workshop = registries.areas.async_get_or_create("Workshop")
+    device = registries.devices.add("serial-a:device", "entry-a", area_id=office.id, name="ST-F07")
+    FakeIntentStore.data = {
+        "generation_id": "generation-a",
+        "managed_baselines": [
+            {
+                "identifier": "serial-a:device",
+                "area_id": workshop.id,
+                "process_token": "process-old",
+            }
+        ],
+    }
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Miniserver", room=None),
+            element(
+                "device",
+                "TreeDevice",
+                parent_uuid="ms",
+                title="ST-F07",
+                room="Workshop",
+            ),
+        )
+    )
+    previous = EngineeringRegistryMetadata(
+        frozenset({"serial-a:device"}),
+        frozenset({"Workshop"}),
+        {"serial-a:device": workshop.id},
+        "generation-a",
+        "serial-a",
+    )
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_store_engineering_state",
+        lambda hass, state: asyncio.sleep(0),
+    )
+    plan = asyncio.run(async_plan_engineering_registry_sync(registries.hass, "entry-a", snapshot, previous))
+    asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+    conflict = asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))[0]
+    assert conflict.device_identifier == "serial-a:device"
+    assert conflict.display_name == "ST-F07"
+    assert conflict.current_area_name == "Office"
+    assert conflict.desired_area_name == "Workshop"
+    with pytest.raises(FrozenInstanceError):
+        conflict.reason = "changed"
+
+    stale = asyncio.run(
+        engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            "not-the-current-token",
+            "apply_loxone_room",
+        )
+    )
+    assert not stale.resolved
+    assert device.area_id == office.id
+
+    user_area = registries.areas.async_get_or_create("User Area")
+    FakeIntentStore.save_callbacks = [
+        lambda: None,
+        lambda: setattr(device, "area_id", user_area.id),
+    ]
+    raced = asyncio.run(
+        engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            conflict.token,
+            "apply_loxone_room",
+        )
+    )
+    assert not raced.resolved
+    assert device.area_id == user_area.id
+    race_conflict = asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))[
+        0
+    ]
+    assert race_conflict.current_area_id == user_area.id
+
+    applied = asyncio.run(
+        engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            race_conflict.token,
+            "apply_loxone_room",
+        )
+    )
+    assert applied.resolved
+    assert device.area_id == workshop.id
+    assert not asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))
+    replay = asyncio.run(
+        engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            conflict.token,
+            "apply_loxone_room",
+        )
+    )
+    assert not replay.resolved
+
+    device.area_id = office.id
+    plan = asyncio.run(async_plan_engineering_registry_sync(registries.hass, "entry-a", snapshot, previous))
+    asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+    keep_conflict = asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))[
+        0
+    ]
+    kept = asyncio.run(
+        engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass,
+            "entry-a",
+            keep_conflict.token,
+            "keep_ha_room",
+        )
+    )
+    assert kept.resolved
+    mutations = registries.devices.mutations
+    replay_plan = asyncio.run(async_plan_engineering_registry_sync(registries.hass, "entry-a", snapshot, previous))
+    asyncio.run(
+        async_apply_engineering_registry_plan(
+            registries.hass,
+            replay_plan,
+            committed_state=StoredEngineeringState(snapshot=snapshot),
+        )
+    )
+    assert registries.devices.mutations == mutations
+    assert device.area_id == office.id
+    assert not asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))
 
 
 def test_retained_area_evidence_is_discarded_for_a_user_override(registries, monkeypatch):
@@ -1250,7 +1744,7 @@ def test_each_journal_save_rechecks_all_remaining_area_mutations(registries, mon
     assert not any(item["identifier"] in {"serial-a:device-a", "serial-a:device-b"} for item in retained)
 
 
-@pytest.mark.parametrize("user_room", ("User Area", "Workshop"))
+@pytest.mark.parametrize("user_room", ("User Area", "Workshop", None))
 def test_user_area_change_between_plan_and_apply_is_never_claimed(
     registries,
     monkeypatch,
@@ -1291,8 +1785,8 @@ def test_user_area_change_between_plan_and_apply_is_never_claimed(
             previous,
         )
     )
-    user_area = registries.areas.async_get_or_create(user_room)
-    device.area_id = user_area.id
+    user_area = registries.areas.async_get_or_create(user_room) if user_room is not None else None
+    device.area_id = user_area.id if user_area else None
     monkeypatch.setattr(
         "custom_components.loxone.engineering_registry.async_store_engineering_state",
         lambda hass, state: asyncio.sleep(0),
@@ -1306,8 +1800,10 @@ def test_user_area_change_between_plan_and_apply_is_never_claimed(
         )
     )
 
-    assert device.area_id == user_area.id
+    assert device.area_id == (user_area.id if user_area else None)
     assert "serial-a:device" not in result.metadata.managed_area_ids
+    conflicts = asyncio.run(engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a"))
+    assert conflicts[0].reason == "area_user_override_preserved"
 
 
 def test_user_area_change_before_cold_replan_cancels_persisted_intent(
