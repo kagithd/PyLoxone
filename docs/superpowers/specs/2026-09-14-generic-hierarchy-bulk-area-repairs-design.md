@@ -72,14 +72,14 @@ HA `via_device_id` mirrors only proven physical relationships. Display grouping 
 
 Physical placement is separate from HA area and bus topology. A bounded `InstallationPlacement` value may contain verified installation label, cabinet, row, and order/position fields.
 
-The implementation first inspects only engineering attribute names and scalar shapes from the authorized local configuration. Values are not logged or copied into fixtures. A field is admitted only after its exact source meaning is proven and it receives:
+Local schema inspection established the Loxone attributes `Installation`, `SwitchBoard`, `SwitchBoardRow`, and `SwitchBoardPos` without reading their values into development artifacts. They map to installation label, cabinet, row, and position. No other raw attribute is admitted. Each admitted field receives:
 
 - an explicit parser mapping;
 - length/type/range validation;
 - sensitivity inheritance;
 - snapshot codec and privacy tests.
 
-If no source field is proven, the placement line is omitted. XML document order, titles, parent keys, and arbitrary attributes must not be interpreted as cabinet order.
+Missing or invalid fields are omitted. XML document order, titles, parent keys, and arbitrary attributes must not be interpreted as cabinet order. Placement values may be returned only to an authenticated local HA administrator for this view. Diagnostics, Repairs issues, logs, notifications, tests, and committed fixtures expose only field presence or synthetic values.
 
 ## Bulk area repair
 
@@ -137,4 +137,4 @@ No dedicated tests are added for trivial getters, static translations, framework
 - Twenty room conflicts can be handled from one native flow without opening twenty issues.
 - Existing-area selection and explicit area creation work without name-based identity.
 - The hierarchy and repair paths remain generic across technical device types.
-- No sensitive or installation-identifying data appears in diagnostics, tests, commits, issue data, or public output.
+- No real installation-identifying data appears in diagnostics, tests, commits, issue data, logs, notifications, or public output; bounded placement values are visible only in the authenticated admin hierarchy view.
