@@ -35,8 +35,14 @@ from .engineering_capabilities import (
     SafeRuntimeBindingDescriptor,
 )
 from .engineering_changes import EngineeringEntityImpact, EngineeringImpactPlan
-from .engineering_config import EngineeringElement, EngineeringInventory
+from .engineering_config import (
+    EngineeringElement,
+    EngineeringInventory,
+    InstallationPlacement,
+    installation_placement_to_dict,
+)
 from .engineering_topology import (
+    PLACEMENT_NODE_KINDS,
     EngineeringSourceContext,
     NodeKind,
     ResolutionStatus,
@@ -357,6 +363,7 @@ def _projection_inventory(
                 suggested_platform=None,
                 attributes=MappingProxyType({}),
                 parent_key=element.parent_key,
+                placement=element.placement if not node.sensitive and node.kind in PLACEMENT_NODE_KINDS else None,
             )
         )
     return EngineeringInventory(
@@ -383,6 +390,7 @@ def _node_to_dict(node: ResolvedEngineeringNode) -> dict[str, Any]:
         # v3 extends the canonical digest only for known identity. Omitting
         # unknown UUIDs preserves v1/v2 generation and recovery cursor hashes.
         **({"room_uuid": element.room_uuid} if element.room_uuid is not None else {}),
+        **({"placement": installation_placement_to_dict(element.placement)} if element.placement is not None else {}),
         "key": element.key,
         "parent_key": element.parent_key,
         "uuid": element.uuid,
@@ -645,8 +653,29 @@ _ROW_FIELDS = frozenset(
 )
 
 
+def _placement_from_dict(value: Any, kind: NodeKind, *, sensitive: bool) -> InstallationPlacement:
+    """Reject noncanonical cached placement at the private storage boundary."""
+    data = _require_dict(
+        value,
+        "placement",
+        required=frozenset(),
+        allowed=frozenset({"installation", "switchboard", "row", "position"}),
+    )
+    if (
+        sensitive
+        or kind not in PLACEMENT_NODE_KINDS
+        or any(key in data and type(data[key]) is not int for key in ("row", "position"))
+    ):
+        raise EngineeringSnapshotError("placement carrier or numeric type is invalid")
+    placement = InstallationPlacement(**data)
+    canonical = installation_placement_to_dict(placement)
+    if not canonical or canonical != data:
+        raise EngineeringSnapshotError("placement fields are invalid")
+    return placement
+
+
 def _node_from_dict(value: Any) -> ResolvedEngineeringNode:
-    data = _require_dict(value, "nodes item", required=_NODE_FIELDS, allowed=_NODE_FIELDS | {"room_uuid"})
+    data = _require_dict(value, "nodes item", required=_NODE_FIELDS, allowed=_NODE_FIELDS | {"room_uuid", "placement"})
     key = _required_identifier(data["key"], "node key")
     uuid = _optional_identifier(data["uuid"], "node uuid")
     if uuid is None:
@@ -690,6 +719,7 @@ def _node_from_dict(value: Any) -> ResolvedEngineeringNode:
         suggested_platform=None,
         attributes=MappingProxyType({}),
         parent_key=parent_key,
+        placement=_placement_from_dict(data["placement"], kind, sensitive=sensitive) if "placement" in data else None,
     )
     return ResolvedEngineeringNode(
         element=element,

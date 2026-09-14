@@ -12,6 +12,81 @@ from custom_components.loxone.engineering_runtime import EngineeringRuntimeInven
 from tests.engineering_fixtures import element, inventory_of, make_snapshot, numeric_binding
 
 
+def test_placement_carriers_are_direct_safe_and_conflicts_are_order_independent():
+    """Carrier or inheritance leaks and duplicate-owner selection must fail."""
+    from dataclasses import replace
+    from custom_components.loxone.engineering_config import parse_engineering_xml
+    from custom_components.loxone.engineering_snapshot import snapshot_from_dict, snapshot_to_dict
+    from custom_components.loxone.engineering_snapshot import EngineeringSnapshotError
+    import pytest
+    from tests.engineering_fixtures import SYNTHETIC_PARSE_CONTEXT
+
+    parsed = parse_engineering_xml(
+        b"""<C Type="LoxLIVE" U="ms" Installation="Synthetic installation">
+      <C Type="LoxLink" U="link" SwitchBoard="Cabinet A">
+        <C Type="AirBaseExtension" U="bridge" SwitchBoardRow="2">
+          <C Type="FutureDevice" U="device" SwitchBoardPos="4">
+            <C Type="VoltageIn" U="input" Installation="Channel placement" />
+          </C>
+          <C Type="FutureDevice" U="empty" />
+        </C>
+      </C>
+      <C Type="WeatherServer" U="service" Installation="Service placement" />
+      <C Type="Page" U="page" Installation="Structural placement">
+        <C Type="FutureDevice" U="page-device" />
+      </C>
+      <C Type="User" U="protected" Installation="Protected placement">
+        <C Type="FutureDevice" U="hidden" SwitchBoard="Hidden placement" />
+      </C>
+    </C>""",
+        **SYNTHETIC_PARSE_CONTEXT,
+    )
+    snapshot = make_snapshot(inventory=parsed)
+    restored = snapshot_from_dict(snapshot_to_dict(snapshot))
+    payload = hierarchy_to_dict(build_engineering_hierarchy(restored))
+
+    def flatten(node):
+        return [node] + [
+            item for child in node.get("children", []) + node.get("sections", []) for item in flatten(child)
+        ]
+
+    nodes = {node["identifier"]: node for node in flatten(payload["root"])}
+    assert nodes["serial-a"]["placement"] == {"installation": "Synthetic installation"}
+    assert nodes["serial-a:link"]["placement"] == {"switchboard": "Cabinet A"}
+    assert nodes["serial-a:bridge"]["placement"] == {"row": 2}
+    assert nodes["serial-a:device"]["placement"] == {"position": 4}
+    assert all("placement" not in nodes[key] for key in ("serial-a:empty", "serial-a:page-device", "serial-a:service"))
+    assert all("placement" not in fn for node in nodes.values() for fn in node["functions"])
+    stored = json.dumps(snapshot_to_dict(snapshot))
+    for forbidden in (
+        "Channel placement",
+        "Service placement",
+        "Structural placement",
+        "Protected placement",
+        "Hidden placement",
+    ):
+        assert forbidden not in stored
+    assert all(node.element.placement is None for node in snapshot.nodes if node.sensitive)
+    for key in ("input", "service", "page", "protected", "hidden"):
+        tampered = snapshot_to_dict(snapshot)
+        next(node for node in tampered["nodes"] if node["key"] == key)["placement"] = {"row": 2}
+        with pytest.raises(EngineeringSnapshotError):
+            snapshot_from_dict(tampered)
+
+    # Duplicate provider records legitimately share a hierarchy identifier.
+    provider = next(item for item in parsed.elements if item.uuid == "ms")
+    alternate = replace(
+        provider,
+        key="ms-other",
+        uuid="ms-other",
+        placement=replace(provider.placement, installation="Synthetic alternate"),
+    )
+    for providers in ((provider, alternate), (alternate, provider)):
+        duplicates = make_snapshot(inventory=inventory_of(*providers))
+        projected = hierarchy_to_dict(build_engineering_hierarchy(duplicates))
+        assert "placement" not in json.dumps(projected)
+
+
 def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
     """Wrong ownership, status mapping, or sensitive disclosure must fail together."""
     snapshot = make_snapshot(

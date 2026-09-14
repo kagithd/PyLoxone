@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from .engineering_capabilities import CapabilityState, ExposureStatus
-from .engineering_topology import NodeKind
+from .engineering_config import InstallationPlacement, installation_placement_to_dict
+from .engineering_topology import PLACEMENT_NODE_KINDS, NodeKind
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -58,6 +59,7 @@ class HierarchyNode:
     functions: tuple[HierarchyFunction, ...]
     children: tuple[HierarchyNode, ...]
     protected_count: int = 0
+    placement: InstallationPlacement | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +93,7 @@ class _MutableHierarchyNode:
     functions: list[HierarchyFunction] = field(default_factory=list)
     children: list[_MutableHierarchyNode] = field(default_factory=list)
     protected_count: int = 0
+    placement: InstallationPlacement | None = None
 
 
 def _role(kind: NodeKind) -> HierarchyRole | None:
@@ -143,6 +146,7 @@ def _freeze(node: _MutableHierarchyNode) -> HierarchyNode:
         functions=tuple(sorted(node.functions, key=_sort_key)),
         children=tuple(_freeze(child) for child in sorted(node.children, key=_sort_key)),
         protected_count=node.protected_count,
+        placement=node.placement,
     )
 
 
@@ -154,6 +158,13 @@ def _build_nodes(
 ]:
     by_key: dict[str, _MutableHierarchyNode] = {}
     by_identifier: dict[str, _MutableHierarchyNode] = {}
+    placements: dict[str, set[InstallationPlacement]] = {}
+    for row in rows:
+        node = row.node
+        if node.sensitive or node.kind not in PLACEMENT_NODE_KINDS or node.device_identifier is None:
+            continue
+        if accepted := installation_placement_to_dict(node.element.placement):
+            placements.setdefault(node.device_identifier, set()).add(InstallationPlacement(**accepted))
     for row in rows:
         node = row.node
         role = _role(node.kind)
@@ -166,6 +177,7 @@ def _build_nodes(
             label=node.element.title or node.element.io_name,
             technical_type=node.element.loxone_type,
             bus_kind=node.bus_kind,
+            placement=next(iter(placements[identifier])) if len(placements.get(identifier, ())) == 1 else None,
         )
         by_key[node.element.key] = builder
         by_identifier[identifier] = builder
@@ -325,6 +337,8 @@ def _node_to_dict(node: HierarchyNode, *, root: bool = False) -> dict[str, objec
         result["sections"] = [_node_to_dict(child) for child in sections]
     result["children"] = [_node_to_dict(child) for child in children]
     result["protected_count"] = node.protected_count
+    if placement := installation_placement_to_dict(node.placement):
+        result["placement"] = placement
     return result
 
 

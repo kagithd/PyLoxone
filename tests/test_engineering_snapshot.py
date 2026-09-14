@@ -67,6 +67,62 @@ from tests.engineering_fixtures import (
 )
 
 
+def test_placement_roundtrip_digest_and_operational_privacy(monkeypatch):
+    """Placement must change private integrity, never automation semantics."""
+    from custom_components.loxone.engineering_changes import diff_engineering_snapshots
+    from custom_components.loxone import config_impact
+    from custom_components.loxone.diagnostics import async_get_config_entry_diagnostics
+    from types import SimpleNamespace
+    from tests.engineering_fixtures import SYNTHETIC_PARSE_CONTEXT
+
+    snapshots = []
+    for cabinet in ("Cabinet A", "Cabinet B"):
+        parsed = parse_engineering_xml(
+            (
+                f'<C Type="LoxLIVE" U="ms" Installation="Synthetic installation">'
+                f'<C Type="FutureDevice" U="device" SwitchBoard="{cabinet}" '
+                'SwitchBoardRow="0" SwitchBoardPos="4" /></C>'
+            ).encode(),
+            **SYNTHETIC_PARSE_CONTEXT,
+        )
+        candidate = make_snapshot(inventory=parsed)
+        payload = snapshot_to_dict(candidate)
+        assert payload["nodes"][0]["placement"] == {"installation": "Synthetic installation"}
+        assert payload["nodes"][1]["placement"] == {"switchboard": cabinet, "row": 0, "position": 4}
+        restored = snapshot_from_dict(payload)
+        assert snapshot_to_dict(restored) == payload
+        assert all(not node.element.attributes for node in restored.nodes)
+        assert "placement" not in json.dumps([node.element.as_public_dict() for node in restored.nodes])
+        snapshots.append(restored)
+    assert snapshots[0].safe_content_digest != snapshots[1].safe_content_digest
+    assert snapshots[0].generation_id != snapshots[1].generation_id
+    assert diff_engineering_snapshots(*snapshots).is_empty
+    entry = SimpleNamespace(entry_id="entry-a")
+    coordinator = SimpleNamespace(engineering_snapshot=snapshots[1], engineering_runtime=None)
+    hass = SimpleNamespace(data={"loxone": {"entry-a": coordinator}})
+    diagnostics = asyncio.run(async_get_config_entry_diagnostics(hass, entry))
+    assert "Cabinet" not in json.dumps(diagnostics)
+    assert "placement" not in json.dumps(diagnostics)
+    monkeypatch.setattr(config_impact.er, "async_get", lambda _hass: object())
+    impact = asyncio.run(config_impact.async_find_engineering_change_impacts(hass, entry, *snapshots))
+    assert impact.impacts == ()
+    legacy = snapshot_to_dict(make_snapshot())
+    assert all("placement" not in item for item in legacy["nodes"])
+    assert snapshot_to_dict(snapshot_from_dict(legacy)) == legacy
+    for malformed in (
+        {"row": True},
+        {"position": 2.5},
+        {"row": "2"},
+        {"row": 1000},
+        {"switchboard": "x" * 81},
+        {"cabinet": "Cabinet C"},
+    ):
+        tampered = json.loads(json.dumps(payload))
+        tampered["nodes"][1]["placement"] = malformed
+        with pytest.raises(EngineeringSnapshotError):
+            snapshot_from_dict(tampered)
+
+
 def test_room_identity_survives_safe_projection_and_rename():
     """Dropping opaque room identity would turn a rename into a new mapping."""
     for name in ("Workshop", "Studio"):

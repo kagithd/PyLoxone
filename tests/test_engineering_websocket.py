@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
@@ -11,6 +12,7 @@ from homeassistant.const import STATE_UNAVAILABLE
 from homeassistant.exceptions import Unauthorized
 
 from custom_components.loxone.const import DOMAIN
+from custom_components.loxone.engineering_config import InstallationPlacement
 from custom_components.loxone.engineering_runtime import EngineeringRuntimeInventory
 from custom_components.loxone.engineering_websocket import (
     async_activate_engineering_view,
@@ -122,14 +124,18 @@ def test_websocket_boundaries_reject_non_admin(handler):
         )
 
 
-def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monkeypatch):
+@pytest.mark.parametrize("with_placement", [False, True])
+def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monkeypatch, with_placement):
     """Wrong owner/status logic or an added disclosure field must fail together."""
     from custom_components.loxone import engineering_websocket as module
 
     snapshot = make_snapshot(
         inventory=inventory_of(
             element("ms", "LoxLIVE", title="Provider", room=None),
-            element("device", "TreeDevice", parent_uuid="ms", title="Endpoint"),
+            replace(
+                element("device", "TreeDevice", parent_uuid="ms", title="Endpoint"),
+                placement=InstallationPlacement(switchboard="Cabinet A", row=2) if with_placement else None,
+            ),
             element("active", "VoltageIn", parent_uuid="device", title="Active", io_name="AI1"),
             element("disabled", "VoltageIn", parent_uuid="device", title="Disabled", io_name="AI2"),
             element("unavailable", "VoltageIn", parent_uuid="device", title="Unavailable", io_name="AI3"),
@@ -291,6 +297,8 @@ def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monke
         "foreign": ("prepared", None),
         "unavailable": ("unavailable", "sensor.unavailable"),
     }
+    if with_placement:
+        assert endpoint["placement"] == {"switchboard": "Cabinet A", "row": 2}
     assert set(endpoint) == {
         "identifier",
         "role",
@@ -301,7 +309,7 @@ def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monke
         "children",
         "protected_count",
         "device_id",
-    }
+    } | ({"placement"} if with_placement else set())
     assert all(
         set(item) == {"key", "label", "technical_type", "status", "reason", "entity_id"} for item in functions.values()
     )

@@ -23,6 +23,43 @@ _TEST_XML_LIMIT = 32
 _DECODE_LIMIT_ERROR = "Decompressed XML exceeds the safety limit"
 
 
+def test_direct_placement_parser_uses_exact_fields_and_omits_invalid_siblings():
+    """Aliases, coercions, and malformed siblings must not supply placement."""
+    from dataclasses import asdict
+    from tests.engineering_fixtures import SYNTHETIC_PARSE_CONTEXT
+
+    parsed = parse_engineering_xml(
+        (
+            '<C Type="LoxLIVE" U="ms" Installation=" Synthetic installation " '
+            'SwitchBoard="Cabinet A" SwitchBoardRow="002" SwitchBoardPos="999">'
+            '<C Type="FutureDevice" U="device" Installation="' + "x" * 81 + '" '
+            'SwitchBoard="Cabinet B" SwitchBoardRow=" 2 " SwitchBoardPos="4" />'
+            '<C Type="FutureDevice" U="alias" installation="Wrong" Switchboard="Wrong" '
+            'Row="2" Position="4" />'
+            '<C Type="FutureDevice" U="invalid" Installation="Bad&#10;text" '
+            'SwitchBoardRow="２" SwitchBoardPos="+1" />'
+            "</C>"
+        ).encode(),
+        **SYNTHETIC_PARSE_CONTEXT,
+    )
+    by_id = {item.uuid: item for item in parsed.elements}
+    assert asdict(by_id["ms"].placement) == {
+        "installation": "Synthetic installation",
+        "switchboard": "Cabinet A",
+        "row": 2,
+        "position": 999,
+    }
+    assert asdict(by_id["device"].placement) == {
+        "installation": None,
+        "switchboard": "Cabinet B",
+        "row": None,
+        "position": 4,
+    }
+    assert by_id["alias"].placement is None
+    assert by_id["invalid"].placement is None
+    assert "placement" not in by_id["ms"].as_public_dict()
+
+
 def _literal_loxcc(payload: bytes, *, declared_size: int | None = None) -> bytes:
     """Create one standards-compliant literal-only LoxCC test block."""
     length = len(payload)

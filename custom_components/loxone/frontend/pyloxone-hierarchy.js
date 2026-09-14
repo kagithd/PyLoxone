@@ -230,10 +230,28 @@ class PyLoxoneHierarchy extends HTMLElement {
     }
     details.append(summary);
     if (node.technical_type) details.append(this._element("div", node.technical_type, "meta"));
+    const placement = this._placementText(node.placement);
+    if (placement) details.append(this._element("div", placement, "meta"));
     for (const item of node.functions || []) details.append(this._renderFunction(item));
     for (const section of node.sections || []) details.append(this._renderNode(section));
     for (const child of node.children || []) details.append(this._renderNode(child));
     return details;
+  }
+
+  _placementText(placement) {
+    if (!placement || typeof placement !== "object") return "";
+    const values = [];
+    for (const [key, label] of [["installation", "Installation"], ["switchboard", "Switchboard"]]) {
+      const value = placement[key];
+      if (typeof value === "string" && value.trim() && [...value.trim()].length <= 80 && !/\p{C}/u.test(value)) {
+        values.push(`${label}: ${value.trim()}`);
+      }
+    }
+    for (const [key, label] of [["row", "Row"], ["position", "Position"]]) {
+      const value = placement[key];
+      if (Number.isInteger(value) && value >= 0 && value <= 999) values.push(`${label}: ${value}`);
+    }
+    return values.join(" · ");
   }
 
   _renderFunction(item) {

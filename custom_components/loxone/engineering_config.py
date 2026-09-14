@@ -7,6 +7,7 @@ import io
 import re
 import ssl
 import struct
+import unicodedata
 import zipfile
 import zlib
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ LOXCC_MAGIC = 0xAABBCCEE
 MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
 MAX_LOXCC_BYTES = 32 * 1024 * 1024
 MAX_XML_BYTES = 64 * 1024 * 1024
+_MAX_PLACEMENT_TEXT_LENGTH = 80
 _BACKUP_NAME = re.compile(r"^sps_(?P<version>\d+)_(?P<timestamp>\d{14})\.zip$", re.IGNORECASE)
 _STRUCTURAL_TYPES = {
     "Document",
@@ -39,6 +41,74 @@ class EngineeringConfigError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class InstallationPlacement:
+    """Bounded direct installation metadata, independent of rooms and topology."""
+
+    installation: str | None = None
+    switchboard: str | None = None
+    row: int | None = None
+    position: int | None = None
+
+
+def validate_installation_placement(
+    *,
+    installation: object = None,
+    switchboard: object = None,
+    row: object = None,
+    position: object = None,
+) -> InstallationPlacement | None:
+    """Accept exact source values independently, without coercion or diagnostics."""
+
+    def text(value: object) -> str | None:
+        if not isinstance(value, str) or any(unicodedata.category(char).startswith("C") for char in value):
+            return None
+        normalized = value.strip()
+        return normalized if normalized and len(normalized) <= _MAX_PLACEMENT_TEXT_LENGTH else None
+
+    def number(value: object) -> int | None:
+        return int(value) if isinstance(value, str) and re.fullmatch(r"[0-9]{1,3}", value) else None
+
+    placement = InstallationPlacement(text(installation), text(switchboard), number(row), number(position))
+    return (
+        placement
+        if any(
+            value is not None
+            for value in (
+                placement.installation,
+                placement.switchboard,
+                placement.row,
+                placement.position,
+            )
+        )
+        else None
+    )
+
+
+def installation_placement_to_dict(placement: InstallationPlacement | None) -> dict[str, str | int]:
+    """Project only validated typed fields; absent or malformed fields are omitted."""
+    if not isinstance(placement, InstallationPlacement):
+        return {}
+    checked = validate_installation_placement(
+        installation=placement.installation,
+        switchboard=placement.switchboard,
+        row=str(placement.row) if type(placement.row) is int else None,
+        position=str(placement.position) if type(placement.position) is int else None,
+    )
+    if checked is None:
+        return {}
+    return {
+        key: value
+        for key, value in (
+            ("installation", checked.installation),
+            ("switchboard", checked.switchboard),
+            ("row", checked.row),
+            ("position", checked.position),
+        )
+        if value is not None
+    }
+
+
+@dataclass(frozen=True, slots=True)
 class EngineeringElement:
     """A generic Loxone XML element prepared for later entity onboarding."""
 
@@ -56,6 +126,7 @@ class EngineeringElement:
     suggested_platform: str | None
     attributes: dict[str, str] = field(repr=False)
     parent_key: str | None = None
+    placement: InstallationPlacement | None = None
 
     def as_public_dict(self) -> dict[str, Any]:
         """Return identity and topology data without arbitrary config values."""
@@ -320,6 +391,12 @@ def parse_engineering_xml(
                 suggested_platform=_suggest_platform(loxone_type, io_name),
                 attributes=dict(node.attrib),
                 parent_key=parent_key,
+                placement=validate_installation_placement(
+                    installation=node.attrib.get("Installation"),
+                    switchboard=node.attrib.get("SwitchBoard"),
+                    row=node.attrib.get("SwitchBoardRow"),
+                    position=node.attrib.get("SwitchBoardPos"),
+                ),
             )
         )
 

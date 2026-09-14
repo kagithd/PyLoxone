@@ -179,6 +179,64 @@ def _rows(form, key):
     return next(marker.default() for marker in form["data_schema"].schema if marker.schema == key)
 
 
+def test_placement_rows_join_current_snapshot_without_becoming_authority(monkeypatch):
+    """Stale placement, provider leakage, or using descriptions as intent fails."""
+    from custom_components.loxone.engineering_config import parse_engineering_xml
+    from tests.engineering_fixtures import SYNTHETIC_PARSE_CONTEXT, make_snapshot
+
+    conflict = replace(_conflict(), device_identifier="serial-a:device")
+    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
+    coordinator = harness.hass.data[DOMAIN]["entry-a"]
+    coordinator.miniserver.serial = "serial-a"
+
+    def snapshot(cabinet):
+        return make_snapshot(
+            inventory=parse_engineering_xml(
+                (
+                    f'<C Type="LoxLIVE" U="ms"><C Type="FutureDevice" U="device" '
+                    f'SwitchBoard="{cabinet}" SwitchBoardRow="2" /></C>'
+                ).encode(),
+                **SYNTHETIC_PARSE_CONTEXT,
+            )
+        )
+
+    coordinator.engineering_snapshot = snapshot("Cabinet A")
+    harness.module.async_register_engineering_area_conflict_reconciler(
+        harness.hass,
+        coordinator.config_entry,
+        coordinator,
+    )
+
+    async def scenario():
+        flow = await _open(harness)
+        rooms = await flow.async_step_init()
+        description = _rows(rooms, "rooms")[0]["description"]
+        assert "Cabinet A" in description and len(description) <= 200
+        issue = next(iter(harness.registry.issues.values()))
+        assert "Cabinet" not in repr(issue.data) + repr(issue.translation_placeholders) + repr(conflict)
+        coordinator.engineering_snapshot = snapshot("Cabinet B")
+        devices = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        description = _rows(devices, "devices")[0]["description"]
+        assert "Cabinet B" in description and "Cabinet A" not in description and len(description) <= 200
+        assert "Cabinet" not in repr(flow._decisions)
+        coordinator.engineering_snapshot = snapshot("Cabinet C")
+        retry = flow._form("devices", (conflict,), {"devices": _rows(devices, "devices")}, "invalid_target")
+        assert "Cabinet C" in _rows(retry, "devices")[0]["description"]
+        assert "Cabinet B" not in _rows(retry, "devices")[0]["description"]
+        coordinator.engineering_snapshot = snapshot("https://example.invalid")
+        bounded = flow._form("devices", (conflict,))
+        assert "example.invalid" not in _rows(bounded, "devices")[0]["description"]
+        coordinator.engineering_snapshot = None
+        missing = flow._form("devices", (conflict,))
+        assert "Cabinet" not in _rows(missing, "devices")[0]["description"]
+        coordinator.engineering_snapshot = snapshot("Cabinet C")
+        coordinator.miniserver.serial = "serial-other"
+        stale = flow._form("devices", (conflict,))
+        assert "Cabinet" not in _rows(stale, "devices")[0]["description"]
+
+    asyncio.run(scenario())
+
+
 def test_aggregate_twenty_conflicts_privacy_and_zero(monkeypatch):
     conflicts = [
         replace(_conflict(token=f"{index:064x}"), device_identifier=f"serial-entry-a:device-{index}")

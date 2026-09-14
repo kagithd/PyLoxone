@@ -28,6 +28,9 @@ class ResolutionStatus(StrEnum):
     UNRESOLVED = "unresolved"
 
 
+PLACEMENT_NODE_KINDS = frozenset({NodeKind.MINISERVER, NodeKind.BUS, NodeKind.BRIDGE, NodeKind.PHYSICAL_DEVICE})
+
+
 @dataclass(frozen=True, slots=True)
 class EngineeringSourceContext:
     """Immutable identity and revision metadata for one engineering source."""
@@ -256,10 +259,12 @@ class OwnerResolver:
         uuidless_service_counts: dict[str, int],
     ) -> ResolvedEngineeringNode:
         chain, failure = self._ancestry(item, elements_by_key)
+        kind = kinds[item.key]
         sensitive = failure is not None or any(self._is_sensitive(ancestor) for ancestor in chain)
         public_item = self._sanitize(item) if sensitive else item
+        if kind not in PLACEMENT_NODE_KINDS:
+            public_item = replace(public_item, placement=None)
         path = () if sensitive else tuple(self._presentation_name(ancestor) for ancestor in reversed(chain))
-        kind = kinds[item.key]
         if failure is not None:
             return self._unresolved(public_item, kind, path, failure, sensitive)
 
@@ -494,6 +499,7 @@ class OwnerResolver:
             room=None,
             category=None,
             attributes={},
+            placement=None,
         )
 
     @staticmethod

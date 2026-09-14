@@ -24,6 +24,8 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import DOMAIN
+from .engineering_config import installation_placement_to_dict
+from .engineering_hierarchy import build_engineering_hierarchy
 from .engineering_registry import (
     EngineeringAreaConflict,
     async_load_engineering_area_conflicts,
@@ -31,9 +33,11 @@ from .engineering_registry import (
 )
 from .engineering_snapshot import (
     EngineeringAreaDecision,
+    EngineeringSnapshot,
     EngineeringSnapshotError,
     normalize_engineering_area_decision,
     validate_engineering_presentation,
+    validate_engineering_snapshot,
 )
 
 if TYPE_CHECKING:
@@ -468,6 +472,40 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         self._room_input: dict[str, Any] | None = None
         self._decisions: tuple[EngineeringAreaDecision, ...] | None = None
 
+    def _placement_descriptions(self) -> dict[str, str]:
+        """Join only the current validated snapshot, never persisted conflict data."""
+        active = self._active
+        if active is None:
+            return {}
+        entry_id = active.config_entry.entry_id
+        if not _binding_is_current(self.hass, entry_id, active):
+            return {}
+        snapshot = getattr(active.coordinator, "engineering_snapshot", None)
+        if (
+            not isinstance(snapshot, EngineeringSnapshot)
+            or snapshot.source.entry_id != entry_id
+            or snapshot.source.provider_identifier != active.provider_identifier
+        ):
+            return {}
+        try:
+            validate_engineering_snapshot(snapshot)
+            hierarchy = build_engineering_hierarchy(snapshot)
+        except (EngineeringSnapshotError, ValueError):
+            return {}
+        summaries = {}
+        pending = [hierarchy.root]
+        while pending:
+            node = pending.pop()
+            pending.extend(node.children)
+            placement = installation_placement_to_dict(node.placement)
+            if placement:
+                summary = " · ".join(
+                    f"{key}: {value}" for key, value in placement.items() if _safe_text(str(value)) is not None
+                )[:200]
+                if summary:
+                    summaries[node.identifier] = summary
+        return summaries
+
     def _form(
         self,
         step: str,
@@ -476,6 +514,13 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         error: str | None = None,
     ) -> RepairsFlowResult:
         schema = {}
+        placements = self._placement_descriptions()
+
+        def description(conflict: EngineeringAreaConflict) -> str:
+            reference = _device_reference(conflict)
+            placement = placements.get(conflict.device_identifier)
+            return (reference + " · " + placement)[:200] if placement else reference
+
         if step == "rooms":
             row_sets = {
                 "rooms": [
@@ -484,7 +529,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                         "description": (
                             (_safe_text(members[0].desired_area_name) or "#" + sha256(room.encode()).hexdigest()[:8])
                             + " · "
-                            + ", ".join(_device_reference(item) for item in members[:3])
+                            + ", ".join(description(item) for item in members[:3])
                         )[:200],
                         "action": "keep_ha",
                     }
@@ -496,7 +541,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 field: [
                     {
                         "device_key": _device_key(item),
-                        "description": _device_reference(item),
+                        "description": description(item),
                         "action": "apply_group" if item.room_uuid else "keep_ha",
                     }
                     for item in sorted(conflicts, key=lambda item: item.token)
@@ -527,6 +572,18 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             if step == "rooms":
                 fields.update({"area_id": {"selector": AreaSelector()}, "area_name": {"selector": TextSelector()}})
             values = user_input.get(field, rows) if isinstance(user_input, dict) else rows
+            if isinstance(values, list):
+                identity = "group_key" if step == "rooms" else "device_key"
+                descriptions = {row[identity]: row["description"] for row in rows}
+                values = [
+                    {**item, "description": descriptions[item[identity]]}
+                    if isinstance(item, dict)
+                    and "description" in item
+                    and isinstance(item.get(identity), str)
+                    and item[identity] in descriptions
+                    else item
+                    for item in values
+                ]
             schema[vol.Required(field, default=values)] = ObjectSelector(
                 ObjectSelectorConfig(
                     multiple=True,
