@@ -8,7 +8,6 @@ import math
 from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
-from functools import partial
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -57,7 +56,7 @@ from .miniserver import MiniServer
 from .pyloxone_api.connection import LoxoneConnection
 from .registry_maintenance import async_run_registry_maintenance
 from .repairs import (
-    async_remove_engineering_area_conflict_issues,
+    async_register_engineering_area_conflict_reconciler,
     async_sync_engineering_area_conflict_issues,
 )
 
@@ -97,10 +96,10 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         )
         self.config_entry = config_entry
         config_entry.async_on_unload(
-            partial(
-                async_remove_engineering_area_conflict_issues,
+            async_register_engineering_area_conflict_reconciler(
                 hass,
-                config_entry.entry_id,
+                config_entry,
+                self,
             )
         )
         self._username = config_entry.options[CONF_USERNAME]
@@ -255,6 +254,8 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             await async_sync_engineering_area_conflict_issues(
                 self.hass,
                 self.config_entry.entry_id,
+                config_entry=self.config_entry,
+                coordinator=self,
             )
             if not startup:
                 self._signal_engineering_generation(generation)
@@ -374,13 +375,19 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 )
             )
             # Planning and consumer discovery must both finish before commit.
-            await async_plan_engineering_registry_sync(self.hass, self.config_entry.entry_id, candidate, metadata)
+            registry_plan = await async_plan_engineering_registry_sync(
+                self.hass,
+                self.config_entry.entry_id,
+                candidate,
+                metadata,
+            )
             impacts = await async_find_engineering_change_impacts(
                 self.hass,
                 self.config_entry,
                 previous,
                 candidate,
                 state.pending_impact_plan,
+                registry_plan=registry_plan,
             )
             committed = StoredEngineeringState(
                 snapshot=candidate,

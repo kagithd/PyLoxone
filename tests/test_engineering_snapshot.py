@@ -248,6 +248,9 @@ def test_state_envelope_round_trip_is_immutable_and_generation_consistent():
                 "platform_changed",
                 {"automation": ("automation.sample",)},
                 ("area-1", "area-2"),
+                "area-1",
+                "area-2",
+                "Workshop",
             ),
         ),
     )
@@ -268,6 +271,9 @@ def test_state_envelope_round_trip_is_immutable_and_generation_consistent():
         "area-1",
         "area-2",
     )
+    assert restored.pending_impact_plan.impacts[0].area_from_id == "area-1"
+    assert restored.pending_impact_plan.impacts[0].area_to_id == "area-2"
+    assert restored.pending_impact_plan.impacts[0].area_to_name == "Workshop"
     with pytest.raises(TypeError):
         restored.managed_area_ids["new"] = "area-2"
 
@@ -319,6 +325,66 @@ def test_prior_impact_payload_without_area_targets_remains_loadable():
 
     assert restored.snapshot.generation_id == snapshot.generation_id
     assert restored.pending_impact_plan.impacts[0].target_area_ids == ()
+    assert restored.pending_impact_plan.impacts[0].area_from_id is None
+    assert restored.pending_impact_plan.impacts[0].area_to_id is None
+    assert restored.pending_impact_plan.impacts[0].area_to_name is None
+
+
+def test_prior_area_impact_payload_without_owner_replay_evidence_is_dropped():
+    """Legacy room metadata evidence cannot be replayed as an owner transition."""
+    snapshot = make_snapshot()
+    state = StoredEngineeringState(
+        snapshot=snapshot,
+        pending_impact_plan=EngineeringImpactPlan(
+            snapshot.generation_id,
+            (
+                EngineeringEntityImpact(
+                    "weather-value",
+                    (),
+                    "area_changed",
+                    {"automation": ("automation.sample",)},
+                    ("area-1",),
+                ),
+            ),
+        ),
+    )
+    encoded = stored_state_to_dict(state)
+    impact = encoded["pending_impact_plan"]["impacts"][0]
+    impact.pop("area_from_id", None)
+    impact.pop("area_to_id", None)
+    impact.pop("area_to_name", None)
+
+    restored = stored_state_from_dict(encoded, "entry-a")
+
+    assert restored.pending_impact_plan.impacts == ()
+
+
+def test_impact_replay_fields_do_not_change_snapshot_generation_hash():
+    """Private recovery evidence is outside immutable snapshot generation identity."""
+    snapshot = make_snapshot()
+    generation = snapshot.generation_id
+    plan = EngineeringImpactPlan(
+        generation,
+        (
+            EngineeringEntityImpact(
+                "serial-a:device",
+                (),
+                "area_changed",
+                {"automation": ("automation.sample",)},
+                ("area-1",),
+                "area-1",
+                None,
+                "Workshop",
+            ),
+        ),
+    )
+
+    restored = stored_state_from_dict(
+        stored_state_to_dict(StoredEngineeringState(snapshot=snapshot, pending_impact_plan=plan)),
+        "entry-a",
+    )
+
+    assert restored.snapshot.generation_id == generation
 
 
 def test_state_envelope_rejects_cross_entry_or_inconsistent_pending_plan():

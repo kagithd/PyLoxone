@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
 
+    from .engineering_registry import EngineeringRegistryPlan
     from .engineering_snapshot import EngineeringSnapshot
 
 NOTIFICATION_ID_PREFIX = f"{DOMAIN}_config_impact"
@@ -55,16 +56,62 @@ def _area_target_references(
     }
 
 
-async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped, mutation-free applicability checks together.
+def _area_destination_id(
+    area_registry: object,
+    impact: EngineeringEntityImpact,
+) -> str | None:
+    if impact.area_to_id is not None:
+        return impact.area_to_id
+    if impact.area_to_name is None:
+        return None
+    area = area_registry.async_get_area_by_name(impact.area_to_name)
+    return getattr(area, "id", None) if area is not None else None
+
+
+def _area_impact_owner_is_at_destination(
+    hass: HomeAssistant,
+    entry_id: str,
+    impact: EngineeringEntityImpact,
+) -> bool:
+    """Recheck persisted owner evidence without reconstructing Task 5 authority."""
+    if (
+        impact.change_kind != "area_changed"
+        or not impact.target_area_ids
+        or not any(
+            (
+                impact.area_from_id is not None,
+                impact.area_to_id is not None,
+                impact.area_to_name is not None,
+            )
+        )
+    ):
+        return False
+    device = dr.async_get(hass).async_get_device_by_identifier(
+        (DOMAIN, impact.unique_id),
+        entry_id,
+    )
+    if device is None:
+        return False
+    destination = _area_destination_id(ar.async_get(hass), impact)
+    if impact.area_to_name is not None and destination is None:
+        return False
+    return getattr(device, "area_id", None) == destination
+
+
+async def async_find_engineering_change_impacts(  # noqa: PLR0912, PLR0913, PLR0915 -- keep scoped, mutation-free applicability checks together.
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     previous: EngineeringSnapshot | None,
     candidate: EngineeringSnapshot,
     previous_plan: EngineeringImpactPlan | None = None,
+    *,
+    registry_plan: EngineeringRegistryPlan | None = None,
 ) -> EngineeringImpactPlan:
     """Reconcile unresolved and new impacts against pre-mutation source identity."""
-    if candidate.source.entry_id != config_entry.entry_id or (
-        previous_plan is not None and (previous is None or previous_plan.generation_id != previous.generation_id)
+    if (
+        candidate.source.entry_id != config_entry.entry_id
+        or (previous_plan is not None and (previous is None or previous_plan.generation_id != previous.generation_id))
+        or (registry_plan is not None and registry_plan.generation_id != candidate.generation_id)
     ):
         raise ValueError(_IMPACT_SCOPE_MISMATCH)
     if previous is None:
@@ -72,13 +119,15 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
     # The diff validates entry/provider equality before old evidence is reused.
     changes = diff_engineering_snapshots(previous, candidate)
     registry = er.async_get(hass)
-    area_registry = ar.async_get(hass)
     targets: dict[str, set[str]] = {}
-    area_targets: dict[str, set[str]] = {}
-    area_references: dict[str, dict[str, set[str]]] = {}
+    area_impacts: dict[str, EngineeringEntityImpact] = {}
     if previous_plan is not None:
         for impact in previous_plan.impacts:
-            if impact.target_area_ids:
+            if impact.target_area_ids and _area_impact_owner_is_at_destination(
+                hass,
+                config_entry.entry_id,
+                impact,
+            ):
                 current = _area_target_references(hass, impact.target_area_ids)
                 retained = {
                     kind: values & set(impact.references.get(kind, ()))
@@ -86,9 +135,16 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
                     if values & set(impact.references.get(kind, ()))
                 }
                 if retained:
-                    area_targets.setdefault(impact.unique_id, set()).update(impact.target_area_ids)
-                    for kind, values in retained.items():
-                        area_references.setdefault(impact.unique_id, {}).setdefault(kind, set()).update(values)
+                    area_impacts[impact.unique_id] = EngineeringEntityImpact(
+                        impact.unique_id,
+                        (),
+                        "area_changed",
+                        {kind: tuple(sorted(values)) for kind, values in sorted(retained.items())},
+                        impact.target_area_ids,
+                        impact.area_from_id,
+                        impact.area_to_id,
+                        impact.area_to_name,
+                    )
             targets.setdefault(impact.unique_id, set()).update(
                 entity_id.partition(".")[0] for entity_id in impact.entity_ids
             )
@@ -98,18 +154,46 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
         )
         if platform_changed and change.old_semantic_platform is not None:
             targets.setdefault(change.unique_id, set()).add(change.old_semantic_platform)
-        if change in changes.metadata_changed and change.old_room != change.new_room:
-            areas = {
-                area.id
-                for room_name in (change.old_room, change.new_room)
-                if room_name is not None
-                if (area := area_registry.async_get_area_by_name(room_name)) is not None
-            }
-            current = _area_target_references(hass, areas)
-            if current:
-                area_targets.setdefault(change.unique_id, set()).update(areas)
-                for kind, values in current.items():
-                    area_references.setdefault(change.unique_id, {}).setdefault(kind, set()).update(values)
+    if registry_plan is not None:
+        area_registry = ar.async_get(hass)
+        device_registry = dr.async_get(hass)
+        for operation in registry_plan.device_operations:
+            if (
+                operation.entry_id != config_entry.entry_id
+                or operation.identifier not in registry_plan.metadata.active_device_identifiers
+                or not operation.area_update_allowed
+                or operation.area_released
+            ):
+                continue
+            device = device_registry.async_get_device_by_identifier(
+                (DOMAIN, operation.identifier),
+                config_entry.entry_id,
+            )
+            if device is None or getattr(device, "area_id", None) != operation.expected_area_id:
+                continue
+            desired_area = area_registry.async_get_area_by_name(operation.room) if operation.room is not None else None
+            desired_area_id = getattr(desired_area, "id", None)
+            if operation.room is None:
+                if operation.expected_area_id is None:
+                    continue
+            elif desired_area is not None and operation.expected_area_id == desired_area_id:
+                continue
+            target_area_ids = tuple(
+                sorted({area_id for area_id in (operation.expected_area_id, desired_area_id) if area_id is not None})
+            )
+            references = _area_target_references(hass, target_area_ids)
+            if not references:
+                continue
+            area_impacts[operation.identifier] = EngineeringEntityImpact(
+                operation.identifier,
+                (),
+                "area_changed",
+                {kind: tuple(sorted(values)) for kind, values in sorted(references.items())},
+                target_area_ids,
+                operation.expected_area_id,
+                desired_area_id,
+                operation.room,
+            )
     current_platforms = {row.node.element.uuid: row.semantic_platform for row in candidate.rows}
     impacts: dict[str, EngineeringEntityImpact] = {}
     for unique_id, platforms in sorted(targets.items()):
@@ -142,19 +226,7 @@ async def async_find_engineering_change_impacts(  # noqa: PLR0912 -- keep scoped
                 "platform_changed" if unique_id in current_platforms else "removed",
                 {kind: tuple(sorted(values)) for kind, values in sorted(references.items())},
             )
-    for unique_id, area_ids in sorted(area_targets.items()):
-        references = area_references[unique_id]
-        existing = impacts.get(unique_id)
-        merged_references = {kind: set(values) for kind, values in (existing.references.items() if existing else ())}
-        for kind, values in references.items():
-            merged_references.setdefault(kind, set()).update(values)
-        impacts[unique_id] = EngineeringEntityImpact(
-            unique_id,
-            existing.entity_ids if existing else (),
-            existing.change_kind if existing else "area_changed",
-            {kind: tuple(sorted(values)) for kind, values in sorted(merged_references.items())},
-            tuple(sorted(area_ids)),
-        )
+    impacts.update(area_impacts)
     return EngineeringImpactPlan(
         candidate.generation_id,
         tuple(impacts[unique_id] for unique_id in sorted(impacts)),
@@ -194,7 +266,15 @@ async def async_publish_engineering_impact_plan(
                 ):
                     is_applicable = True
                     break
-            if not is_applicable and impact.target_area_ids:
+            if (
+                not is_applicable
+                and impact.target_area_ids
+                and _area_impact_owner_is_at_destination(
+                    hass,
+                    config_entry.entry_id,
+                    impact,
+                )
+            ):
                 current = _area_target_references(hass, impact.target_area_ids)
                 is_applicable = any(values & set(impact.references.get(kind, ())) for kind, values in current.items())
             if is_applicable:

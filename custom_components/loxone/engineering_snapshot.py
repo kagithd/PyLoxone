@@ -1132,6 +1132,9 @@ def _impact_to_dict(impact: EngineeringEntityImpact) -> dict[str, Any]:
         "change_kind": impact.change_kind,
         "references": {key: list(values) for key, values in sorted(impact.references.items())},
         "target_area_ids": list(impact.target_area_ids),
+        "area_from_id": impact.area_from_id,
+        "area_to_id": impact.area_to_id,
+        "area_to_name": impact.area_to_name,
     }
 
 
@@ -1141,7 +1144,13 @@ def _impact_from_dict(value: Any) -> EngineeringEntityImpact:
         value,
         "impact",
         required=fields,
-        allowed=fields | {"target_area_ids"},
+        allowed=fields
+        | {
+            "target_area_ids",
+            "area_from_id",
+            "area_to_id",
+            "area_to_name",
+        },
     )
     unique_id = _required_identifier(data["unique_id"], "impact unique_id")
     entity_ids = tuple(
@@ -1174,12 +1183,18 @@ def _impact_from_dict(value: Any) -> EngineeringEntityImpact:
     )
     if len(target_area_ids) != len(set(target_area_ids)):
         raise EngineeringSnapshotError("impact target areas contain duplicates")
+    area_from_id = _optional_identifier(data.get("area_from_id"), "impact source area")
+    area_to_id = _optional_identifier(data.get("area_to_id"), "impact destination area")
+    area_to_name = validate_engineering_presentation(data.get("area_to_name"))
     return EngineeringEntityImpact(
         unique_id,
         entity_ids,
         change_kind,
         references,
         target_area_ids,
+        area_from_id,
+        area_to_id,
+        area_to_name,
     )
 
 
@@ -1203,7 +1218,16 @@ def _impact_plan_to_dict(plan: EngineeringImpactPlan) -> dict[str, Any]:
 def _impact_plan_from_dict(value: Any) -> EngineeringImpactPlan:
     fields = frozenset({"generation_id", "impacts"})
     data = _require_dict(value, "impact plan", required=fields)
-    impacts = tuple(_impact_from_dict(item) for item in _require_list(data["impacts"], "impact plan impacts"))
+    impacts = tuple(
+        impact
+        for item in _require_list(data["impacts"], "impact plan impacts")
+        if (
+            (impact := _impact_from_dict(item)).change_kind != "area_changed"
+            or impact.area_from_id is not None
+            or impact.area_to_id is not None
+            or impact.area_to_name is not None
+        )
+    )
     unique_ids = [item.unique_id for item in impacts]
     if len(unique_ids) != len(set(unique_ids)):
         raise EngineeringSnapshotError("impact plan contains duplicate unique IDs")

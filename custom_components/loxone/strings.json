@@ -2,7 +2,7 @@
   "issues": {
     "engineering_area_conflict": {
       "title": "Choose the room for {device}",
-      "description": "Home Assistant currently places **{device}** in **{current_room}**, while Loxone requests **{desired_room}**. Review the current values and choose which assignment should be kept.",
+      "description": "A room assignment conflict is active for **{device}**. Open the repair to review the current Home Assistant assignment and the Loxone request.",
       "fix_flow": {
         "abort": {
           "conflict_changed": "The room assignment changed while this repair was open. Review the current repair and try again.",
@@ -14,12 +14,67 @@
           "resolution_failed": "The room decision could not be completed. Review the current repair and try again."
         },
         "step": {
-          "init": {
+          "current_named_desired_named": {
             "title": "Choose the room for {device}",
             "description": "Current Home Assistant room: **{current_room}**\n\nRequested Loxone room: **{desired_room}**",
             "data": {
               "action": "Room assignment"
             }
+          },
+          "current_named_desired_none": {
+            "title": "Choose the room for {device}",
+            "description": "Current Home Assistant room: **{current_room}**\n\nLoxone requests **no room**.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_named_desired_unknown": {
+            "title": "Choose the room for {device}",
+            "description": "Current Home Assistant room: **{current_room}**\n\nThe safe display name of the requested Loxone room is unavailable.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_named_desired_invalid": {
+            "title": "Keep the current room for {device}",
+            "description": "Current Home Assistant room: **{current_room}**\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_none_desired_named": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant currently has **no room** assigned.\n\nRequested Loxone room: **{desired_room}**",
+            "data": {"action": "Room assignment"}
+          },
+          "current_none_desired_none": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant currently has **no room** assigned.\n\nLoxone also requests **no room**.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_none_desired_unknown": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant currently has **no room** assigned.\n\nThe safe display name of the requested Loxone room is unavailable.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_none_desired_invalid": {
+            "title": "Keep the current room for {device}",
+            "description": "Home Assistant currently has **no room** assigned.\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_unknown_desired_named": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nRequested Loxone room: **{desired_room}**",
+            "data": {"action": "Room assignment"}
+          },
+          "current_unknown_desired_none": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nLoxone requests **no room**.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_unknown_desired_unknown": {
+            "title": "Choose the room for {device}",
+            "description": "Home Assistant and Loxone both have room assignments whose safe display names are unavailable.",
+            "data": {"action": "Room assignment"}
+          },
+          "current_unknown_desired_invalid": {
+            "title": "Keep the current room for {device}",
+            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
+            "data": {"action": "Room assignment"}
           }
         }
       }

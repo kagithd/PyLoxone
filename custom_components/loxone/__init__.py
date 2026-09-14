@@ -80,6 +80,7 @@ from .pyloxone_api.exceptions import (
     LoxoneUnauthorisedError,
 )
 from .registry_maintenance import async_run_registry_maintenance
+from .repairs import async_remove_engineering_area_conflict_issues
 
 REQUIREMENTS = ["websockets", "pycryptodome", "numpy"]
 
@@ -122,6 +123,14 @@ CONFIG_SCHEMA = vol.Schema(
 _UNDEF: dict = {}
 
 # TODO: get version and check for updates https://update.loxone.com/updatecheck.xml?serial=xxxxxxxxx
+
+
+async def async_remove_entry(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+) -> None:
+    """Retire durable Repairs only after Home Assistant removes the entry."""
+    async_remove_engineering_area_conflict_issues(hass, config_entry.entry_id)
 
 
 async def async_unload_entry(hass, config_entry):

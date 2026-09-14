@@ -8,6 +8,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 
 import custom_components.loxone.coordinator as module
@@ -86,7 +87,7 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
     monkeypatch.setattr(
         module,
         "async_sync_engineering_area_conflict_issues",
-        lambda hass, entry_id: asyncio.sleep(
+        lambda hass, entry_id, **kwargs: asyncio.sleep(
             0,
             result=MemoryStore.events.append(f"repairs:{entry_id}"),
         ),
@@ -126,9 +127,14 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
         entry = SimpleNamespace(
             entry_id="entry-a",
             async_on_unload=unload_callbacks.append,
+            domain="loxone",
+            state=ConfigEntryState.LOADED,
             options={"username": "", "password": "", "host": "", "port": 0},
         )
-        hass.config_entries = SimpleNamespace(async_entries=lambda domain: [entry])
+        hass.config_entries = SimpleNamespace(
+            async_entries=lambda domain: [entry],
+            async_get_entry=lambda entry_id: entry if entry_id == entry.entry_id else None,
+        )
         coordinator = module.LoxoneCoordinator(hass, entry)
         coordinator.miniserver = SimpleNamespace(
             serial="serial-a", lox_config=SimpleNamespace(json={"lastModified": "revision-7", "controls": {}})
@@ -147,16 +153,25 @@ def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported sh
     )
 
 
-def test_config_entry_unload_callback_removes_scoped_repairs(
+def test_config_entry_unload_callback_suspends_without_deleting_repairs(
     transaction,
     monkeypatch,
 ):
-    """The native config-entry lifecycle cleans only its Repairs namespace."""
-    cleaned = []
+    """Ordinary unload invokes the lifecycle fence without retiring issues."""
+    events = []
+
+    def register(hass, entry, coordinator):
+        events.append(("register", hass, entry, coordinator))
+
+        def unload():
+            events.append(("unload", hass, entry, coordinator))
+
+        return unload
+
     monkeypatch.setattr(
         module,
-        "async_remove_engineering_area_conflict_issues",
-        lambda hass, entry_id: cleaned.append((hass, entry_id)),
+        "async_register_engineering_area_conflict_reconciler",
+        register,
     )
 
     async def scenario():
@@ -166,7 +181,10 @@ def test_config_entry_unload_callback_removes_scoped_repairs(
 
     coordinator = asyncio.run(scenario())
 
-    assert cleaned == [(coordinator.hass, "entry-a")]
+    assert events == [
+        ("register", coordinator.hass, coordinator.config_entry, coordinator),
+        ("unload", coordinator.hass, coordinator.config_entry, coordinator),
+    ]
 
 
 @pytest.mark.parametrize(

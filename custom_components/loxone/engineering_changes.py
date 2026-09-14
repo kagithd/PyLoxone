@@ -53,6 +53,9 @@ class EngineeringEntityImpact:
     change_kind: Literal["area_changed", "removed", "platform_changed"]
     references: Mapping[str, tuple[str, ...]]
     target_area_ids: tuple[str, ...] = ()
+    area_from_id: str | None = None
+    area_to_id: str | None = None
+    area_to_name: str | None = None
 
     def __post_init__(self) -> None:
         """Freeze caller-owned collections at the recovery boundary."""

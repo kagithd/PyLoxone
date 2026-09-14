@@ -94,7 +94,7 @@
   "issues": {
     "engineering_area_conflict": {
       "title": "Raum für {device} auswählen",
-      "description": "Home Assistant ordnet **{device}** derzeit **{current_room}** zu, während Loxone **{desired_room}** vorgibt. Prüfe die aktuellen Werte und wähle, welche Zuordnung beibehalten werden soll.",
+      "description": "Für **{device}** besteht ein Konflikt bei der Raumzuordnung. Öffne die Reparatur, um die aktuelle Home-Assistant-Zuordnung und die Loxone-Vorgabe zu prüfen.",
       "fix_flow": {
         "abort": {
           "conflict_changed": "Die Raumzuordnung hat sich geändert, während diese Reparatur geöffnet war. Prüfe die aktuelle Reparatur und versuche es erneut.",
@@ -106,12 +106,67 @@
           "resolution_failed": "Die Raumentscheidung konnte nicht abgeschlossen werden. Prüfe die aktuelle Reparatur und versuche es erneut."
         },
         "step": {
-          "init": {
+          "current_named_desired_named": {
             "title": "Raum für {device} auswählen",
             "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nAngeforderter Loxone-Raum: **{desired_room}**",
             "data": {
               "action": "Raumzuordnung"
             }
+          },
+          "current_named_desired_none": {
+            "title": "Raum für {device} auswählen",
+            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nLoxone fordert **keinen Raum** an.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_named_desired_unknown": {
+            "title": "Raum für {device} auswählen",
+            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nDer sichere Anzeigename des angeforderten Loxone-Raums ist nicht verfügbar.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_named_desired_invalid": {
+            "title": "Aktuellen Raum für {device} beibehalten",
+            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_none_desired_named": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nAngeforderter Loxone-Raum: **{desired_room}**",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_none_desired_none": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nAuch Loxone fordert **keinen Raum** an.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_none_desired_unknown": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nDer sichere Anzeigename des angeforderten Loxone-Raums ist nicht verfügbar.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_none_desired_invalid": {
+            "title": "Aktuellen Raum für {device} beibehalten",
+            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_unknown_desired_named": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nAngeforderter Loxone-Raum: **{desired_room}**",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_unknown_desired_none": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nLoxone fordert **keinen Raum** an.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_unknown_desired_unknown": {
+            "title": "Raum für {device} auswählen",
+            "description": "In Home Assistant und Loxone sind Räume zugeordnet, deren sichere Anzeigenamen nicht verfügbar sind.",
+            "data": {"action": "Raumzuordnung"}
+          },
+          "current_unknown_desired_invalid": {
+            "title": "Aktuellen Raum für {device} beibehalten",
+            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
+            "data": {"action": "Raumzuordnung"}
           }
         }
       }
