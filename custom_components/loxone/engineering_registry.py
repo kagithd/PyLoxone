@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import re
 from dataclasses import dataclass, replace
 from hashlib import sha256
 from secrets import token_hex
@@ -20,10 +22,12 @@ from .engineering_entities import (
 )
 from .engineering_snapshot import (
     EngineeringSnapshot,
+    EngineeringSnapshotError,
     EngineeringStateStore,
     StoredEngineeringState,
     async_load_engineering_state,
     async_store_engineering_state,
+    validate_engineering_presentation,
     validate_engineering_snapshot,
 )
 from .engineering_topology import NodeKind, ResolutionStatus
@@ -52,9 +56,17 @@ _AREA_RESOLUTION_ACTIONS = frozenset({"apply_loxone_room", "keep_ha_room"})
 _MAX_AREA_TEXT_LENGTH = 160
 _CONTROL_CHARACTER_LIMIT = 32
 _CONFLICT_TOKEN_LENGTH = 64
+_AREA_OPERATION_LOCKS = "loxone_engineering_area_operation_locks"
+_AREA_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 
 # Kept as a named seam so cold-restart tests exercise acknowledged Store behavior.
 EngineeringRegistryIntentStore = EngineeringStateStore
+
+
+def _area_operation_lock(hass: HomeAssistant, entry_id: str) -> asyncio.Lock:
+    """Serialize whole journal/apply/resolution transitions for one entry."""
+    locks = hass.data.setdefault(_AREA_OPERATION_LOCKS, {})
+    return locks.setdefault(entry_id, asyncio.Lock())
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +109,7 @@ class EngineeringDeviceOperation:
     area_intent_replay: bool = False
     area_conflict_reason: str | None = None
     area_released: bool = False
+    area_process_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +173,22 @@ class EngineeringAreaConflict:
     desired_area_name: str | None
     generation_id: str
     reason: str
+    desired_action_valid: bool = True
+
+    def __post_init__(self) -> None:
+        """Sanitize permitted operational fields without manufacturing a clear."""
+        desired_name = _optional_bounded_string(self.desired_area_name)
+        desired_id = _optional_area_id(self.desired_area_id)
+        object.__setattr__(
+            self,
+            "desired_action_valid",
+            self.desired_action_valid is True
+            and desired_name == self.desired_area_name
+            and desired_id == self.desired_area_id,
+        )
+        for field in ("display_name", "current_area_name", "desired_area_name"):
+            object.__setattr__(self, field, _optional_bounded_string(getattr(self, field)))
+        object.__setattr__(self, "desired_area_id", desired_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,14 +264,17 @@ def _optional_bounded_string(value: object) -> str | None:
         or "@" in value
     ):
         return None
-    return value
+    try:
+        return validate_engineering_presentation(value)
+    except EngineeringSnapshotError:
+        return None
 
 
 def _optional_area_id(value: object) -> str | None:
     """Validate an opaque Home Assistant area identifier."""
     if value is None:
         return None
-    return value if isinstance(value, str) and 0 < len(value) <= _MAX_AREA_TEXT_LENGTH else None
+    return value if isinstance(value, str) and _AREA_IDENTIFIER_PATTERN.fullmatch(value) else None
 
 
 async def _async_load_area_state(
@@ -309,6 +341,8 @@ async def _async_load_area_state(
             or not isinstance(identifier, str)
             or not identifier
             or conflict_entry != entry_id
+            or _optional_area_id(identifier) != identifier
+            or _optional_area_id(item.get("current_area_id")) != item.get("current_area_id")
             or not isinstance(conflict_generation, str)
             or reason not in _AREA_CONFLICT_REASONS
         ):
@@ -317,13 +351,14 @@ async def _async_load_area_state(
             token=token,
             entry_id=entry_id,
             device_identifier=identifier,
-            display_name=_optional_bounded_string(item.get("display_name")),
+            display_name=item.get("display_name"),
             current_area_id=_optional_area_id(item.get("current_area_id")),
-            current_area_name=_optional_bounded_string(item.get("current_area_name")),
-            desired_area_id=_optional_area_id(item.get("desired_area_id")),
-            desired_area_name=_optional_bounded_string(item.get("desired_area_name")),
+            current_area_name=item.get("current_area_name"),
+            desired_area_id=item.get("desired_area_id"),
+            desired_area_name=item.get("desired_area_name"),
             generation_id=conflict_generation,
             reason=reason,
+            desired_action_valid=item.get("desired_action_valid", True),
         )
     released = frozenset(item for item in raw.get("released_identifiers", ()) if isinstance(item, str) and item)
     return _AreaRegistryState(
@@ -372,6 +407,7 @@ async def _async_store_area_state(
                 "desired_area_name": item.desired_area_name,
                 "generation_id": item.generation_id,
                 "reason": item.reason,
+                "desired_action_valid": item.desired_action_valid,
             }
             for item in sorted(state.conflicts.values(), key=lambda value: value.device_identifier)
         ],
@@ -463,6 +499,11 @@ async def _async_keep_ha_area(
         release=True,
     )
     await _async_store_area_state(hass, entry_id, resolved_state)
+    device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
+    current_area = getattr(device, "area_id", None) if device else None
+    if device is None or current_area != conflict.current_area_id:
+        refreshed = await _async_persist_resolution_race(hass, entry_id, resolved_state, conflict, current_area)
+        return _area_resolution_result("keep_ha_room", "stale_conflict", refreshed, resolved=False)
     return _area_resolution_result("keep_ha_room", "resolved", conflict, resolved=True)
 
 
@@ -486,17 +527,23 @@ async def _async_persist_resolution_race(
     intents.pop(conflict.device_identifier, None)
     baselines = dict(state.baselines)
     baselines.pop(conflict.device_identifier, None)
-    await _async_store_area_state(
-        hass,
-        entry_id,
-        replace(
-            state,
-            intents=MappingProxyType(intents),
-            baselines=MappingProxyType(baselines),
-            conflicts=MappingProxyType(conflicts),
-        ),
-    )
-    return refreshed
+    while True:
+        await _async_store_area_state(
+            hass,
+            entry_id,
+            replace(
+                state,
+                intents=MappingProxyType(intents),
+                baselines=MappingProxyType(baselines),
+                conflicts=MappingProxyType(dict(conflicts)),
+            ),
+        )
+        device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
+        current_area = getattr(device, "area_id", None) if device else None
+        if current_area == refreshed.current_area_id:
+            return refreshed
+        refreshed = _refresh_area_conflict(refreshed, ar.async_get(hass), current_area, "area_user_override_preserved")
+        conflicts[conflict.device_identifier] = refreshed
 
 
 def _resolution_desired_area_id(
@@ -527,7 +574,8 @@ async def _async_apply_loxone_area(
     device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
     current_area = getattr(device, "area_id", None) if device else None
     if device is None or current_area != conflict.current_area_id:
-        return _area_resolution_result("apply_loxone_room", "stale_conflict", conflict, resolved=False)
+        refreshed = await _async_persist_resolution_race(hass, entry_id, state, conflict, current_area)
+        return _area_resolution_result("apply_loxone_room", "stale_conflict", refreshed, resolved=False)
 
     intent = _AreaIntent(
         conflict.device_identifier,
@@ -544,7 +592,7 @@ async def _async_apply_loxone_area(
     current_device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
     rechecked_area_id = getattr(current_device, "area_id", None) if current_device else None
     if current_conflict is None or current_device is None or rechecked_area_id != conflict.current_area_id:
-        if current_conflict is not None and current_device is not None:
+        if current_conflict is not None:
             current_conflict = await _async_persist_resolution_race(
                 hass,
                 entry_id,
@@ -556,7 +604,8 @@ async def _async_apply_loxone_area(
     desired_valid, desired_area_id = _resolution_desired_area_id(area_registry, conflict)
     if not desired_valid:
         return _area_resolution_result("apply_loxone_room", "stale_conflict", current_conflict, resolved=False)
-    if getattr(current_device, "area_id", None) != conflict.current_area_id:
+    current_device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
+    if current_device is None or getattr(current_device, "area_id", None) != conflict.current_area_id:
         return _area_resolution_result("apply_loxone_room", "stale_conflict", current_conflict, resolved=False)
     if conflict.current_area_id != desired_area_id:
         device_registry.async_update_device(
@@ -574,8 +623,9 @@ async def _async_apply_loxone_area(
         release=False,
     )
     await _async_store_area_state(hass, entry_id, resolved_state)
-    final_area_id = getattr(current_device, "area_id", None)
-    if final_area_id != desired_area_id:
+    current_device = device_registry.async_get_device_by_identifier((DOMAIN, conflict.device_identifier), entry_id)
+    final_area_id = getattr(current_device, "area_id", None) if current_device else None
+    if current_device is None or final_area_id != desired_area_id:
         refreshed = await _async_persist_resolution_race(
             hass,
             entry_id,
@@ -594,6 +644,17 @@ async def async_resolve_engineering_area_conflict(
     action: str,
 ) -> EngineeringAreaResolutionResult:
     """Apply an explicit stale-safe Task 8 area-conflict decision."""
+    async with _area_operation_lock(hass, entry_id):
+        return await _async_resolve_engineering_area_conflict(hass, entry_id, conflict_token, action)
+
+
+async def _async_resolve_engineering_area_conflict(
+    hass: HomeAssistant,
+    entry_id: str,
+    conflict_token: str,
+    action: str,
+) -> EngineeringAreaResolutionResult:
+    """Resolve against current state while holding the entry transition lock."""
     if action not in _AREA_RESOLUTION_ACTIONS:
         return _area_resolution_result(action, "invalid_action", resolved=False)
     state = await _async_load_area_state(hass, entry_id)
@@ -602,6 +663,8 @@ async def async_resolve_engineering_area_conflict(
         return _area_resolution_result(action, "stale_conflict", resolved=False)
     if action == "keep_ha_room":
         return await _async_keep_ha_area(hass, entry_id, state, conflict)
+    if not conflict.desired_action_valid:
+        return _area_resolution_result(action, "invalid_desired_area", conflict, resolved=False)
     return await _async_apply_loxone_area(hass, entry_id, state, conflict)
 
 
@@ -799,7 +862,9 @@ def _area_operation_policy(
 ) -> tuple[bool, str | None]:
     """Return automatic authority and any bounded conflict reason."""
     current_area = getattr(current, "area_id", None) if current else None
-    baseline_matches = baseline is not None and current_area == baseline.area_id
+    baseline_matches = (
+        baseline is not None and baseline.process_token == _AREA_PROCESS_TOKEN and current_area == baseline.area_id
+    )
     allowed = not released and existing_conflict is None and (current is None or baseline_matches or intent_replay)
     if released:
         return allowed, None
@@ -812,7 +877,7 @@ def _area_operation_policy(
             else "area_assignment_unverified"
         )
         return allowed, reason
-    return allowed, None
+    return allowed, "area_assignment_unverified" if current is not None and not allowed else None
 
 
 async def async_plan_engineering_registry_sync(
@@ -894,6 +959,7 @@ async def async_plan_engineering_registry_sync(
                 area_intent_replay=intent_replay,
                 area_conflict_reason=conflict_reason,
                 area_released=released,
+                area_process_token=_AREA_PROCESS_TOKEN,
             )
         )
 
@@ -982,7 +1048,10 @@ def _candidate_area_intents(
     for operation in plan.device_operations:
         if (
             not operation.area_update_allowed
+            or operation.area_process_token != _AREA_PROCESS_TOKEN
             or operation.area_released
+            or operation.identifier in prior_state.released_identifiers
+            or operation.identifier in prior_state.conflicts
             or operation.identifier not in plan.metadata.active_device_identifiers
         ):
             continue
@@ -1012,9 +1081,12 @@ def _candidate_area_intents(
             and current is not None
             and current_area == desired_area_id
         )
-        original_state_unchanged = (
-            current is None and operation.expected_area_id is None
-        ) or current_area == operation.expected_area_id
+        original_state_unchanged = (current is None and operation.expected_area_id is None) or (
+            current_area == operation.expected_area_id
+            and (baseline := prior_state.baselines.get(operation.identifier)) is not None
+            and baseline.process_token == _AREA_PROCESS_TOKEN
+            and baseline.area_id == current_area
+        )
         if compatibility_replay or original_state_unchanged:
             intents[operation.identifier] = _AreaIntent(
                 operation.identifier,
@@ -1059,12 +1131,7 @@ async def _async_prepare_area_intents(
     area_registry: object,
 ) -> tuple[dict[str, _AreaIntent], _AreaRegistryState]:
     """Persist and recheck area intent before registry mutation."""
-    area_state = _AreaRegistryState(None, {}, {}, {}, frozenset())
-    if committed_state is not None:
-        area_state = await _async_load_area_state(
-            hass,
-            committed_state.snapshot.source.entry_id,
-        )
+    area_state = await _async_load_area_state(hass, _plan_entry_id(plan))
     intents = _candidate_area_intents(
         plan,
         device_registry,
@@ -1167,7 +1234,7 @@ def _area_conflict(
 ) -> EngineeringAreaConflict:
     """Create a deterministic sanitized conflict record."""
     current_name = _area_name_by_id(area_registry, context.current_area_id)
-    desired_name = _optional_bounded_string(operation.room)
+    desired_name = operation.room
     token_source = "\x1f".join(
         (
             operation.entry_id,
@@ -1243,7 +1310,6 @@ def _reconcile_area_state_after_apply(
             continue
         if identifier in released:
             baselines.pop(identifier, None)
-            conflicts.pop(identifier, None)
             remaining_intents.pop(identifier, None)
             continue
         device = device_registry.async_get_device_by_identifier((DOMAIN, identifier), operation.entry_id)
@@ -1261,6 +1327,7 @@ def _reconcile_area_state_after_apply(
         if (
             intent is None
             and baseline is not None
+            and baseline.process_token == _AREA_PROCESS_TOKEN
             and current_area == baseline.area_id
             and operation.area_conflict_reason is None
         ):
@@ -1269,6 +1336,10 @@ def _reconcile_area_state_after_apply(
             continue
         mismatch_after_plan = current_area != operation.expected_area_id
         reason = operation.area_conflict_reason
+        if reason is None and baseline is None and intent is None:
+            reason = "area_assignment_unverified"
+        if baseline is not None and baseline.process_token != _AREA_PROCESS_TOKEN:
+            reason = "area_assignment_unverified"
         if (intent is not None and current_area != desired_area) or mismatch_after_plan:
             reason = "area_user_override_preserved"
         elif baseline is not None and current_area != baseline.area_id:
@@ -1460,6 +1531,17 @@ async def async_apply_engineering_registry_plan(
     committed_state: StoredEngineeringState | None = None,
 ) -> EngineeringRegistrySyncResult:
     """Apply both registry passes idempotently and then persist its recovery cursor."""
+    async with _area_operation_lock(hass, _plan_entry_id(plan)):
+        return await _async_apply_engineering_registry_plan(hass, plan, committed_state=committed_state)
+
+
+async def _async_apply_engineering_registry_plan(
+    hass: HomeAssistant,
+    plan: EngineeringRegistryPlan,
+    *,
+    committed_state: StoredEngineeringState | None = None,
+) -> EngineeringRegistrySyncResult:
+    """Apply with exclusive ownership of entry area-state transitions."""
     if committed_state is not None and (
         committed_state.snapshot is None or committed_state.snapshot.generation_id != plan.generation_id
     ):

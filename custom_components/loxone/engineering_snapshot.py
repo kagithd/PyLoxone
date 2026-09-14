@@ -448,6 +448,16 @@ def _optional_string(value: Any, field_name: str) -> str | None:
     return value
 
 
+def validate_engineering_presentation(value: object) -> str | None:
+    """
+    Validate permitted operational display text using the snapshot privacy policy.
+
+    Callers must first restrict fields to allowed roles; this does not authorize
+    provider, project, user, location, or sensitive-container presentation.
+    """
+    return _optional_string(value, "engineering presentation")
+
+
 def _required_identifier(value: Any, field_name: str) -> str:
     if not isinstance(value, str) or not _IDENTIFIER_PATTERN.fullmatch(value):
         raise EngineeringSnapshotError(f"{field_name} has an unsafe identifier shape")
