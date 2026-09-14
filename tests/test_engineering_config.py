@@ -231,7 +231,8 @@ def test_rejects_invalid_loxcc_magic():
         _decompress_loxcc(bytes(16))
 
 
-def test_generic_inventory_keeps_unknown_onewire_hardware_and_topology():
+@pytest.mark.parametrize("room_uuid", ["room-office", ""])
+def test_generic_inventory_keeps_unknown_onewire_hardware_and_topology(room_uuid):
     """Unknown hardware remains available with inherited room/category data."""
     xml = b"""<?xml version="1.0"?>
 <ControlList Version="42">
@@ -242,6 +243,7 @@ def test_generic_inventory_keeps_unknown_onewire_hardware_and_topology():
     <C Type="OneWireTemperatureSensor" U="ow-sensor" IName="AI1" Title="Pipe sensor" />
   </C>
 </ControlList>"""
+    xml = xml.replace(b'Pr="room-office"', f'Pr="{room_uuid}"'.encode())
     inventory = parse_engineering_xml(
         xml,
         source_archive="sps_42_20260818120000.zip",
@@ -251,7 +253,8 @@ def test_generic_inventory_keeps_unknown_onewire_hardware_and_topology():
 
     sensor = next(item for item in inventory.candidates if item.uuid == "ow-sensor")
     assert sensor.parent_uuid == "ow-device"
-    assert sensor.room == "Office"
+    assert sensor.room == ("Office" if room_uuid else None)
+    assert sensor.room_uuid == (room_uuid or None)
     assert sensor.category == "Temperature"
     assert sensor.suggested_platform == "sensor"
     assert inventory.summary()["candidate_count"] == 2

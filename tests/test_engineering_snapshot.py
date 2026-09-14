@@ -67,6 +67,97 @@ from tests.engineering_fixtures import (
 )
 
 
+def test_room_identity_survives_safe_projection_and_rename():
+    """Dropping opaque room identity would turn a rename into a new mapping."""
+    for name in ("Workshop", "Studio"):
+        snapshot = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", room=None),
+                replace(element("device", "TreeDevice", parent_uuid="ms", room=name), room_uuid="room-a"),
+            )
+        )
+        restored = snapshot_from_dict(snapshot_to_dict(snapshot))
+        device = next(node for node in restored.nodes if node.element.uuid == "device")
+        assert device.element.room_uuid == "room-a"
+        assert device.element.room == name
+
+
+def test_v2_state_migration_preserves_recovery_cursors_and_unknown_rooms():
+    """A schema migration must not invent room IDs or invalidate old cursors."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            replace(element("ms", "LoxLIVE", room=None), room_uuid=None),
+            replace(element("device", "TreeDevice", parent_uuid="ms", room="Workshop"), room_uuid=None),
+        )
+    )
+    encoded = stored_state_to_dict(
+        StoredEngineeringState(
+            snapshot=snapshot,
+            registry_applied_generation=snapshot.generation_id,
+            impact_published_generation=snapshot.generation_id,
+            managed_area_ids={"serial-a:device": "area-a"},
+        )
+    )
+    legacy = {
+        key: encoded[key]
+        for key in (
+            "snapshot",
+            "registry_applied_generation",
+            "impact_published_generation",
+            "pending_impact_plan",
+            "managed_area_ids",
+        )
+    }
+    legacy["schema_version"] = 2
+    restored = stored_state_from_dict(legacy, "entry-a")
+    assert getattr(restored, "room_area_mappings", None) == {}
+    assert restored.registry_applied_generation == snapshot.generation_id
+    assert restored.impact_published_generation == snapshot.generation_id
+    assert restored.managed_area_ids == {"serial-a:device": "area-a"}
+    assert all(node.element.room_uuid is None for node in restored.snapshot.nodes)
+    wire = stored_state_to_dict(restored)
+    assert stored_state_to_dict(stored_state_from_dict(wire, "entry-a")) == wire
+
+
+def test_room_state_is_detached_scoped_and_integrity_checked():
+    """Caller mutations and provider-changing replacements cannot redirect durable authority."""
+    from custom_components.loxone.engineering_snapshot import (
+        EngineeringAreaBatchGroup,
+        EngineeringAreaBatchIntent,
+        EngineeringAreaBatchMember,
+        EngineeringAreaDecision,
+    )
+
+    snapshot = make_snapshot()
+    mappings = {"room-a": "area-a"}
+    tokens = ["b" * 64, "a" * 64]
+    members = [
+        EngineeringAreaBatchMember("b" * 64, "serial-a:second", None),
+        EngineeringAreaBatchMember("a" * 64, "serial-a:device", None, True),
+    ]
+    groups = [
+        EngineeringAreaBatchGroup(
+            EngineeringAreaDecision("room-a", "use_existing", area_id="area-a", conflict_tokens=tokens), members
+        )
+    ]
+    pending = EngineeringAreaBatchIntent("entry-a", "serial-a", snapshot.generation_id, groups)
+    state = StoredEngineeringState(snapshot, room_area_mappings=mappings, pending_area_batch=pending)
+    mappings.clear()
+    tokens.clear()
+    members.clear()
+    groups.clear()
+    wire = stored_state_to_dict(state)
+    assert stored_state_to_dict(stored_state_from_dict(wire, "entry-a")) == wire
+    assert state.room_area_mappings == {"room-a": "area-a"}
+    assert len(state.pending_area_batch.groups[0].members) == 2
+    foreign = _rehash(replace(snapshot, source=replace(snapshot.source, entry_id="entry-b")))
+    with pytest.raises(EngineeringSnapshotError):
+        stored_state_to_dict(replace(state, snapshot=foreign))
+    wire["room_area_mappings"]["room-a"] = "area-b"
+    with pytest.raises(EngineeringSnapshotError):
+        stored_state_from_dict(wire, "entry-a")
+
+
 def _rehash(snapshot):
     """Recompute integrity tokens after an intentional semantic mutation."""
     return replace(
@@ -1021,14 +1112,29 @@ def _real_engineering_store(hass, entry_id="entry-a", **kwargs):
 
 
 @pytest.mark.anyio
-async def test_real_store_is_atomic_acknowledged_and_migrates_v1(tmp_path):
-    """The installed HA Store performs an atomic v1 migration and acknowledged v2 write."""
+@pytest.mark.parametrize("old_version", [1, 2])
+async def test_real_store_is_atomic_acknowledged_and_migrates_legacy(tmp_path, old_version):
+    """Cold HA Store migration preserves old safe hashes and recovery cursors."""
     hass = HomeAssistant(str(tmp_path))
-    snapshot = make_snapshot()
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            replace(element("ms", "LoxLIVE", room=None), room_uuid=None),
+            replace(element("device", "TreeDevice", parent_uuid="ms", room="Workshop"), room_uuid=None),
+        )
+    )
     legacy = snapshot_to_dict(snapshot)
+    if old_version == 2:
+        legacy = {
+            "schema_version": 2,
+            "snapshot": legacy,
+            "registry_applied_generation": snapshot.generation_id,
+            "impact_published_generation": snapshot.generation_id,
+            "pending_impact_plan": {"generation_id": snapshot.generation_id, "impacts": []},
+            "managed_area_ids": {"serial-a:device": "area-a"},
+        }
     legacy_store = Store(
         hass,
-        1,
+        old_version,
         "loxone.engineering_snapshot.entry-a",
         private=True,
         atomic_writes=True,
@@ -1037,7 +1143,7 @@ async def test_real_store_is_atomic_acknowledged_and_migrates_v1(tmp_path):
 
     migrated = _real_engineering_store(hass)
     restored = stored_state_from_dict(await migrated.async_load(), "entry-a")
-    raw_v2 = await Store(
+    raw_current = await Store(
         hass,
         ENGINEERING_SNAPSHOT_STORAGE_VERSION,
         "loxone.engineering_snapshot.entry-a",
@@ -1046,7 +1152,13 @@ async def test_real_store_is_atomic_acknowledged_and_migrates_v1(tmp_path):
 
     assert restored.snapshot.generation_id == snapshot.generation_id
     assert migrated._atomic_writes is True
-    assert raw_v2["schema_version"] == ENGINEERING_SNAPSHOT_STORAGE_VERSION
+    assert raw_current["schema_version"] == ENGINEERING_SNAPSHOT_STORAGE_VERSION
+    assert all(node.element.room_uuid is None for node in restored.snapshot.nodes)
+    if old_version == 2:
+        assert restored.registry_applied_generation == snapshot.generation_id
+        assert restored.impact_published_generation == snapshot.generation_id
+        assert restored.pending_impact_plan.generation_id == snapshot.generation_id
+        assert restored.managed_area_ids == {"serial-a:device": "area-a"}
 
 
 @pytest.mark.anyio

@@ -51,7 +51,9 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
-ENGINEERING_SNAPSHOT_STORAGE_VERSION = 2
+ENGINEERING_SNAPSHOT_STORAGE_VERSION = 3
+_PREVIOUS_STATE_VERSION = 2
+_MAX_AREA_NAME_LENGTH = 160
 ENGINEERING_SNAPSHOT_STORAGE_KEY = "loxone.engineering_snapshot"
 _DIGEST_PATTERN = re.compile(r"^(?:rev|safe|gen):[0-9a-f]{64}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
@@ -150,6 +152,61 @@ class EngineeringSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class EngineeringAreaDecision:
+    """Explicit room-group selection; labels never supply room identity."""
+
+    room_uuid: str | None
+    action: str
+    area_id: str | None = None
+    area_name: str | None = None
+    conflict_tokens: tuple[str, ...] = ()
+    keep_conflict_tokens: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        """Detach caller-owned token sequences."""
+        object.__setattr__(self, "conflict_tokens", tuple(self.conflict_tokens))
+        object.__setattr__(self, "keep_conflict_tokens", tuple(self.keep_conflict_tokens))
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringAreaBatchMember:
+    """Exact pre-mutation identity and acknowledged per-device progress."""
+
+    token: str
+    device_identifier: str
+    from_area_id: str | None
+    completed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringAreaBatchGroup:
+    """One group commit point, including the returned created-area identity."""
+
+    decision: EngineeringAreaDecision
+    members: tuple[EngineeringAreaBatchMember, ...]
+    created_area_id: str | None = None
+    mapping_committed: bool = False
+
+    def __post_init__(self) -> None:
+        """Detach member collections."""
+        object.__setattr__(self, "members", tuple(self.members))
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringAreaBatchIntent:
+    """Source-bound normalized write-ahead journal for safe cold recovery."""
+
+    entry_id: str
+    provider_identifier: str
+    generation_id: str
+    groups: tuple[EngineeringAreaBatchGroup, ...]
+
+    def __post_init__(self) -> None:
+        """Detach group collections."""
+        object.__setattr__(self, "groups", tuple(self.groups))
+
+
+@dataclass(frozen=True, slots=True)
 class StoredEngineeringState:
     """Atomic recovery envelope for a committed engineering generation."""
 
@@ -158,6 +215,9 @@ class StoredEngineeringState:
     pending_impact_plan: EngineeringImpactPlan | None = None
     impact_published_generation: str | None = None
     managed_area_ids: Mapping[str, str] = field(default_factory=dict)
+    room_area_mappings: Mapping[str, str] = field(default_factory=dict)
+    room_area_mapping_scope: tuple[str, str] | None = None
+    pending_area_batch: EngineeringAreaBatchIntent | None = None
 
     def __post_init__(self) -> None:
         """Detach integration-owned metadata from caller-mutable mappings."""
@@ -166,6 +226,13 @@ class StoredEngineeringState:
             "managed_area_ids",
             MappingProxyType(dict(sorted(self.managed_area_ids.items()))),
         )
+        object.__setattr__(self, "room_area_mappings", MappingProxyType(dict(sorted(self.room_area_mappings.items()))))
+        scope = self.room_area_mapping_scope
+        if scope is None and self.room_area_mappings and self.snapshot is not None:
+            scope = (self.snapshot.source.entry_id, self.snapshot.source.provider_identifier)
+        object.__setattr__(self, "room_area_mapping_scope", None if scope is None else tuple(scope))
+        if self.pending_area_batch is not None:
+            object.__setattr__(self, "pending_area_batch", _batch_from_dict(_batch_to_dict(self.pending_area_batch)))
 
 
 def _freeze_node(node: ResolvedEngineeringNode) -> ResolvedEngineeringNode:
@@ -282,7 +349,7 @@ def _projection_inventory(
                 uuid=element.uuid,
                 io_name=element.io_name if keep_presentation else None,
                 parent_uuid=None,
-                room_uuid=None,
+                room_uuid=element.room_uuid if keep_presentation else None,
                 room=element.room if keep_presentation else None,
                 category_uuid=None,
                 category=None,
@@ -312,6 +379,9 @@ def _safe_projection_nodes(
 def _node_to_dict(node: ResolvedEngineeringNode) -> dict[str, Any]:
     element = node.element
     return {
+        # v3 extends the canonical digest only for known identity. Omitting
+        # unknown UUIDs preserves v1/v2 generation and recovery cursor hashes.
+        **({"room_uuid": element.room_uuid} if element.room_uuid is not None else {}),
         "key": element.key,
         "parent_key": element.parent_key,
         "uuid": element.uuid,
@@ -575,7 +645,7 @@ _ROW_FIELDS = frozenset(
 
 
 def _node_from_dict(value: Any) -> ResolvedEngineeringNode:
-    data = _require_dict(value, "nodes item", required=_NODE_FIELDS)
+    data = _require_dict(value, "nodes item", required=_NODE_FIELDS, allowed=_NODE_FIELDS | {"room_uuid"})
     key = _required_identifier(data["key"], "node key")
     uuid = _optional_identifier(data["uuid"], "node uuid")
     if uuid is None:
@@ -612,7 +682,7 @@ def _node_from_dict(value: Any) -> ResolvedEngineeringNode:
         uuid=uuid,
         io_name=io_name,
         parent_uuid=None,
-        room_uuid=None,
+        room_uuid=_optional_identifier(data.get("room_uuid"), "node room_uuid"),
         room=room,
         category_uuid=None,
         category=None,
@@ -1118,6 +1188,7 @@ def snapshot_from_dict(value: Any) -> EngineeringSnapshot:
         if (
             node.element.title != safe_node.element.title
             or node.element.room != safe_node.element.room
+            or node.element.room_uuid != safe_node.element.room_uuid
             or node.element.io_name != safe_node.element.io_name
             or node.topology_path != safe_node.topology_path
         ):
@@ -1247,9 +1318,168 @@ _STATE_FIELDS = frozenset(
         "managed_area_ids",
     }
 )
+_AREA_STATE_FIELDS = frozenset(
+    {"room_area_mappings", "room_area_mapping_scope", "pending_area_batch", "area_state_digest"}
+)
 
 
-def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) -> None:
+def normalize_engineering_area_decision(decision: EngineeringAreaDecision) -> EngineeringAreaDecision:
+    """Validate the complete bounded public decision before any side effect."""
+    if not isinstance(decision, EngineeringAreaDecision):
+        raise EngineeringSnapshotError("invalid area decision")
+    _optional_identifier(decision.room_uuid, "room UUID")
+    actions = {"use_existing", "create", "keep_ha", "clear"}
+    if decision.action not in actions:
+        raise EngineeringSnapshotError("invalid area action")
+    tokens = decision.conflict_tokens
+    keep = decision.keep_conflict_tokens
+    if (
+        not tokens
+        or any(not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{64}", token) for token in (*tokens, *keep))
+        or len(set(tokens)) != len(tokens)
+        or len(set(keep)) != len(keep)
+        or not set(keep) <= set(tokens)
+    ):
+        raise EngineeringSnapshotError("invalid area token membership")
+    if decision.room_uuid is None and (len(tokens) != 1 or keep or decision.action not in {"keep_ha", "clear"}):
+        raise EngineeringSnapshotError("unknown room requires a single keep or clear")
+    if decision.action == "use_existing":
+        _required_identifier(decision.area_id, "selected area ID")
+        if decision.area_name is not None:
+            raise EngineeringSnapshotError("existing area accepts no name")
+    elif decision.action == "create":
+        if decision.area_id is not None or not isinstance(decision.area_name, str):
+            raise EngineeringSnapshotError("new area requires only a name")
+        name = " ".join(decision.area_name.split())
+        if not name or len(name) > _MAX_AREA_NAME_LENGTH:
+            raise EngineeringSnapshotError("new area name is invalid")
+        validate_engineering_presentation(name)
+        decision = replace(decision, area_name=name)
+    elif decision.area_id is not None or decision.area_name is not None:
+        raise EngineeringSnapshotError("keep or clear accepts no target")
+    return replace(decision, conflict_tokens=tuple(sorted(tokens)), keep_conflict_tokens=tuple(sorted(keep)))
+
+
+def _batch_to_dict(batch: EngineeringAreaBatchIntent) -> dict[str, Any]:
+    """Encode only exact identities, decisions and small progress checkpoints."""
+    return {
+        "entry_id": batch.entry_id,
+        "provider_identifier": batch.provider_identifier,
+        "generation_id": batch.generation_id,
+        "groups": [
+            {
+                "decision": {
+                    "room_uuid": group.decision.room_uuid,
+                    "action": group.decision.action,
+                    "area_id": group.decision.area_id,
+                    "area_name": group.decision.area_name,
+                    "conflict_tokens": list(group.decision.conflict_tokens),
+                    "keep_conflict_tokens": list(group.decision.keep_conflict_tokens),
+                },
+                "members": [
+                    {
+                        "token": member.token,
+                        "device_identifier": member.device_identifier,
+                        "from_area_id": member.from_area_id,
+                        "completed": member.completed,
+                    }
+                    for member in group.members
+                ],
+                "created_area_id": group.created_area_id,
+                "mapping_committed": group.mapping_committed,
+            }
+            for group in batch.groups
+        ],
+    }
+
+
+def _batch_from_dict(value: Any) -> EngineeringAreaBatchIntent:
+    """Validate cold progress independently of dataclass caller assertions."""
+    data = _require_dict(
+        value, "area batch", required=frozenset({"entry_id", "provider_identifier", "generation_id", "groups"})
+    )
+    provider = _required_identifier(data["provider_identifier"], "batch provider")
+    groups = []
+    seen_tokens: set[str] = set()
+    seen_rooms: set[str] = set()
+    seen_devices: set[str] = set()
+    for raw_group in _require_list(data["groups"], "batch groups"):
+        group = _require_dict(
+            raw_group,
+            "batch group",
+            required=frozenset({"decision", "members", "created_area_id", "mapping_committed"}),
+        )
+        raw_decision = _require_dict(
+            group["decision"],
+            "batch decision",
+            required=frozenset(
+                {"room_uuid", "action", "area_id", "area_name", "conflict_tokens", "keep_conflict_tokens"}
+            ),
+        )
+        _require_list(raw_decision["conflict_tokens"], "conflict tokens")
+        _require_list(raw_decision["keep_conflict_tokens"], "keep tokens")
+        decision = normalize_engineering_area_decision(EngineeringAreaDecision(**raw_decision))
+        if seen_tokens.intersection(decision.conflict_tokens) or (
+            decision.room_uuid is not None and decision.room_uuid in seen_rooms
+        ):
+            raise EngineeringSnapshotError("duplicate batch group")
+        seen_tokens.update(decision.conflict_tokens)
+        if decision.room_uuid is not None:
+            seen_rooms.add(decision.room_uuid)
+        members = []
+        for raw_member in _require_list(group["members"], "batch members"):
+            member = _require_dict(
+                raw_member,
+                "batch member",
+                required=frozenset({"token", "device_identifier", "from_area_id", "completed"}),
+            )
+            identifier = _required_identifier(member["device_identifier"], "batch device")
+            _validate_scope(identifier, provider)
+            if identifier in seen_devices:
+                raise EngineeringSnapshotError("duplicate batch device")
+            seen_devices.add(identifier)
+            members.append(
+                EngineeringAreaBatchMember(
+                    _required_identifier(member["token"], "member token"),
+                    identifier,
+                    _optional_identifier(member["from_area_id"], "prior area"),
+                    _require_bool(member["completed"], "member progress"),
+                )
+            )
+        if len(members) != len(decision.conflict_tokens) or {member.token for member in members} != set(
+            decision.conflict_tokens
+        ):
+            raise EngineeringSnapshotError("batch member tokens do not match decision")
+        created = _optional_identifier(group["created_area_id"], "created area ID")
+        committed = _require_bool(group["mapping_committed"], "group progress")
+        if (created is not None and decision.action != "create") or (
+            committed and not all(member.completed for member in members)
+        ):
+            raise EngineeringSnapshotError("inconsistent batch progress")
+        groups.append(
+            EngineeringAreaBatchGroup(
+                decision, tuple(sorted(members, key=lambda member: member.device_identifier)), created, committed
+            )
+        )
+    if not groups:
+        raise EngineeringSnapshotError("empty area batch")
+    return EngineeringAreaBatchIntent(
+        _required_identifier(data["entry_id"], "batch entry"),
+        provider,
+        _required_digest(data["generation_id"], "gen", "batch generation"),
+        tuple(sorted(groups, key=lambda group: (group.decision.room_uuid or "", group.decision.conflict_tokens))),
+    )
+
+
+def _area_state_payload(state: StoredEngineeringState) -> dict[str, Any]:
+    return {
+        "room_area_mappings": dict(state.room_area_mappings),
+        "room_area_mapping_scope": list(state.room_area_mapping_scope) if state.room_area_mapping_scope else None,
+        "pending_area_batch": _batch_to_dict(state.pending_area_batch) if state.pending_area_batch else None,
+    }
+
+
+def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) -> None:  # noqa: PLR0912 -- independent scope/recovery trust checks.
     snapshot = state.snapshot
     if snapshot is None:
         if (
@@ -1257,6 +1487,9 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
             or state.pending_impact_plan is not None
             or state.impact_published_generation is not None
             or state.managed_area_ids
+            or state.room_area_mappings
+            or state.room_area_mapping_scope is not None
+            or state.pending_area_batch is not None
         ):
             raise EngineeringSnapshotError("empty state contains recovery metadata")
         return
@@ -1283,6 +1516,18 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
     if published == current and registry != current:
         raise EngineeringSnapshotError("current publication requires current registry application")
     provider = snapshot.source.provider_identifier
+    scope = (snapshot.source.entry_id, provider)
+    if state.room_area_mapping_scope is not None and state.room_area_mapping_scope != scope:
+        raise EngineeringSnapshotError("room mapping scope does not match snapshot")
+    if state.room_area_mappings and state.room_area_mapping_scope != scope:
+        raise EngineeringSnapshotError("room mapping has no source scope")
+    for room_uuid, area_id in state.room_area_mappings.items():
+        _required_identifier(room_uuid, "mapped room UUID")
+        _required_identifier(area_id, "mapped area ID")
+    if state.pending_area_batch is not None:
+        batch = _batch_from_dict(_batch_to_dict(state.pending_area_batch))
+        if (batch.entry_id, batch.provider_identifier) != scope:
+            raise EngineeringSnapshotError("batch scope does not match snapshot")
     for identifier, area_id in state.managed_area_ids.items():
         checked_identifier = _required_identifier(identifier, "managed area owner")
         _validate_scope(checked_identifier, provider)
@@ -1290,7 +1535,7 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
 
 
 def stored_state_to_dict(state: StoredEngineeringState) -> dict[str, Any]:
-    """Encode one atomic v2 private state envelope."""
+    """Encode a v3 envelope; area-state digest is separate from read generation."""
     _validate_state(state)
     return {
         "schema_version": ENGINEERING_SNAPSHOT_STORAGE_VERSION,
@@ -1299,6 +1544,8 @@ def stored_state_to_dict(state: StoredEngineeringState) -> dict[str, Any]:
         "pending_impact_plan": (_impact_plan_to_dict(state.pending_impact_plan) if state.pending_impact_plan else None),
         "impact_published_generation": state.impact_published_generation,
         "managed_area_ids": dict(state.managed_area_ids),
+        **_area_state_payload(state),
+        "area_state_digest": _canonical_digest("safe", _area_state_payload(state)),
     }
 
 
@@ -1309,8 +1556,10 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
         state = StoredEngineeringState(snapshot=snapshot_from_dict(value))
         _validate_state(state, entry_id)
         return state
-    data = _require_dict(value, "stored state", required=_STATE_FIELDS)
-    if data["schema_version"] != ENGINEERING_SNAPSHOT_STORAGE_VERSION:
+    version = value.get("schema_version") if isinstance(value, dict) else None
+    fields = _STATE_FIELDS if version == _PREVIOUS_STATE_VERSION else _STATE_FIELDS | _AREA_STATE_FIELDS
+    data = _require_dict(value, "stored state", required=fields)
+    if data["schema_version"] not in {2, ENGINEERING_SNAPSHOT_STORAGE_VERSION}:
         raise EngineeringSnapshotError("stored state schema_version is invalid")
     raw_snapshot = data["snapshot"]
     snapshot = None if raw_snapshot is None else snapshot_from_dict(raw_snapshot)
@@ -1351,13 +1600,22 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
             )
         ),
         managed_area_ids=areas,
+        room_area_mappings=data.get("room_area_mappings", {}),
+        room_area_mapping_scope=data.get("room_area_mapping_scope"),
+        pending_area_batch=_batch_from_dict(data["pending_area_batch"])
+        if data.get("pending_area_batch") is not None
+        else None,
     )
     _validate_state(state, entry_id)
+    if version == ENGINEERING_SNAPSHOT_STORAGE_VERSION and data["area_state_digest"] != _canonical_digest(
+        "safe", _area_state_payload(state)
+    ):
+        raise EngineeringSnapshotError("area state digest is inconsistent")
     return state
 
 
 class EngineeringStateStore(Store[dict[str, Any]]):
-    """Versioned Home Assistant store with a validating v1-to-v2 migration."""
+    """Versioned Home Assistant store with validating v1/v2-to-v3 migration."""
 
     def __init__(
         self,
@@ -1469,7 +1727,7 @@ class EngineeringStateStore(Store[dict[str, Any]]):
         old_data: Any,
     ) -> dict[str, Any]:
         del old_minor_version
-        if old_major_version != 1:
+        if old_major_version not in {1, 2}:
             raise NotImplementedError
         entry_id = self.key.removeprefix(f"{ENGINEERING_SNAPSHOT_STORAGE_KEY}.")
         return stored_state_to_dict(stored_state_from_dict(old_data, entry_id))

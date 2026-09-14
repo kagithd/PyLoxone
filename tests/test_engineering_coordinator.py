@@ -64,6 +64,9 @@ class MemoryStore:
 
 @pytest.fixture
 def transaction(monkeypatch, registries, tmp_path):  # noqa: F811 -- imported shared pytest fixture.
+    monkeypatch.setattr(
+        "custom_components.loxone.engineering_registry.async_load_engineering_state", async_load_engineering_state
+    )
     monkeypatch.setattr("homeassistant.helpers.frame.report_usage", lambda *args, **kwargs: None)
     MemoryStore.data = {}
     MemoryStore.events = []
@@ -236,6 +239,86 @@ def test_forced_refresh_and_unchanged_rebind(transaction, monkeypatch):
         before = deepcopy(MemoryStore.data)
         await coordinator.async_drain_committed_engineering_state()
         assert MemoryStore.data == before
+
+    asyncio.run(scenario())
+
+
+def test_refresh_and_cold_drain_retain_room_mapping_and_pending_batch(transaction, monkeypatch):
+    """An explicit coordinator state construction must not drop room recovery metadata."""
+
+    async def scenario():
+        from custom_components.loxone.engineering_snapshot import (
+            EngineeringAreaDecision,
+            EngineeringAreaBatchIntent,
+            EngineeringAreaBatchGroup,
+            EngineeringAreaBatchMember,
+            async_store_engineering_state,
+        )
+
+        coordinator = transaction.make()
+        first = await coordinator.async_refresh_engineering_inventory(force=True)
+        state = await async_load_engineering_state(coordinator.hass, "entry-a")
+        decision = EngineeringAreaDecision("room-a", "use_existing", area_id="area-a", conflict_tokens=("a" * 64,))
+        pending = EngineeringAreaBatchIntent(
+            "entry-a",
+            "serial-a",
+            first.generation_id,
+            (
+                EngineeringAreaBatchGroup(
+                    decision, (EngineeringAreaBatchMember("a" * 64, "serial-a:device", None, True),)
+                ),
+            ),
+        )
+        state = replace(state, room_area_mappings={"room-a": "area-a"}, pending_area_batch=pending)
+        await async_store_engineering_state(coordinator.hass, state)
+        await coordinator.async_refresh_engineering_inventory(force=True)
+        warm = await async_load_engineering_state(coordinator.hass, "entry-a")
+        assert warm.room_area_mappings == {"room-a": "area-a"}
+        assert warm.pending_area_batch == pending
+        cold = transaction.make()
+        await cold.async_drain_committed_engineering_state(startup=True)
+        restored = await async_load_engineering_state(cold.hass, "entry-a")
+        assert restored.room_area_mappings == warm.room_area_mappings
+        assert restored.pending_area_batch == pending
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["candidate", "publication"])
+def test_coordinator_does_not_overwrite_concurrent_batch_metadata(transaction, monkeypatch, phase):
+    """Read/plan/publish awaits must not write old copies over batch mappings."""
+
+    async def scenario():
+        from custom_components.loxone.engineering_snapshot import async_store_engineering_state
+
+        coordinator = transaction.make()
+        await coordinator.async_refresh_engineering_inventory(force=True)
+        original = (
+            module.async_find_engineering_change_impacts
+            if phase == "candidate"
+            else module.async_publish_engineering_impact_plan
+        )
+
+        async def interleave(*args, **kwargs):
+            value = await original(*args, **kwargs)
+            latest = await async_load_engineering_state(coordinator.hass, "entry-a")
+            await async_store_engineering_state(
+                coordinator.hass, replace(latest, room_area_mappings={"room-a": "area-a"})
+            )
+            return value
+
+        monkeypatch.setattr(
+            module,
+            "async_find_engineering_change_impacts"
+            if phase == "candidate"
+            else "async_publish_engineering_impact_plan",
+            interleave,
+        )
+        if phase == "publication":
+            coordinator._engineering_published_impact_plan = None
+        await coordinator.async_refresh_engineering_inventory(force=True)
+        latest = await async_load_engineering_state(coordinator.hass, "entry-a")
+        assert latest.room_area_mappings == {"room-a": "area-a"}
 
     asyncio.run(scenario())
 

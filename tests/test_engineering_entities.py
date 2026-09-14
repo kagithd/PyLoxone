@@ -1,6 +1,9 @@
 """Tests for conservative engineering entity onboarding."""
 
 from datetime import UTC, datetime
+import asyncio
+from dataclasses import replace
+from types import SimpleNamespace
 
 from custom_components.loxone.engineering_config import (
     EngineeringElement,
@@ -18,6 +21,63 @@ from custom_components.loxone.engineering_runtime import (
     EngineeringRuntimeInventory,
 )
 from custom_components.loxone.sensor import LoxoneEngineeringSensor
+
+
+def test_metadata_adapter_serializes_with_batch_state_and_loads_mappings(monkeypatch):
+    """The compatibility adapter cannot publish stale metadata during a batch transaction."""
+    from custom_components.loxone import engineering_entities as entities
+    from custom_components.loxone.engineering_registry import (
+        engineering_area_operation_lock,
+        registry_metadata_from_snapshot,
+    )
+    from custom_components.loxone.engineering_snapshot import (
+        StoredEngineeringState,
+        async_load_engineering_state,
+        async_store_engineering_state,
+        EngineeringAreaDecision,
+        EngineeringAreaBatchIntent,
+        EngineeringAreaBatchGroup,
+        EngineeringAreaBatchMember,
+    )
+    from tests.engineering_fixtures import make_snapshot
+    from tests.test_engineering_coordinator import MemoryStore
+
+    MemoryStore.data = {}
+    MemoryStore.events = []
+    MemoryStore.fault = None
+    monkeypatch.setattr("custom_components.loxone.engineering_snapshot.EngineeringStateStore", MemoryStore)
+    monkeypatch.setattr(entities, "Store", MemoryStore)
+
+    async def scenario():
+        hass = SimpleNamespace(data={})
+        snapshot = make_snapshot()
+        state = StoredEngineeringState(snapshot)
+        await async_store_engineering_state(hass, state)
+        metadata = registry_metadata_from_snapshot(snapshot, applied_generation=snapshot.generation_id)
+        decision = EngineeringAreaDecision("room-a", "use_existing", area_id="area-a", conflict_tokens=("a" * 64,))
+        batch = EngineeringAreaBatchIntent(
+            "entry-a",
+            "serial-a",
+            snapshot.generation_id,
+            (EngineeringAreaBatchGroup(decision, (EngineeringAreaBatchMember("a" * 64, "serial-a:device", None),)),),
+        )
+        async with engineering_area_operation_lock(hass, "entry-a"):
+            task = asyncio.create_task(entities.async_store_engineering_registry_metadata(hass, "entry-a", metadata))
+            await asyncio.sleep(0)
+            assert (await async_load_engineering_state(hass, "entry-a")).registry_applied_generation is None
+            await async_store_engineering_state(
+                hass, replace(state, room_area_mappings={"room-a": "area-a"}, pending_area_batch=batch)
+            )
+        await task
+        latest = await async_load_engineering_state(hass, "entry-a")
+        assert latest.room_area_mappings == {"room-a": "area-a"}
+        assert latest.pending_area_batch == batch
+        assert latest.registry_applied_generation == snapshot.generation_id
+        assert (await entities.async_load_engineering_registry_metadata(hass, "entry-a")).room_area_mappings == {
+            "room-a": "area-a"
+        }
+
+    asyncio.run(scenario())
 
 
 def _element(

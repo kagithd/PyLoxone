@@ -297,7 +297,9 @@ def parse_engineering_xml(
         category_uuid = inherited_category
         io_data = next((child for child in node if child.tag == "IoData"), None)
         if io_data is not None:
-            room_uuid = io_data.attrib.get("Pr", room_uuid)
+            # An explicitly empty room reference is unknown, not an identity
+            # and not an instruction to reconstruct one from a display name.
+            room_uuid = io_data.attrib.get("Pr", room_uuid) or None
             category_uuid = io_data.attrib.get("Cr", category_uuid)
 
         loxone_type = node.attrib.get("Type")

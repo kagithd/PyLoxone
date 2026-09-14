@@ -51,6 +51,567 @@ from tests.engineering_fixtures import (
 _UNDEFINED = object()
 
 
+async def _batch_case(registries, monkeypatch, room_uuid="room-a"):
+    """Reuse real reconciliation and persist copied wire state across cold runs."""
+    from custom_components.loxone import engineering_snapshot as snapshots
+
+    office = registries.areas.async_get_or_create("Office")
+    target = registries.areas.async_get_or_create("Studio")
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            *(
+                replace(
+                    element(key, "TreeDevice", parent_uuid="ms", room="Workshop"),
+                    room_uuid=room_uuid[index] if isinstance(room_uuid, tuple) else room_uuid,
+                )
+                for index, key in enumerate(("device", "second"))
+            ),
+        )
+    )
+    saved = {"wire": snapshots.stored_state_to_dict(StoredEngineeringState(snapshot))}
+
+    async def load(hass, entry_id):
+        return snapshots.stored_state_from_dict(deepcopy(saved["wire"]), entry_id)
+
+    async def save(hass, state):
+        saved["wire"] = snapshots.stored_state_to_dict(state)
+        if callback := saved.pop("callback", None):
+            callback()
+
+    monkeypatch.setattr(engineering_registry, "async_load_engineering_state", load)
+    monkeypatch.setattr(engineering_registry, "async_store_engineering_state", save)
+    for key in ("device", "second"):
+        registries.devices.add(f"serial-a:{key}", "entry-a", area_id=office.id)
+    await _record_override(registries, snapshot, StoredEngineeringState(snapshot))
+    conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+    return SimpleNamespace(snapshot=snapshot, saved=saved, load=load, target=target, office=office, conflicts=conflicts)
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "empty",
+        "partial",
+        "duplicate",
+        "foreign_keep",
+        "target_fields",
+        "no_room_group",
+        "no_room_move",
+        "deleted",
+        "collision",
+    ],
+)
+def test_batch_preflight_is_whole_request_and_non_mutating(registries, monkeypatch, invalid):
+    """An invalid later group must prevent every earlier create and device write."""
+
+    async def scenario():
+        assert hasattr(engineering_registry, "EngineeringAreaDecision")
+        case = await _batch_case(registries, monkeypatch, None if invalid.startswith("no_room") else "room-a")
+        decision = engineering_registry.EngineeringAreaDecision
+        tokens = tuple(item.token for item in case.conflicts)
+        args = dict(room_uuid="room-a", action="use_existing", area_id=case.target.id, conflict_tokens=tokens)
+        if invalid == "empty":
+            args["conflict_tokens"] = ()
+        if invalid == "partial":
+            args["conflict_tokens"] = tokens[:1]
+        if invalid == "duplicate":
+            args["conflict_tokens"] = tokens + tokens[:1]
+        if invalid == "foreign_keep":
+            args["keep_conflict_tokens"] = ("f" * 64,)
+        if invalid == "target_fields":
+            args["area_name"] = "Other"
+        if invalid == "no_room_group":
+            args.update(room_uuid=None, action="keep_ha", area_id=None)
+        if invalid == "no_room_move":
+            args.update(room_uuid=None, conflict_tokens=tokens[:1])
+        if invalid == "deleted":
+            registries.areas.areas.pop(case.target.id)
+        if invalid == "collision":
+            args.update(action="create", area_id=None, area_name="  STUDIO  ")
+        before = registries.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision(**args),), is_current=lambda: True
+        )
+        assert result.unresolved_groups == 1
+        assert result.resolved_groups == 0
+        assert registries.mutations == before
+        assert (await case.load(registries.hass, "entry-a")).pending_area_batch is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interruption", ["failure", "cancel", "store_cancel", "none"])
+def test_batch_group_commit_and_cold_replay(registries, monkeypatch, interruption):
+    """A partially applied room cannot activate its mapping or repeat completed writes."""
+
+    async def scenario():
+        assert hasattr(engineering_registry, "EngineeringAreaDecision")
+        case = await _batch_case(registries, monkeypatch)
+        assert {item.room_uuid for item in case.conflicts} == {"room-a"}
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in case.conflicts),
+        )
+        original = registries.devices.async_update_device
+        changed = []
+        if interruption == "store_cancel":
+            from custom_components.loxone.engineering_snapshot import (
+                EngineeringStoreCommitCancelledError,
+                EngineeringStoreCommitOutcome,
+            )
+
+            def cancel_store():
+                raise EngineeringStoreCommitCancelledError(
+                    EngineeringStoreCommitOutcome.CANCELLED, settled_outcome=EngineeringStoreCommitOutcome.COMMITTED
+                )
+
+            case.saved["callback"] = lambda: case.saved.update(callback=cancel_store)
+
+        def update(device_id, **changes):
+            if len(changed) == 1 and interruption != "none":
+                if interruption == "cancel":
+                    raise asyncio.CancelledError
+                raise RuntimeError("injected batch failure")
+            result = original(device_id, **changes)
+            changed.append(device_id)
+            return result
+
+        monkeypatch.setattr(registries.devices, "async_update_device", update)
+        if interruption in {"cancel", "store_cancel"}:
+            with pytest.raises(asyncio.CancelledError):
+                await engineering_registry.async_resolve_engineering_area_conflicts(
+                    registries.hass, "entry-a", (decision,), is_current=lambda: True
+                )
+        else:
+            result = await engineering_registry.async_resolve_engineering_area_conflicts(
+                registries.hass, "entry-a", (decision,), is_current=lambda: True
+            )
+        stored = await case.load(registries.hass, "entry-a")
+        if interruption != "none":
+            assert stored.room_area_mappings == {}
+            assert stored.pending_area_batch is not None
+            assert len(changed) == 1
+            monkeypatch.setattr(registries.devices, "async_update_device", original)
+            monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "cold-process")
+            registries.hass.data.clear()
+            before = registries.devices.mutations
+            result = await engineering_registry.async_resolve_engineering_area_conflicts(
+                registries.hass, "entry-a", (decision,), is_current=lambda: True
+            )
+            assert registries.devices.mutations == before + 1
+        assert result.resolved_groups == 1
+        assert result.unresolved_groups == 0
+        final = await case.load(registries.hass, "entry-a")
+        assert final.room_area_mappings == {"room-a": case.target.id}
+        assert final.pending_area_batch is None
+        assert not await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("area_deleted", [False, True])
+def test_batch_keep_override_and_mapping_reaches_later_device(registries, monkeypatch, area_deleted):
+    """Persisted UUID mappings must reach new devices after a room rename, except released devices."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in case.conflicts),
+            keep_conflict_tokens=(case.conflicts[0].token,),
+        )
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert result.resolved_groups == 1
+        assert registries.device("serial-a:device").area_id == case.office.id
+        assert registries.device("serial-a:second").area_id == case.target.id
+        stored = await case.load(registries.hass, "entry-a")
+        if area_deleted:
+            registries.areas.areas.pop(case.target.id)
+            registries.devices.async_update_device(registries.device("serial-a:second").id, area_id=None)
+        updated = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", room=None),
+                *(
+                    replace(element(key, "TreeDevice", parent_uuid="ms", room="Renamed"), room_uuid="room-a")
+                    for key in ("device", "second", "third")
+                ),
+            ),
+            read_sequence=2,
+        )
+        metadata = engineering_registry.registry_metadata_from_snapshot(
+            stored.snapshot, managed_area_ids=stored.managed_area_ids, room_area_mappings=stored.room_area_mappings
+        )
+        plan = await async_plan_engineering_registry_sync(registries.hass, "entry-a", updated, metadata)
+        await engineering_registry.async_store_engineering_state(registries.hass, replace(stored, snapshot=updated))
+        await async_apply_engineering_registry_plan(
+            registries.hass, plan, committed_state=replace(stored, snapshot=updated)
+        )
+        assert registries.device("serial-a:third").area_id == (None if area_deleted else case.target.id)
+        assert registries.device("serial-a:device").area_id == case.office.id
+        assert registries.areas.async_get_area_by_name("Renamed") is None
+        if area_deleted:
+            conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+            third = next(item for item in conflicts if item.device_identifier == "serial-a:third")
+            result = await engineering_registry.async_resolve_engineering_area_conflict(
+                registries.hass, "entry-a", third.token, "apply_loxone_room"
+            )
+            assert not result.resolved
+            assert registries.areas.async_get_area_by_name("Renamed") is None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "race", ["lifecycle", "provider", "token", "area_deleted", "completed_changed", "final_changed"]
+)
+def test_batch_await_fences_preserve_unresolved_state(registries, monkeypatch, race):
+    """Await boundaries cannot turn revoked lifecycle or stale registry state into a mapping."""
+
+    async def scenario():
+        from custom_components.loxone import engineering_snapshot as snapshots
+
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in case.conflicts),
+        )
+        current = True
+
+        def change():
+            nonlocal current
+            if race == "lifecycle":
+                current = False
+            if race == "provider":
+                other = _snapshot_for("entry-a", "serial-b")
+                case.saved["wire"] = snapshots.stored_state_to_dict(StoredEngineeringState(other))
+            if race == "token":
+                FakeIntentStore.data["area_conflicts"][0]["token"] = "f" * 64
+            if race == "area_deleted":
+                registries.areas.areas.pop(case.target.id)
+            if race in {"completed_changed", "final_changed"}:
+                registries.devices.async_update_device(registries.device("serial-a:device").id, area_id=case.office.id)
+
+        if race == "completed_changed":
+            case.saved["callback"] = lambda: case.saved.update(callback=change)
+        elif race == "final_changed":
+            original_save = engineering_registry.async_store_engineering_state
+
+            async def save(hass, state):
+                if state.room_area_mappings:
+                    case.saved["callback"] = change
+                await original_save(hass, state)
+
+            monkeypatch.setattr(engineering_registry, "async_store_engineering_state", save)
+        else:
+            case.saved["callback"] = change
+        before = registries.devices.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: current
+        )
+        assert result.unresolved_groups == 1
+        stored = await case.load(registries.hass, "entry-a")
+        assert stored.room_area_mappings == {}
+        if race not in {"completed_changed", "final_changed"}:
+            assert registries.devices.mutations == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "gap", ["unjournaled_create", "missing_created", "changed_created", "lost_device_save", "resume"]
+)
+def test_batch_cold_ambiguous_registry_persistence_stays_unresolved(registries, monkeypatch, gap):
+    """Cold ambiguity must never adopt an area by name or trust lost HA device writes."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a", "create", area_name="New Area", conflict_tokens=tuple(item.token for item in case.conflicts)
+        )
+        real_save = engineering_registry.async_store_engineering_state
+        count = 0
+
+        async def save(hass, state):
+            nonlocal count
+            count += 1
+            if gap == "unjournaled_create" and count == 2:
+                raise asyncio.CancelledError
+            await real_save(hass, state)
+            if gap in {"missing_created", "changed_created", "resume"} and count == 2:
+                raise asyncio.CancelledError
+            if gap == "lost_device_save" and count == 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", save)
+        with pytest.raises(asyncio.CancelledError):
+            await engineering_registry.async_resolve_engineering_area_conflicts(
+                registries.hass, "entry-a", (decision,), is_current=lambda: True
+            )
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", real_save)
+        created = registries.areas.async_get_area_by_name("New Area")
+        if gap == "missing_created":
+            registries.areas.areas.pop(created.id)
+        if gap == "changed_created":
+            created.name = "Changed"
+        if gap == "lost_device_save":
+            registries.devices.async_update_device(registries.device("serial-a:device").id, area_id=case.office.id)
+        monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "cold-process")
+        registries.hass.data.clear()
+        before = registries.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        if gap == "resume":
+            assert result.resolved_groups == 1
+            assert registries.areas.async_get_area_by_name("New Area").id == created.id
+            assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {"room-a": created.id}
+            return
+        assert result.unresolved_groups == 1
+        assert registries.mutations == before
+        stored = await case.load(registries.hass, "entry-a")
+        assert stored.room_area_mappings == {}
+        assert stored.pending_area_batch is not None
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("action,owned", [("keep_ha", False), ("clear", False), ("clear", True)])
+def test_no_room_decision_never_becomes_a_mapping(registries, monkeypatch, action, owned):
+    """Unknown rooms are device-local; clear needs current managed proof."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch, None)
+        if owned:
+            FakeIntentStore.data["managed_baselines"] = [
+                {"identifier": "serial-a:device", "area_id": case.office.id, "process_token": "process-a"}
+            ]
+        decision = engineering_registry.EngineeringAreaDecision(
+            None, action, conflict_tokens=(case.conflicts[0].token,)
+        )
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert result.resolved_groups == int(action == "keep_ha" or owned)
+        assert registries.device("serial-a:device").area_id == (None if owned else case.office.id)
+        assert registries.device("serial-a:second").area_id == case.office.id
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {}
+
+    asyncio.run(scenario())
+
+
+def test_batch_does_not_create_before_later_group_preflight(registries, monkeypatch):
+    """All groups must validate before the first valid group's area creation."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decisions = (
+            engineering_registry.EngineeringAreaDecision(
+                "room-a", "create", area_name="New Area", conflict_tokens=tuple(item.token for item in case.conflicts)
+            ),
+            engineering_registry.EngineeringAreaDecision(None, "keep_ha", conflict_tokens=("f" * 64,)),
+        )
+        before = registries.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions, is_current=lambda: True
+        )
+        assert result.unresolved_groups == 2
+        assert registries.mutations == before
+        assert (await case.load(registries.hass, "entry-a")).pending_area_batch is None
+
+    asyncio.run(scenario())
+
+
+def test_batch_cold_completed_group_revalidates_before_reporting_success(registries, monkeypatch):
+    """A journaled group commit is not success evidence after a user's later edit."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a",
+            "use_existing",
+            area_id=case.target.id,
+            conflict_tokens=tuple(item.token for item in case.conflicts),
+        )
+        original = engineering_registry.async_store_engineering_state
+
+        async def cancel_after_commit(hass, state):
+            await original(hass, state)
+            if state.room_area_mappings:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", cancel_after_commit)
+        with pytest.raises(asyncio.CancelledError):
+            await engineering_registry.async_resolve_engineering_area_conflicts(
+                registries.hass, "entry-a", (decision,), is_current=lambda: True
+            )
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", original)
+        registries.devices.async_update_device(registries.device("serial-a:device").id, area_id=case.office.id)
+        monkeypatch.setattr(engineering_registry, "_AREA_PROCESS_TOKEN", "cold-process")
+        before = registries.devices.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert result.unresolved_groups == 1
+        assert result.resolved_groups == 0
+        assert registries.devices.mutations == before
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {}
+
+    asyncio.run(scenario())
+
+
+def test_batch_all_keep_exceptions_do_not_create_an_unused_area(registries, monkeypatch):
+    """The group action applies only to non-keep devices, including an empty remainder."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        tokens = tuple(item.token for item in case.conflicts)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a", "create", area_name="Unused", conflict_tokens=tokens, keep_conflict_tokens=tokens
+        )
+        before = registries.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert result.resolved_groups == 1
+        assert registries.mutations == before
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {}
+
+    asyncio.run(scenario())
+
+
+def test_room_mapping_metadata_cannot_cross_entries_with_same_provider(registries):
+    """Equal provider and room IDs in another entry do not convey mapping authority."""
+
+    async def scenario():
+        target = registries.areas.async_get_or_create("Other entry area")
+        foreign = _snapshot_for("entry-b", "serial-a")
+        previous = engineering_registry.registry_metadata_from_snapshot(
+            foreign, room_area_mappings={"room-a": target.id}
+        )
+        snapshot = make_snapshot(
+            inventory=inventory_of(
+                element("ms", "LoxLIVE", room=None),
+                replace(element("device", "TreeDevice", parent_uuid="ms", room="Workshop"), room_uuid="room-a"),
+            )
+        )
+        await async_sync_engineering_devices(registries.hass, "entry-a", snapshot, previous)
+        assert registries.device("serial-a:device").area_id != target.id
+
+    asyncio.run(scenario())
+
+
+def test_batch_partial_groups_commit_independently_and_resume(registries, monkeypatch):
+    """A second group's failed mutation cannot activate it or undo the first group's commit."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch, ("room-a", "room-b"))
+        decisions = tuple(
+            engineering_registry.EngineeringAreaDecision(
+                item.room_uuid, "use_existing", area_id=case.target.id, conflict_tokens=(item.token,)
+            )
+            for item in case.conflicts
+        )
+        registries.devices.fail_mutation_number = registries.devices.mutations + 2
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions, is_current=lambda: True
+        )
+        assert (result.resolved_groups, result.unresolved_groups) == (1, 1)
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {"room-a": case.target.id}
+        registries.devices.fail_mutation_number = None
+        before = registries.devices.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions, is_current=lambda: True
+        )
+        assert (result.resolved_groups, result.unresolved_groups) == (2, 0)
+        assert registries.devices.mutations == before + 1
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {
+            "room-a": case.target.id,
+            "room-b": case.target.id,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_new_decisions_cannot_discard_an_unfinished_pending_group(registries, monkeypatch):
+    """A replacement selection must cover outstanding intent, not silently erase it."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch, ("room-a", "room-b"))
+        decisions = tuple(
+            engineering_registry.EngineeringAreaDecision(
+                item.room_uuid, "use_existing", area_id=case.target.id, conflict_tokens=(item.token,)
+            )
+            for item in case.conflicts
+        )
+        registries.devices.fail_mutation_number = registries.devices.mutations + 1
+        await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions, is_current=lambda: True
+        )
+        pending = (await case.load(registries.hass, "entry-a")).pending_area_batch
+        registries.devices.fail_mutation_number = None
+        before = registries.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", decisions[:1], is_current=lambda: True
+        )
+        assert result.unresolved_groups == 1
+        assert registries.mutations == before
+        assert (await case.load(registries.hass, "entry-a")).pending_area_batch == pending
+
+    asyncio.run(scenario())
+
+
+def test_cold_missing_area_after_conflict_retirement_allows_new_explicit_choice(registries, monkeypatch):
+    """A crash between conflict retirement and mapping commit must not strand Repairs without tokens."""
+
+    async def scenario():
+        case = await _batch_case(registries, monkeypatch)
+        decision = engineering_registry.EngineeringAreaDecision(
+            "room-a", "create", area_name="New Area", conflict_tokens=tuple(item.token for item in case.conflicts)
+        )
+        original = engineering_registry.async_store_engineering_state
+
+        async def fail_before_mapping(hass, state):
+            if state.room_area_mappings:
+                raise asyncio.CancelledError
+            await original(hass, state)
+
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", fail_before_mapping)
+        with pytest.raises(asyncio.CancelledError):
+            await engineering_registry.async_resolve_engineering_area_conflicts(
+                registries.hass, "entry-a", (decision,), is_current=lambda: True
+            )
+        monkeypatch.setattr(engineering_registry, "async_store_engineering_state", original)
+        created = registries.areas.async_get_area_by_name("New Area")
+        registries.areas.areas.pop(created.id)
+        for key in ("device", "second"):
+            registries.devices.async_update_device(registries.device(f"serial-a:{key}").id, area_id=None)
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (decision,), is_current=lambda: True
+        )
+        assert result.unresolved_groups == 1
+        conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+        assert len(conflicts) == 2
+        replacement = engineering_registry.EngineeringAreaDecision(
+            "room-a", "use_existing", area_id=case.target.id, conflict_tokens=tuple(item.token for item in conflicts)
+        )
+        result = await engineering_registry.async_resolve_engineering_area_conflicts(
+            registries.hass, "entry-a", (replacement,), is_current=lambda: True
+        )
+        assert result.resolved_groups == 1
+        assert (await case.load(registries.hass, "entry-a")).room_area_mappings == {"room-a": case.target.id}
+
+    asyncio.run(scenario())
+
+
 def test_all_devices_uses_public_registry_iteration():
     """A registry mapping lookup would reintroduce HA's deprecated API warning."""
     expected = (SimpleNamespace(id="one"), SimpleNamespace(id="two"))
@@ -444,7 +1005,25 @@ class FakeAreaRegistry:
         self.mutations = 0
 
     def async_get_area_by_name(self, name: str):
-        return next((area for area in self.areas.values() if area.name == name), None)
+        return next(
+            (
+                area
+                for area in self.areas.values()
+                if engineering_registry.ar.normalize_name(area.name) == engineering_registry.ar.normalize_name(name)
+            ),
+            None,
+        )
+
+    def async_get_area(self, area_id):
+        return self.areas.get(area_id)
+
+    def async_list_areas(self):
+        return self.areas.values()
+
+    def async_create(self, name):
+        if self.async_get_area_by_name(name) is not None:
+            raise ValueError("duplicate area")
+        return self.async_get_or_create(name)
 
     def async_get_or_create(self, name: str):
         if area := self.async_get_area_by_name(name):
@@ -662,6 +1241,11 @@ def registries(monkeypatch) -> RegistryHarness:
         raising=False,
     )
     harness = RegistryHarness()
+    monkeypatch.setattr(
+        engineering_registry,
+        "async_load_engineering_state",
+        lambda hass, entry_id: asyncio.sleep(0, result=StoredEngineeringState(None)),
+    )
     monkeypatch.setattr(
         "custom_components.loxone.engineering_registry.ar.async_get",
         lambda hass: harness.areas,

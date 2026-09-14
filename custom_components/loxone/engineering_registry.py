@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from secrets import token_hex
 from types import MappingProxyType
@@ -21,12 +21,17 @@ from .engineering_entities import (
     build_engineering_entity_specs,
 )
 from .engineering_snapshot import (
+    EngineeringAreaBatchGroup,
+    EngineeringAreaBatchIntent,
+    EngineeringAreaBatchMember,
+    EngineeringAreaDecision,
     EngineeringSnapshot,
     EngineeringSnapshotError,
     EngineeringStateStore,
     StoredEngineeringState,
     async_load_engineering_state,
     async_store_engineering_state,
+    normalize_engineering_area_decision,
     validate_engineering_presentation,
     validate_engineering_snapshot,
 )
@@ -73,6 +78,9 @@ def _area_operation_lock(hass: HomeAssistant, entry_id: str) -> asyncio.Lock:
     return locks.setdefault(entry_id, asyncio.Lock())
 
 
+engineering_area_operation_lock = _area_operation_lock
+
+
 @dataclass(frozen=True, slots=True)
 class EngineeringRegistryMetadata:
     """Safe integration-owned registry reconciliation metadata."""
@@ -82,6 +90,8 @@ class EngineeringRegistryMetadata:
     managed_area_ids: Mapping[str, str]
     applied_generation: str | None = None
     provider_identifier: str | None = None
+    room_area_mappings: Mapping[str, str] = field(default_factory=dict)
+    entry_id: str | None = None
 
     def __post_init__(self) -> None:
         """Detach managed metadata from mutable caller-owned mappings."""
@@ -90,6 +100,7 @@ class EngineeringRegistryMetadata:
             "managed_area_ids",
             MappingProxyType(dict(sorted(self.managed_area_ids.items()))),
         )
+        object.__setattr__(self, "room_area_mappings", MappingProxyType(dict(sorted(self.room_area_mappings.items()))))
 
     @classmethod
     def empty(cls) -> EngineeringRegistryMetadata:
@@ -114,6 +125,8 @@ class EngineeringDeviceOperation:
     area_conflict_reason: str | None = None
     area_released: bool = False
     area_process_token: str | None = None
+    room_uuid: str | None = None
+    mapped_area_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +191,7 @@ class EngineeringAreaConflict:
     generation_id: str
     reason: str
     desired_action_valid: bool = True
+    room_uuid: str | None = None
 
     def __post_init__(self) -> None:
         """Sanitize permitted operational fields without manufacturing a clear."""
@@ -190,9 +204,19 @@ class EngineeringAreaConflict:
             and desired_name == self.desired_area_name
             and desired_id == self.desired_area_id,
         )
-        for field in ("display_name", "current_area_name", "desired_area_name"):
-            object.__setattr__(self, field, _optional_bounded_string(getattr(self, field)))
+        for field_name in ("display_name", "current_area_name", "desired_area_name"):
+            object.__setattr__(self, field_name, _optional_bounded_string(getattr(self, field_name)))
         object.__setattr__(self, "desired_area_id", desired_id)
+        object.__setattr__(self, "room_uuid", _optional_area_id(self.room_uuid))
+
+
+@dataclass(frozen=True, slots=True)
+class EngineeringBatchAreaResolutionResult:
+    """Bounded group-level completion, including safe unresolved cold replay."""
+
+    resolved_groups: int
+    unresolved_groups: int
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -363,6 +387,7 @@ async def _async_load_area_state(
             generation_id=conflict_generation,
             reason=reason,
             desired_action_valid=item.get("desired_action_valid", True),
+            room_uuid=item.get("room_uuid"),
         )
     released = frozenset(item for item in raw.get("released_identifiers", ()) if isinstance(item, str) and item)
     return _AreaRegistryState(
@@ -414,6 +439,7 @@ async def _async_store_area_state(
                 "generation_id": item.generation_id,
                 "reason": item.reason,
                 "desired_action_valid": item.desired_action_valid,
+                "room_uuid": item.room_uuid,
             }
             for item in sorted(state.conflicts.values(), key=lambda value: value.device_identifier)
         ],
@@ -782,6 +808,400 @@ async def _async_resolve_engineering_area_conflict(
     )
 
 
+def _batch_group_key(group: EngineeringAreaBatchGroup) -> tuple[str, tuple[str, ...]]:
+    return group.decision.room_uuid or "", group.decision.conflict_tokens
+
+
+def _batch_device(hass: HomeAssistant, entry_id: str, identifier: str) -> object | None:
+    """Require positive, exclusive config-entry membership for batch writes."""
+    device = dr.async_get(hass).async_get_device_by_identifier((DOMAIN, identifier), entry_id)
+    if device is None or _device_config_entries(device) != frozenset({entry_id}):
+        return None
+    return device
+
+
+def _batch_target(group: EngineeringAreaBatchGroup) -> str | None:
+    return group.created_area_id if group.decision.action == "create" else group.decision.area_id
+
+
+def _batch_keep(group: EngineeringAreaBatchGroup, member: EngineeringAreaBatchMember) -> bool:
+    return group.decision.action == "keep_ha" or member.token in group.decision.keep_conflict_tokens
+
+
+def _batch_area_by_id(area_registry: object, area_id: str | None) -> object | None:
+    return area_registry.async_get_area(area_id) if area_id is not None else None
+
+
+def _batch_validate_targets(hass: HomeAssistant, groups: tuple[EngineeringAreaBatchGroup, ...]) -> str | None:
+    """Preflight every selected area before any group may mutate a registry."""
+    areas = ar.async_get(hass)
+    create_names: set[str] = set()
+    for group in groups:
+        decision = group.decision
+        if decision.action == "use_existing" and _batch_area_by_id(areas, decision.area_id) is None:
+            return "selected_area_missing"
+        if decision.action != "create":
+            continue
+        normalized = ar.normalize_name(decision.area_name)
+        if normalized in create_names:
+            return "area_name_collision"
+        create_names.add(normalized)
+        if group.created_area_id is not None:
+            created = _batch_area_by_id(areas, group.created_area_id)
+            if created is None:
+                return "created_area_missing"
+            if ar.normalize_name(created.name) != normalized:
+                return "created_area_changed"
+        elif any(ar.normalize_name(area.name) == normalized for area in areas.async_list_areas()):
+            # Never infer that an unjournaled same-name area was created by us.
+            return "area_name_collision"
+    return None
+
+
+def _batch_validate_members(  # noqa: PLR0911 -- independent fail-closed identity fences.
+    hass: HomeAssistant,
+    stored: StoredEngineeringState,
+    area_state: _AreaRegistryState,
+    batch: EngineeringAreaBatchIntent,
+    *,
+    replay: bool,
+) -> str | None:
+    """Re-read live identities and all token membership at every checkpoint."""
+    snapshot = stored.snapshot
+    if snapshot is None or (snapshot.source.entry_id, snapshot.source.provider_identifier, snapshot.generation_id) != (
+        batch.entry_id,
+        batch.provider_identifier,
+        batch.generation_id,
+    ):
+        return "snapshot_changed"
+    owners = {
+        node.device_identifier: node for node in snapshot.nodes if node.element.key in _eligible_device_keys(snapshot)
+    }
+    for group in batch.groups:
+        decision = group.decision
+        current_tokens = {
+            conflict.token
+            for conflict in area_state.conflicts.values()
+            if conflict.room_uuid == decision.room_uuid
+            and (decision.room_uuid is not None or conflict.token in decision.conflict_tokens)
+        }
+        # Completed members may have had their conflicts durably retired before
+        # the group checkpoint. Uncompleted or retokened members never get this exception.
+        retired = {
+            member.token
+            for member in group.members
+            if replay and member.completed and member.device_identifier not in area_state.conflicts
+        }
+        if current_tokens | retired != set(decision.conflict_tokens):
+            return "stale_conflict"
+        for member in group.members:
+            node = owners.get(member.device_identifier)
+            if node is None or node.element.room_uuid != decision.room_uuid:
+                return "room_identity_changed"
+            conflict = area_state.conflicts.get(member.device_identifier)
+            if conflict is not None and (
+                conflict.token != member.token
+                or conflict.generation_id != batch.generation_id
+                or conflict.entry_id != batch.entry_id
+            ):
+                return "stale_conflict"
+            device = _batch_device(hass, batch.entry_id, member.device_identifier)
+            if device is None:
+                return "device_ownership_changed"
+            expected = member.from_area_id if _batch_keep(group, member) else _batch_target(group)
+            current = getattr(device, "area_id", None)
+            if member.completed:
+                if current != expected:
+                    return "completed_device_changed"
+            elif current != member.from_area_id and (not replay or _batch_keep(group, member) or current != expected):
+                # A crash after the synchronous update but before progress may
+                # safely acknowledge the exact target, never overwrite a third area.
+                return "stale_conflict"
+            if decision.action == "clear" and not _batch_keep(group, member) and not member.completed:
+                baseline = area_state.baselines.get(member.device_identifier)
+                if baseline is None or baseline.process_token != _AREA_PROCESS_TOKEN or baseline.area_id != current:
+                    return "managed_ownership_missing"
+    return _batch_validate_targets(hass, batch.groups)
+
+
+def _batch_prepare(
+    stored: StoredEngineeringState,
+    area_state: _AreaRegistryState,
+    entry_id: str,
+    decisions: tuple[EngineeringAreaDecision, ...],
+) -> EngineeringAreaBatchIntent:
+    snapshot = stored.snapshot
+    if snapshot is None or snapshot.source.entry_id != entry_id:
+        raise EngineeringSnapshotError(_SNAPSHOT_ENTRY_MISMATCH)
+    groups = []
+    seen_tokens: set[str] = set()
+    seen_rooms: set[str] = set()
+    for decision in decisions:
+        if seen_tokens.intersection(decision.conflict_tokens) or (
+            decision.room_uuid is not None and decision.room_uuid in seen_rooms
+        ):
+            raise EngineeringSnapshotError(_STATE_PLAN_MISMATCH)
+        seen_tokens.update(decision.conflict_tokens)
+        if decision.room_uuid is not None:
+            seen_rooms.add(decision.room_uuid)
+        members = []
+        for token in decision.conflict_tokens:
+            conflict = _conflict_for_token(area_state, token)
+            if conflict is None or conflict.room_uuid != decision.room_uuid:
+                raise EngineeringSnapshotError(_STATE_PLAN_MISMATCH)
+            members.append(EngineeringAreaBatchMember(token, conflict.device_identifier, conflict.current_area_id))
+        groups.append(
+            EngineeringAreaBatchGroup(decision, tuple(sorted(members, key=lambda item: item.device_identifier)))
+        )
+    return EngineeringAreaBatchIntent(
+        entry_id,
+        snapshot.source.provider_identifier,
+        snapshot.generation_id,
+        tuple(sorted(groups, key=_batch_group_key)),
+    )
+
+
+async def async_resolve_engineering_area_conflicts(
+    hass: HomeAssistant,
+    entry_id: str,
+    decisions: tuple[EngineeringAreaDecision, ...],
+    *,
+    is_current: Callable[[], bool],
+) -> EngineeringBatchAreaResolutionResult:
+    """
+    Resolve an explicit complete batch under exactly one entry lock owner.
+
+    Re-submitting the same normalized decisions resumes durable progress.
+    Registry persistence is not transactional with the journal: ambiguous cold
+    state remains unresolved and requires a fresh explicit decision.
+    """
+    decisions = tuple(decisions)
+    total = len(decisions)
+    async with _area_operation_lock(hass, entry_id):
+        try:
+            _ensure_resolution_current(is_current)
+            normalized = tuple(
+                sorted(
+                    (normalize_engineering_area_decision(item) for item in decisions),
+                    key=lambda item: (item.room_uuid or "", item.conflict_tokens),
+                )
+            )
+            if not normalized:
+                return EngineeringBatchAreaResolutionResult(0, 0, "invalid_decision")
+            return await _async_resolve_area_batch(hass, entry_id, normalized, is_current)
+        except _ResolutionLifecycleChangedError:
+            return EngineeringBatchAreaResolutionResult(0, total, "lifecycle_changed")
+        except asyncio.CancelledError:
+            # Acknowledged Store cancellation also inherits SnapshotError.
+            # Keep its cancellation semantics and its durable progress intact.
+            raise
+        except EngineeringSnapshotError:
+            return EngineeringBatchAreaResolutionResult(0, total, "invalid_decision")
+
+
+async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 -- ordered journal/checkpoint state machine.
+    hass: HomeAssistant,
+    entry_id: str,
+    decisions: tuple[EngineeringAreaDecision, ...],
+    is_current: Callable[[], bool],
+) -> EngineeringBatchAreaResolutionResult:
+    """Keep the single-conflict resolver compatible; share its state primitive."""
+    stored = await async_load_engineering_state(hass, entry_id)
+    _ensure_resolution_current(is_current)
+    area_state = await _async_load_area_state(hass, entry_id)
+    _ensure_resolution_current(is_current)
+    batch = stored.pending_area_batch
+    replay = batch is not None
+    if batch is not None and tuple(group.decision for group in batch.groups) != decisions:
+        # Replacing an interrupted batch is explicit, but may not discard its
+        # successful effects. A new full preflight must bind all current tokens.
+        replacement = _batch_prepare(stored, area_state, entry_id, decisions)
+        outstanding = {
+            member.device_identifier
+            for group in batch.groups
+            if not group.mapping_committed
+            for member in group.members
+            if not (member.completed and _batch_keep(group, member))
+        }
+        selected = {member.device_identifier for group in replacement.groups for member in group.members}
+        if not outstanding <= selected:
+            return EngineeringBatchAreaResolutionResult(0, len(decisions), "pending_batch_exists")
+        batch = replacement
+        replay = False
+    if batch is None:
+        batch = _batch_prepare(stored, area_state, entry_id, decisions)
+    total = len(batch.groups)
+
+    def result(reason: str) -> EngineeringBatchAreaResolutionResult:
+        resolved = sum(
+            group.mapping_committed
+            and _batch_validate_members(hass, stored, area_state, replace(batch, groups=(group,)), replay=True) is None
+            for group in batch.groups
+        )
+        return EngineeringBatchAreaResolutionResult(resolved, total - resolved, reason)
+
+    async def checkpoint() -> str | None:
+        nonlocal stored, area_state
+        stored = await async_load_engineering_state(hass, entry_id)
+        _ensure_resolution_current(is_current)
+        area_state = await _async_load_area_state(hass, entry_id)
+        _ensure_resolution_current(is_current)
+        return _batch_validate_members(hass, stored, area_state, batch, replay=True)
+
+    async def persist() -> str | None:
+        nonlocal stored
+        stored = replace(stored, pending_area_batch=batch)
+        await async_store_engineering_state(hass, stored)
+        _ensure_resolution_current(is_current)
+        return await checkpoint()
+
+    async def withdraw_unverified_mapping(reason: str) -> EngineeringBatchAreaResolutionResult:
+        """Withdraw only our mapping authority, never roll back registry changes."""
+        nonlocal stored, batch, area_state
+        mappings = dict(stored.room_area_mappings)
+        groups = []
+        for original_group in batch.groups:
+            group = original_group
+            if any(member.completed for member in group.members) and _batch_validate_members(
+                hass, stored, area_state, replace(batch, groups=(group,)), replay=True
+            ):
+                if group.decision.room_uuid is not None and mappings.get(group.decision.room_uuid) == _batch_target(
+                    group
+                ):
+                    mappings.pop(group.decision.room_uuid, None)
+                group = replace(group, mapping_committed=False)
+                conflicts = dict(area_state.conflicts)
+                baselines = dict(area_state.baselines)
+                for member in group.members:
+                    if _batch_keep(group, member):
+                        if member.completed:
+                            area_state = _resolution_state(
+                                area_state, member.device_identifier, baseline=None, release=True
+                            )
+                            conflicts.pop(member.device_identifier, None)
+                            baselines.pop(member.device_identifier, None)
+                        continue
+                    device = _batch_device(hass, entry_id, member.device_identifier)
+                    conflict = EngineeringAreaConflict(
+                        member.token,
+                        entry_id,
+                        member.device_identifier,
+                        None,
+                        member.from_area_id,
+                        None,
+                        _batch_target(group),
+                        group.decision.area_name,
+                        batch.generation_id,
+                        "area_user_override_preserved",
+                        room_uuid=group.decision.room_uuid,
+                        desired_action_valid=_batch_target(group) is None
+                        or _batch_area_by_id(ar.async_get(hass), _batch_target(group)) is not None,
+                    )
+                    conflicts[member.device_identifier] = _refresh_area_conflict(
+                        conflict, ar.async_get(hass), getattr(device, "area_id", None), "area_user_override_preserved"
+                    )
+                    baselines.pop(member.device_identifier, None)
+                area_state = replace(
+                    area_state, conflicts=MappingProxyType(conflicts), baselines=MappingProxyType(baselines)
+                )
+            groups.append(group)
+        batch = replace(batch, groups=tuple(groups))
+        stored = replace(stored, room_area_mappings=mappings, pending_area_batch=batch)
+        await async_store_engineering_state(hass, stored)
+        _ensure_resolution_current(is_current)
+        await _async_store_area_state(hass, entry_id, area_state, is_current=is_current)
+        _ensure_resolution_current(is_current)
+        return result(reason)
+
+    reason = _batch_validate_members(hass, stored, area_state, batch, replay=replay)
+    if reason is not None:
+        if (
+            any(member.completed for group in batch.groups for member in group.members)
+            and stored.snapshot is not None
+            and (stored.snapshot.source.entry_id, stored.snapshot.source.provider_identifier)
+            == (batch.entry_id, batch.provider_identifier)
+        ):
+            return await withdraw_unverified_mapping(reason)
+        return result(reason)
+    if not replay and (reason := await persist()) is not None:
+        return result(reason)
+    for group_index in range(len(batch.groups)):
+        group = batch.groups[group_index]
+        if group.mapping_committed:
+            continue
+        if (
+            group.decision.action == "create"
+            and group.created_area_id is None
+            and any(not _batch_keep(group, member) for member in group.members)
+        ):
+            _ensure_resolution_current(is_current)
+            created = ar.async_get(hass).async_create(group.decision.area_name)
+            group = replace(group, created_area_id=created.id)
+            batch = replace(batch, groups=(*batch.groups[:group_index], group, *batch.groups[group_index + 1 :]))
+            if (reason := await persist()) is not None:
+                return result(reason)
+        for member_index in range(len(group.members)):
+            member = group.members[member_index]
+            if member.completed:
+                continue
+            if (reason := await checkpoint()) is not None:
+                return result(reason)
+            if not _batch_keep(group, member):
+                device = _batch_device(hass, entry_id, member.device_identifier)
+                desired = _batch_target(group)
+                if device.area_id != desired:
+                    _ensure_resolution_current(is_current)
+                    try:
+                        dr.async_get(hass).async_update_device(device.id, area_id=desired)
+                    except (RuntimeError, ValueError, KeyError, TypeError):
+                        return result("registry_write_failed")
+            member = replace(member, completed=True)
+            group = replace(group, members=(*group.members[:member_index], member, *group.members[member_index + 1 :]))
+            batch = replace(batch, groups=(*batch.groups[:group_index], group, *batch.groups[group_index + 1 :]))
+            if (reason := await persist()) is not None:
+                return result(reason)
+        # Only complete groups retire conflicts and activate mappings. The
+        # journal permits replay if the process stops between these two stores.
+        for member in group.members:
+            keep = _batch_keep(group, member)
+            area_state = _resolution_state(
+                area_state,
+                member.device_identifier,
+                baseline=None
+                if keep
+                else _ManagedAreaBaseline(member.device_identifier, _batch_target(group), _AREA_PROCESS_TOKEN),
+                release=keep,
+            )
+        await _async_store_area_state(hass, entry_id, area_state, is_current=is_current)
+        _ensure_resolution_current(is_current)
+        if (reason := await checkpoint()) is not None:
+            return await withdraw_unverified_mapping(reason)
+        mappings = dict(stored.room_area_mappings)
+        selected = any(not _batch_keep(group, member) for member in group.members)
+        if selected and group.decision.room_uuid is not None:
+            if group.decision.action in {"use_existing", "create"}:
+                mappings[group.decision.room_uuid] = _batch_target(group)
+            elif group.decision.action == "clear":
+                mappings.pop(group.decision.room_uuid, None)
+        managed = dict(stored.managed_area_ids)
+        for member in group.members:
+            managed.pop(member.device_identifier, None)
+            if not _batch_keep(group, member) and _batch_target(group) is not None:
+                managed[member.device_identifier] = _batch_target(group)
+        stored = replace(stored, room_area_mappings=mappings, managed_area_ids=managed)
+        group = replace(group, mapping_committed=True)
+        batch = replace(batch, groups=(*batch.groups[:group_index], group, *batch.groups[group_index + 1 :]))
+        if (reason := await persist()) is not None:
+            return await withdraw_unverified_mapping(reason)
+    if (reason := await checkpoint()) is not None:
+        return result(reason)
+    await async_store_engineering_state(hass, replace(stored, pending_area_batch=None))
+    _ensure_resolution_current(is_current)
+    if (reason := await checkpoint()) is not None:
+        return await withdraw_unverified_mapping(reason)
+    return result("resolved")
+
+
 def _device_config_entries(device: object) -> frozenset[str]:
     """Read persisted ownership across supported HA device-registry shapes."""
     config_entry_id = getattr(device, "config_entry_id", None)
@@ -912,6 +1332,7 @@ def registry_metadata_from_snapshot(
     *,
     managed_area_ids: Mapping[str, str] | None = None,
     applied_generation: str | None = None,
+    room_area_mappings: Mapping[str, str] | None = None,
 ) -> EngineeringRegistryMetadata:
     """Derive sanitized active identifiers and rooms from a validated snapshot."""
     validate_engineering_snapshot(snapshot)
@@ -929,6 +1350,8 @@ def registry_metadata_from_snapshot(
         {identifier: area_id for identifier, area_id in (managed_area_ids or {}).items() if identifier in active},
         applied_generation,
         provider,
+        room_area_mappings or {},
+        snapshot.source.entry_id,
     )
 
 
@@ -992,7 +1415,7 @@ def _area_operation_policy(
     return allowed, "area_assignment_unverified" if current is not None and not allowed else None
 
 
-async def async_plan_engineering_registry_sync(
+async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit registry planning passes.
     hass: HomeAssistant,
     entry_id: str,
     snapshot: EngineeringSnapshot,
@@ -1022,7 +1445,18 @@ async def async_plan_engineering_registry_sync(
         prior_intent = area_state.intents.get(identifier)
         baseline = area_state.baselines.get(identifier)
         existing_conflict = area_state.conflicts.get(identifier)
-        desired_area = area_registry.async_get_area_by_name(node.element.room) if node.element.room else None
+        mapped_area_id = (
+            previous.room_area_mappings.get(node.element.room_uuid)
+            if previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
+            else None
+        )
+        desired_area = (
+            _batch_area_by_id(area_registry, mapped_area_id)
+            if mapped_area_id is not None
+            else area_registry.async_get_area_by_name(node.element.room)
+            if node.element.room
+            else None
+        )
         intent_replay = (
             area_state.generation_id == snapshot.generation_id
             and prior_intent is not None
@@ -1049,6 +1483,9 @@ async def async_plan_engineering_registry_sync(
             released=released,
             intent_replay=intent_replay,
         )
+        if mapped_area_id is not None and desired_area is None:
+            allowed = False
+            conflict_reason = "area_assignment_unverified"
         if (
             conflict_reason is None
             and not released
@@ -1072,6 +1509,8 @@ async def async_plan_engineering_registry_sync(
                 area_conflict_reason=conflict_reason,
                 area_released=released,
                 area_process_token=_AREA_PROCESS_TOKEN,
+                room_uuid=node.element.room_uuid,
+                mapped_area_id=mapped_area_id,
             )
         )
 
@@ -1130,6 +1569,9 @@ async def async_plan_engineering_registry_sync(
         snapshot,
         managed_area_ids=previous.managed_area_ids,
         applied_generation=snapshot.generation_id,
+        room_area_mappings=previous.room_area_mappings
+        if previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
+        else {},
     )
     return EngineeringRegistryPlan(
         snapshot.generation_id,
@@ -1141,9 +1583,15 @@ async def async_plan_engineering_registry_sync(
     )
 
 
-def _desired_area_id(area_registry: object, room: str | None) -> str | None:
+def _desired_area_id(area_registry: object, room: str | None, mapped_area_id: str | None = None) -> str | None:
     """Resolve an existing desired area without creating it."""
-    area = area_registry.async_get_area_by_name(room) if room else None
+    area = (
+        _batch_area_by_id(area_registry, mapped_area_id)
+        if mapped_area_id is not None
+        else area_registry.async_get_area_by_name(room)
+        if room
+        else None
+    )
     return area.id if area is not None else None
 
 
@@ -1165,6 +1613,10 @@ def _candidate_area_intents(
             or operation.identifier in prior_state.released_identifiers
             or operation.identifier in prior_state.conflicts
             or operation.identifier not in plan.metadata.active_device_identifiers
+            or (
+                operation.mapped_area_id is not None
+                and _batch_area_by_id(area_registry, operation.mapped_area_id) is None
+            )
         ):
             continue
         current = device_registry.async_get_device_by_identifier(
@@ -1179,7 +1631,7 @@ def _candidate_area_intents(
             and persisted.process_token == _AREA_PROCESS_TOKEN
             and persisted.to_room == operation.room
         )
-        desired_area_id = _desired_area_id(area_registry, operation.room)
+        desired_area_id = _desired_area_id(area_registry, operation.room, operation.mapped_area_id)
         persisted_replay_is_authorized = persisted_matches and (
             (current is None and persisted.from_area_id is None)
             or current_area in {persisted.from_area_id, desired_area_id}
@@ -1225,7 +1677,9 @@ def _recheck_area_intents(
             operation.entry_id,
         )
         current_area = getattr(current, "area_id", None) if current else None
-        desired_area_id = _desired_area_id(area_registry, intent.to_room)
+        desired_area_id = _desired_area_id(area_registry, intent.to_room, operation.mapped_area_id)
+        if operation.mapped_area_id is not None and desired_area_id is None:
+            continue
         if (
             (current is None and intent.from_area_id is None)
             or current_area == intent.from_area_id
@@ -1298,7 +1752,7 @@ def _apply_device_properties(
             name=operation.name,
             manufacturer="Loxone",
             model=operation.model,
-            suggested_area=operation.room,
+            suggested_area=operation.room if operation.mapped_area_id is None else None,
         )
         if before is None:
             created.add(operation.identifier)
@@ -1312,8 +1766,14 @@ def _apply_device_properties(
             for field_name, value in desired_fields.items()
             if getattr(device, field_name, None) != value
         }
-        desired_area = area_registry.async_get_area_by_name(operation.room) if operation.room else None
-        if operation.room and desired_area is None:
+        desired_area = (
+            _batch_area_by_id(area_registry, operation.mapped_area_id)
+            if operation.mapped_area_id is not None
+            else area_registry.async_get_area_by_name(operation.room)
+            if operation.room
+            else None
+        )
+        if operation.room and desired_area is None and operation.mapped_area_id is None:
             desired_area = area_registry.async_get_or_create(operation.room)
         desired_area_id = desired_area.id if desired_area is not None else None
         if operation.identifier in area_intents:
@@ -1346,7 +1806,11 @@ def _area_conflict(
 ) -> EngineeringAreaConflict:
     """Create a deterministic sanitized conflict record."""
     current_name = _area_name_by_id(area_registry, context.current_area_id)
-    desired_name = operation.room
+    desired_name = (
+        _area_name_by_id(area_registry, operation.mapped_area_id)
+        if operation.mapped_area_id is not None
+        else operation.room
+    )
     token_source = "\x1f".join(
         (
             operation.entry_id,
@@ -1354,6 +1818,7 @@ def _area_conflict(
             context.current_area_id or "",
             context.desired_area_id or "",
             operation.room or "",
+            operation.room_uuid or "",
             context.generation_id,
             context.reason,
         )
@@ -1369,6 +1834,9 @@ def _area_conflict(
         desired_area_name=desired_name,
         generation_id=context.generation_id,
         reason=context.reason,
+        room_uuid=operation.room_uuid,
+        desired_action_valid=operation.mapped_area_id is None
+        or _batch_area_by_id(area_registry, operation.mapped_area_id) is not None,
     )
 
 
@@ -1386,6 +1854,7 @@ def _refresh_area_conflict(
             current_area_id or "",
             conflict.desired_area_id or "",
             conflict.desired_area_name or "",
+            conflict.room_uuid or "",
             conflict.generation_id,
             reason,
         )
@@ -1426,7 +1895,7 @@ def _reconcile_area_state_after_apply(
             continue
         device = device_registry.async_get_device_by_identifier((DOMAIN, identifier), operation.entry_id)
         current_area = getattr(device, "area_id", None) if device else None
-        desired_area = _desired_area_id(area_registry, operation.room)
+        desired_area = _desired_area_id(area_registry, operation.room, operation.mapped_area_id)
         intent = intents.get(identifier)
         if intent is not None and current_area == desired_area:
             baselines[identifier] = _ManagedAreaBaseline(identifier, desired_area, _AREA_PROCESS_TOKEN)
@@ -1644,6 +2113,26 @@ async def async_apply_engineering_registry_plan(
 ) -> EngineeringRegistrySyncResult:
     """Apply both registry passes idempotently and then persist its recovery cursor."""
     async with _area_operation_lock(hass, _plan_entry_id(plan)):
+        if committed_state is not None:
+            latest = await async_load_engineering_state(hass, _plan_entry_id(plan))
+            if latest.snapshot is not None:
+                if latest.snapshot.generation_id != plan.generation_id:
+                    raise EngineeringRegistryError(_STATE_PLAN_MISMATCH)
+                committed_state = latest
+                # A batch may have finished while this caller waited for the
+                # entry lock. Replan against its new mappings and overrides.
+                if plan.metadata.room_area_mappings != latest.room_area_mappings:
+                    plan = await async_plan_engineering_registry_sync(
+                        hass,
+                        _plan_entry_id(plan),
+                        latest.snapshot,
+                        registry_metadata_from_snapshot(
+                            latest.snapshot,
+                            managed_area_ids=latest.managed_area_ids,
+                            room_area_mappings=latest.room_area_mappings,
+                            applied_generation=latest.registry_applied_generation,
+                        ),
+                    )
         return await _async_apply_engineering_registry_plan(hass, plan, committed_state=committed_state)
 
 

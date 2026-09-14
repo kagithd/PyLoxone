@@ -30,6 +30,7 @@ from .engineering_registry import (
     async_filter_entity_identity_conflicts,
     async_plan_engineering_registry_sync,
     registry_metadata_from_snapshot,
+    engineering_area_operation_lock,
 )
 from .engineering_runtime import (
     RUNTIME_PROBE_CONCURRENCY,
@@ -248,6 +249,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 metadata = registry_metadata_from_snapshot(
                     snapshot,
                     managed_area_ids=state.managed_area_ids,
+                    room_area_mappings=state.room_area_mappings,
                     applied_generation=state.registry_applied_generation,
                 )
                 plan = await async_plan_engineering_registry_sync(
@@ -288,8 +290,12 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                     self._engineering_published_impact_plan = plan
                     self._engineering_published_generation = generation
                 if state.impact_published_generation != generation:
-                    state = replace(state, impact_published_generation=generation)
-                    await async_store_engineering_state(self.hass, state)
+                    async with engineering_area_operation_lock(self.hass, self.config_entry.entry_id):
+                        state = await async_load_engineering_state(self.hass, self.config_entry.entry_id)
+                        if state.snapshot is None or state.snapshot.generation_id != generation:
+                            raise EngineeringSnapshotError(_REGISTRY_PENDING)  # noqa: TRY301 -- checked at recovery boundary.
+                        state = replace(state, impact_published_generation=generation)
+                        await async_store_engineering_state(self.hass, state)
             # Maintenance owns its separately persisted last-counted token. It
             # must still reevaluate elapsed-time eligibility on every drain.
             self.engineering_refresh_stage = "maintenance"
@@ -390,6 +396,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 else registry_metadata_from_snapshot(
                     previous,
                     managed_area_ids=state.managed_area_ids,
+                    room_area_mappings=state.room_area_mappings,
                     applied_generation=state.registry_applied_generation,
                 )
             )
@@ -411,15 +418,20 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 registry_plan=registry_plan,
             )
             self.engineering_refresh_stage = "snapshot_store"
-            committed = StoredEngineeringState(
-                snapshot=candidate,
-                pending_impact_plan=impacts,
-                registry_applied_generation=state.registry_applied_generation,
-                impact_published_generation=state.impact_published_generation,
-                managed_area_ids=state.managed_area_ids,
-            )
             try:
-                await async_store_engineering_state(self.hass, committed)
+                async with engineering_area_operation_lock(self.hass, self.config_entry.entry_id):
+                    state = await async_load_engineering_state(self.hass, self.config_entry.entry_id)
+                    committed = StoredEngineeringState(
+                        snapshot=candidate,
+                        pending_impact_plan=impacts,
+                        registry_applied_generation=state.registry_applied_generation,
+                        impact_published_generation=state.impact_published_generation,
+                        managed_area_ids=state.managed_area_ids,
+                        room_area_mappings=state.room_area_mappings,
+                        room_area_mapping_scope=state.room_area_mapping_scope,
+                        pending_area_batch=state.pending_area_batch,
+                    )
+                    await async_store_engineering_state(self.hass, committed)
             except EngineeringStoreCommitCancelledError as err:
                 if err.settled_outcome == EngineeringStoreCommitOutcome.COMMITTED:
                     self._adopt_engineering_snapshot(candidate)

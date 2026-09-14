@@ -357,7 +357,7 @@ async def async_store_engineering_registry_metadata(
     """Store applied metadata or the unchanged coordinator's legacy audit scope."""
     from dataclasses import replace  # noqa: PLC0415
 
-    from .engineering_registry import EngineeringRegistryMetadata  # noqa: PLC0415
+    from .engineering_registry import EngineeringRegistryMetadata, engineering_area_operation_lock  # noqa: PLC0415
     from .engineering_snapshot import (  # noqa: PLC0415
         async_load_engineering_state,
         async_store_engineering_state,
@@ -381,17 +381,18 @@ async def async_store_engineering_registry_metadata(
             }
         )
         return
-    state = await async_load_engineering_state(hass, entry_id)
-    if state.snapshot is None or metadata.applied_generation != state.snapshot.generation_id:
-        return
-    await async_store_engineering_state(
-        hass,
-        replace(
-            state,
-            registry_applied_generation=metadata.applied_generation,
-            managed_area_ids=metadata.managed_area_ids,
-        ),
-    )
+    async with engineering_area_operation_lock(hass, entry_id):
+        state = await async_load_engineering_state(hass, entry_id)
+        if state.snapshot is None or metadata.applied_generation != state.snapshot.generation_id:
+            return
+        await async_store_engineering_state(
+            hass,
+            replace(
+                state,
+                registry_applied_generation=metadata.applied_generation,
+                managed_area_ids=metadata.managed_area_ids,
+            ),
+        )
 
 
 async def async_load_engineering_registry_metadata(
@@ -432,6 +433,7 @@ async def async_load_engineering_registry_metadata(
         state.snapshot,
         managed_area_ids=state.managed_area_ids,
         applied_generation=applied,
+        room_area_mappings=state.room_area_mappings,
     )
     if applied is not None:
         return current
@@ -441,6 +443,8 @@ async def async_load_engineering_registry_metadata(
         current.managed_area_ids,
         None,
         current.provider_identifier,
+        current.room_area_mappings,
+        current.entry_id,
     )
 
 
