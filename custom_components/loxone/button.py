@@ -80,6 +80,7 @@ class LoxoneEngineeringInventoryButton(ButtonEntity):
         except Exception:
             self._attr_extra_state_attributes = {
                 "status": "error",
+                "error_stage": self._coordinator.engineering_refresh_stage,
             }
             self.async_write_ha_state()
             raise HomeAssistantError("Engineering inventory could not be loaded. Retry the refresh.") from None

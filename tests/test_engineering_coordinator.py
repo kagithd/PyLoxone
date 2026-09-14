@@ -646,7 +646,7 @@ def test_button_error_does_not_expose_exception(transaction, monkeypatch):
         with pytest.raises(HomeAssistantError) as caught:
             await button.async_press()
         assert "PRIVATE_MARKER" not in str(caught.value)
-        assert button.extra_state_attributes == {"status": "error"}
+        assert button.extra_state_attributes == {"status": "error", "error_stage": "download"}
         assert all("PRIVATE_MARKER" not in text for text in transaction.notifications.values())
 
     asyncio.run(scenario())

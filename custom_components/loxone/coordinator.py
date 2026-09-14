@@ -121,6 +121,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self._engineering_signaled_generation: str | None = None
         self._engineering_published_generation: str | None = None
         self._engineering_published_impact_plan: EngineeringImpactPlan | None = None
+        self.engineering_refresh_stage = "idle"
 
     async def async_config_entry_first_refresh(self) -> None:
         """Open the connection and initialize the ordinary LoxAPP model."""
@@ -225,6 +226,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
 
     async def async_drain_committed_engineering_state(self, *, startup: bool = False) -> None:
         """Finish one durable generation; callers hold the per-entry refresh lock."""
+        self.engineering_refresh_stage = "recovery_load"
         state = await async_load_engineering_state(self.hass, self.config_entry.entry_id)
         if state.snapshot is None:
             return
@@ -238,6 +240,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 or state.registry_applied_generation != generation
                 or self._engineering_registry_verified_generation != generation
             ):
+                self.engineering_refresh_stage = "registry_apply"
                 metadata = registry_metadata_from_snapshot(
                     snapshot,
                     managed_area_ids=state.managed_area_ids,
@@ -251,6 +254,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 if state.registry_applied_generation != generation:
                     raise EngineeringSnapshotError(_REGISTRY_PENDING)  # noqa: TRY301 -- checked inside recovery boundary.
                 self._engineering_registry_verified_generation = generation
+            self.engineering_refresh_stage = "repairs_sync"
             await async_sync_engineering_area_conflict_issues(
                 self.hass,
                 self.config_entry.entry_id,
@@ -260,6 +264,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             if not startup:
                 self._signal_engineering_generation(generation)
             if startup or state.impact_published_generation != generation:
+                self.engineering_refresh_stage = "impact_publish"
                 if startup or self._engineering_published_generation != generation:
                     plan = state.pending_impact_plan or EngineeringImpactPlan(generation, ())
                     if (
@@ -283,12 +288,14 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                     await async_store_engineering_state(self.hass, state)
             # Maintenance owns its separately persisted last-counted token. It
             # must still reevaluate elapsed-time eligibility on every drain.
+            self.engineering_refresh_stage = "maintenance"
             await async_run_registry_maintenance(
                 self.hass, self.config_entry, self.miniserver.lox_config.json, bounded_notification=True
             )
             if startup:
                 self._signal_engineering_generation(generation)
             persistent_notification.async_dismiss(self.hass, self._engineering_status_notification_id)
+            self.engineering_refresh_stage = "complete"
         except (Exception, asyncio.CancelledError):
             self._engineering_degraded_notification()
             raise
@@ -303,7 +310,9 @@ class LoxoneCoordinator(DataUpdateCoordinator):
     async def async_refresh_engineering_inventory(self, *, force: bool = False) -> EngineeringSnapshot | None:
         """Commit a validated read before mutation, then drain replayable phases."""
         async with self._engineering_refresh_lock:
+            self.engineering_refresh_stage = "recovery"
             await self.async_drain_committed_engineering_state()
+            self.engineering_refresh_stage = "revision_check"
             revision = extract_loxapp_last_modified(self.miniserver.lox_config.json)
             previous = self.engineering_snapshot
             if (
@@ -312,9 +321,13 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 and revision is not None
                 and revision == previous.source.loxapp_last_modified
             ):
+                self.engineering_refresh_stage = "runtime_rebind"
                 await self.async_rebind_engineering_runtime()
+                self.engineering_refresh_stage = "complete"
                 return None
+            self.engineering_refresh_stage = "download"
             inventory = await self._async_download_engineering_inventory()
+            self.engineering_refresh_stage = "topology"
             source = EngineeringSourceContext(
                 self.config_entry.entry_id,
                 self.miniserver.serial,
@@ -326,12 +339,14 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 revision,
             )
             resolved = resolve_engineering_topology(inventory, source)
+            self.engineering_refresh_stage = "runtime_probe"
             runtime = await async_probe_engineering_runtime(resolved, client=self._engineering_runtime_client())
             if any(
                 binding.status in {"auth_error", "transport_error", "malformed_response"}
                 for binding in runtime.bindings
             ):
                 raise EngineeringSnapshotError(_PROBE_FAILED)
+            self.engineering_refresh_stage = "snapshot_validation"
             rows = resolve_engineering_capabilities(resolved, runtime)
             _, rejected = await async_filter_entity_identity_conflicts(
                 self.hass,
@@ -375,12 +390,14 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 )
             )
             # Planning and consumer discovery must both finish before commit.
+            self.engineering_refresh_stage = "registry_plan"
             registry_plan = await async_plan_engineering_registry_sync(
                 self.hass,
                 self.config_entry.entry_id,
                 candidate,
                 metadata,
             )
+            self.engineering_refresh_stage = "impact_analysis"
             impacts = await async_find_engineering_change_impacts(
                 self.hass,
                 self.config_entry,
@@ -389,6 +406,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 state.pending_impact_plan,
                 registry_plan=registry_plan,
             )
+            self.engineering_refresh_stage = "snapshot_store"
             committed = StoredEngineeringState(
                 snapshot=candidate,
                 pending_impact_plan=impacts,
@@ -405,7 +423,9 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 raise
             self._adopt_engineering_snapshot(candidate)
             self.engineering_runtime = runtime
+            self.engineering_refresh_stage = "registry_apply"
             await self.async_drain_committed_engineering_state()
+            self.engineering_refresh_stage = "complete"
             return self.engineering_snapshot
 
     async def async_rebind_engineering_runtime(self) -> None:
