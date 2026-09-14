@@ -10,6 +10,8 @@ from typing import Final
 
 from homeassistant.const import Platform
 
+VERSION_SENSOR_UNIQUE_ID_SUFFIX: Final = "loxone_software_version_uuid"
+
 LOXONE_PLATFORMS: Final[list[Platform]] = [
     Platform.SENSOR,
     Platform.BINARY_SENSOR,

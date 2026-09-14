@@ -314,6 +314,16 @@ def _probe_targets(element: EngineeringElement, *, unique_io_name: bool) -> tupl
     return tuple(targets)
 
 
+async def _read_bounded_runtime_response(content: aiohttp.StreamReader) -> bytes:
+    """Read through EOF without buffering more than the limit plus one byte."""
+    body = bytearray()
+    while chunk := await content.read(MAX_RUNTIME_RESPONSE_BYTES + 1 - len(body)):
+        body.extend(chunk)
+        if len(body) > MAX_RUNTIME_RESPONSE_BYTES:
+            raise EngineeringRuntimeError(ERR_RESPONSE_TOO_LARGE)
+    return bytes(body)
+
+
 async def _probe_element(
     client: RuntimeProbeClient,
     element: EngineeringElement,
@@ -358,7 +368,7 @@ async def _probe_element(
                             else "not_found"
                         )
                         continue
-                    payload = await response.content.read(MAX_RUNTIME_RESPONSE_BYTES + 1)
+                    payload = await _read_bounded_runtime_response(response.content)
                 parsed = _parse_runtime_response(payload)
                 last_code = parsed.code
                 if parsed.code != HTTP_OK:

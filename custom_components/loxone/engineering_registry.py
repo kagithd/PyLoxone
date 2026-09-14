@@ -636,13 +636,13 @@ def _resolution_desired_area_id(
     area_registry: object,
     conflict: EngineeringAreaConflict,
 ) -> tuple[bool, str | None]:
-    """Resolve or create the explicitly selected Loxone area."""
+    """Resolve an existing area; creation requires the explicit batch action."""
     desired_area_id = conflict.desired_area_id
     if conflict.desired_area_name is None:
         return True, desired_area_id
     desired_area = area_registry.async_get_area_by_name(conflict.desired_area_name)
     if desired_area is None:
-        desired_area = area_registry.async_get_or_create(conflict.desired_area_name)
+        return False, None
     if desired_area_id is not None and desired_area.id != desired_area_id:
         return False, None
     return True, desired_area.id
@@ -1542,11 +1542,12 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
             released=released,
             intent_replay=intent_replay,
         )
-        if mapped_area_id is not None and desired_area is None:
+        if (mapped_area_id is not None or node.element.room) and desired_area is None:
             allowed = False
             conflict_reason = "area_assignment_unverified"
         if (
             conflict_reason is None
+            and not allowed
             and not released
             and current is not None
             and desired_area is not None
@@ -1673,8 +1674,8 @@ def _candidate_area_intents(
             or operation.identifier in prior_state.conflicts
             or operation.identifier not in plan.metadata.active_device_identifiers
             or (
-                operation.mapped_area_id is not None
-                and _batch_area_by_id(area_registry, operation.mapped_area_id) is None
+                (operation.mapped_area_id is not None or operation.room)
+                and _desired_area_id(area_registry, operation.room, operation.mapped_area_id) is None
             )
         ):
             continue
@@ -1737,7 +1738,7 @@ def _recheck_area_intents(
         )
         current_area = getattr(current, "area_id", None) if current else None
         desired_area_id = _desired_area_id(area_registry, intent.to_room, operation.mapped_area_id)
-        if operation.mapped_area_id is not None and desired_area_id is None:
+        if (operation.mapped_area_id is not None or operation.room) and desired_area_id is None:
             continue
         if (
             (current is None and intent.from_area_id is None)
@@ -1811,7 +1812,7 @@ def _apply_device_properties(
             name=operation.name,
             manufacturer="Loxone",
             model=operation.model,
-            suggested_area=operation.room if operation.mapped_area_id is None else None,
+            suggested_area=None,
         )
         if before is None:
             created.add(operation.identifier)
@@ -1832,10 +1833,9 @@ def _apply_device_properties(
             if operation.room
             else None
         )
-        if operation.room and desired_area is None and operation.mapped_area_id is None:
-            desired_area = area_registry.async_get_or_create(operation.room)
         desired_area_id = desired_area.id if desired_area is not None else None
-        if operation.identifier in area_intents:
+        target_resolved = desired_area is not None or not (operation.room or operation.mapped_area_id)
+        if operation.identifier in area_intents and target_resolved:
             if getattr(device, "area_id", None) != desired_area_id:
                 changes["area_id"] = desired_area_id
             if desired_area_id is not None and operation.identifier in plan.metadata.active_device_identifiers:
@@ -1955,8 +1955,9 @@ def _reconcile_area_state_after_apply(
         device = device_registry.async_get_device_by_identifier((DOMAIN, identifier), operation.entry_id)
         current_area = getattr(device, "area_id", None) if device else None
         desired_area = _desired_area_id(area_registry, operation.room, operation.mapped_area_id)
+        target_missing = bool(operation.room or operation.mapped_area_id) and desired_area is None
         intent = intents.get(identifier)
-        if intent is not None and current_area == desired_area:
+        if intent is not None and not target_missing and current_area == desired_area:
             baselines[identifier] = _ManagedAreaBaseline(identifier, desired_area, _AREA_PROCESS_TOKEN)
             conflicts.pop(identifier, None)
             remaining_intents.pop(identifier, None)
@@ -1970,12 +1971,13 @@ def _reconcile_area_state_after_apply(
             and baseline.process_token == _AREA_PROCESS_TOKEN
             and current_area == baseline.area_id
             and operation.area_conflict_reason is None
+            and not target_missing
         ):
             if current_area is not None:
                 managed[identifier] = current_area
             continue
         mismatch_after_plan = current_area != operation.expected_area_id
-        reason = operation.area_conflict_reason
+        reason = "area_assignment_unverified" if target_missing else operation.area_conflict_reason
         if reason is None and baseline is None and intent is None:
             reason = "area_assignment_unverified"
         if baseline is not None and baseline.process_token != _AREA_PROCESS_TOKEN:

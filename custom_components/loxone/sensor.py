@@ -46,7 +46,10 @@ from homeassistant.helpers.typing import UNDEFINED, ConfigType, DiscoveryInfoTyp
 from homeassistant.util import dt as dt_util
 
 from . import LoxoneEntity
-from .const import CLIMATE_EVENT, CONF_ACTIONID, DOMAIN, EVENT, SENDDOMAIN, THROTTLE_KEEP_ALIVE_TIME
+from .const import (
+    CLIMATE_EVENT, CONF_ACTIONID, DOMAIN, EVENT, SENDDOMAIN,
+    THROTTLE_KEEP_ALIVE_TIME, VERSION_SENSOR_UNIQUE_ID_SUFFIX,
+)
 from .engineering_entities import (
     EngineeringEntitySpec,
     EngineeringPlatformReconciler,
@@ -601,7 +604,7 @@ class LoxoneVersionSensor(LoxoneEntity, SensorEntity):
     _attr_should_poll = False
     _attr_name = "Loxone Software Version"
     _attr_icon = "mdi:information-outline"
-    _attr_unique_id = "loxone_software_version_uuid"
+    _attr_unique_id = VERSION_SENSOR_UNIQUE_ID_SUFFIX
 
     def __init__(self, minisersver_serial, version_list, **kwargs):
         super().__init__(**kwargs)

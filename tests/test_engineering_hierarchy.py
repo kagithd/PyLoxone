@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+
+import pytest
 
 from custom_components.loxone.engineering_hierarchy import (
     build_engineering_hierarchy,
@@ -10,6 +13,44 @@ from custom_components.loxone.engineering_hierarchy import (
 )
 from custom_components.loxone.engineering_runtime import EngineeringRuntimeInventory
 from tests.engineering_fixtures import element, inventory_of, make_snapshot, numeric_binding
+
+
+@pytest.mark.parametrize("proven_owner", (False, True))
+def test_unknown_safe_functions_remain_visible_without_inferred_ownership(proven_owner):
+    """Unknown rows survive exactly once, using only explicit owner metadata."""
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element("device", "FutureDevice", parent_uuid="ms", title="Shared label"),
+            element("function", "FutureFunction", parent_uuid="device", title="Shared label"),
+            element("unowned", "FutureFunction", title="Shared label"),
+            element("channel", "VoltageIn", parent_uuid="device"),
+            element("hidden", "NfcCode", parent_uuid="device", title="Synthetic secret"),
+        )
+    )
+    if proven_owner:
+        snapshot = replace(
+            snapshot,
+            rows=tuple(
+                replace(row, node=replace(row.node, owner_key="device")) if row.node.element.key == "function" else row
+                for row in snapshot.rows
+            ),
+        )
+    payload = hierarchy_to_dict(build_engineering_hierarchy(snapshot))
+    device = payload["root"]["children"][0]
+    groups = [section for section in payload["root"]["sections"] if section["identifier"] == "unassigned"]
+    assert len(groups) == 1
+    unassigned = groups[0]
+    assert {fn["key"] for fn in device["functions"]} == ({"channel", "function"} if proven_owner else {"channel"})
+    assert {fn["key"] for fn in unassigned["functions"]} == ({"unowned"} if proven_owner else {"function", "unowned"})
+    functions = device["functions"] + unassigned["functions"]
+    assert len(functions) == 3
+    for function in functions:
+        if function["technical_type"] == "FutureFunction":
+            assert function["status"] == "unsupported"
+            assert function["reason"] == "unsupported_technical_type"
+    assert payload["summary"]["unsupported"] == 2
+    assert "Synthetic secret" not in json.dumps(payload)
 
 
 def test_placement_carriers_are_direct_safe_and_conflicts_are_order_independent():
@@ -204,7 +245,16 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
                     "label": None,
                     "technical_type": None,
                     "bus_kind": None,
-                    "functions": [],
+                    "functions": [
+                        {
+                            "key": "io",
+                            "label": "IoData",
+                            "technical_type": "IoData",
+                            "status": "unsupported",
+                            "reason": "unsupported_technical_type",
+                            "entity_id": None,
+                        }
+                    ],
                     "children": [
                         {
                             "identifier": "serial-a:orphan-device",
@@ -295,7 +345,7 @@ def test_generic_hierarchy_projects_ownership_statuses_and_protected_content():
             "active_entity": 1,
             "prepared": 2,
             "inventory_only": 1,
-            "unsupported": 1,
+            "unsupported": 2,
             "protected": 2,
         },
     }

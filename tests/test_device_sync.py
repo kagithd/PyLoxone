@@ -362,4 +362,4 @@ def test_version_sensor_registry_identity_is_migrated_before_setup(monkeypatch):
 
     assert migrated == 1
     assert entity.entity_id == "sensor.loxone_software_version"
-    assert entity.unique_id == "serial-loxone_software_version"
+    assert entity.unique_id == "serial-loxone_software_version_uuid"

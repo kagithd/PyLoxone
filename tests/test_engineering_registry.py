@@ -51,6 +51,46 @@ from tests.engineering_fixtures import (
 _UNDEFINED = object()
 
 
+@pytest.mark.parametrize("state", ("conflicted", "released", "new", "managed"))
+def test_refresh_missing_named_area_requires_explicit_creation(registries, monkeypatch, state):
+    """Refreshing absent targets must neither create areas nor change assignments."""
+    office = registries.areas.async_get_or_create("Office")
+    if state != "new":
+        registries.devices.add("serial-a:device", "entry-a", area_id=office.id)
+    if state == "released":
+        FakeIntentStore.data = {
+            "generation_id": "old-generation",
+            "released_identifiers": ["serial-a:device"],
+        }
+    elif state == "managed":
+        _seed_managed_baseline(office.id)
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", room=None),
+            element("device", "TreeDevice", parent_uuid="ms", room="Absent room"),
+        )
+    )
+    monkeypatch.setattr(engineering_registry, "async_store_engineering_state", lambda *args: asyncio.sleep(0))
+
+    async def run():
+        plan = await async_plan_engineering_registry_sync(
+            registries.hass, "entry-a", snapshot, EngineeringRegistryMetadata.empty()
+        )
+        await async_apply_engineering_registry_plan(
+            registries.hass, plan, committed_state=StoredEngineeringState(snapshot)
+        )
+        return await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+
+    conflicts = asyncio.run(run())
+    assert registries.areas.mutations == 1
+    assert registries.areas.async_get_area_by_name("Absent room") is None
+    assert registries.device("serial-a:device").area_id == (None if state == "new" else office.id)
+    if state != "released":
+        assert len(conflicts) == 1
+        assert conflicts[0].desired_area_id is None
+        assert conflicts[0].desired_area_name == "Absent room"
+
+
 async def _batch_case(registries, monkeypatch, room_uuid="room-a"):
     """Reuse real reconciliation and persist copied wire state across cold runs."""
     from custom_components.loxone import engineering_snapshot as snapshots
@@ -86,6 +126,24 @@ async def _batch_case(registries, monkeypatch, room_uuid="room-a"):
     await _record_override(registries, snapshot, StoredEngineeringState(snapshot))
     conflicts = await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
     return SimpleNamespace(snapshot=snapshot, saved=saved, load=load, target=target, office=office, conflicts=conflicts)
+
+
+def test_legacy_room_resolution_cannot_create_an_absent_area(registries, monkeypatch):
+    """Only the explicit batch create decision may create a global HA area."""
+
+    async def run():
+        case = await _batch_case(registries, monkeypatch)
+        before = registries.areas.mutations
+        result = await engineering_registry.async_resolve_engineering_area_conflict(
+            registries.hass, "entry-a", case.conflicts[0].token, "apply_loxone_room"
+        )
+        assert not result.resolved
+        assert registries.areas.mutations == before
+        assert registries.areas.async_get_area_by_name("Workshop") is None
+        assert registries.device(case.conflicts[0].device_identifier).area_id == case.office.id
+        assert await engineering_registry.async_load_engineering_area_conflicts(registries.hass, "entry-a")
+
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(
@@ -764,6 +822,8 @@ def _seed_managed_baseline(area_id, identifiers=("serial-a:device",)):
 def _area_recovery_case(registries, monkeypatch, room="Workshop"):
     """Build an acknowledged current-process managed transition."""
     office = registries.areas.async_get_or_create("Office")
+    if room and registries.areas.async_get_area_by_name(room) is None:
+        registries.areas.async_create(room)
     registries.devices.add("serial-a:device", "entry-a", area_id=office.id, name="ST-F07")
     FakeIntentStore.data = {
         "managed_baselines": [{"identifier": "serial-a:device", "area_id": office.id, "process_token": "process-a"}]
@@ -1521,6 +1581,7 @@ def test_registry_planning_is_mutation_free(registries):
 
 def test_loxone_area_move_updates_only_integration_managed_assignment(registries):
     """A Loxone room move must preserve an explicit Home Assistant area override."""
+    registries.areas.async_create("Workshop")
     old_area = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(old_area.id)
     managed = registries.devices.add(
@@ -1841,6 +1902,8 @@ def test_sensitive_only_service_is_not_created(registries):
 
 def test_area_intent_survives_metadata_failure_and_fresh_replan(registries, monkeypatch):
     """A cold replan must retain ownership of an integration-made room move."""
+    registries.areas.async_create("Workshop")
+    registries.areas.async_create("Living Room")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(
@@ -1963,6 +2026,7 @@ def test_area_intent_survives_metadata_failure_and_fresh_replan(registries, monk
 
 def test_same_plan_replay_retains_managed_area_after_metadata_failure(registries, monkeypatch):
     """The original deterministic plan must recognize its persisted move."""
+    registries.areas.async_create("Workshop")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(
@@ -2045,6 +2109,7 @@ def test_cross_process_old_area_is_preserved_for_explicit_resolution(
     monkeypatch,
 ):
     """An older HA area after restart is never inferred to be a rollback."""
+    registries.areas.async_create("Workshop")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(
@@ -2135,6 +2200,7 @@ def test_same_process_unexplained_area_change_is_preserved_and_conflicted(
     override_room,
 ):
     """A post-apply user change is never inferred from its area value."""
+    registries.areas.async_create("Workshop")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(
@@ -2224,6 +2290,7 @@ def test_rapid_generations_cold_old_area_pauses_without_timestamp_inference(
     modified_at,
 ):
     """Cold older registry states become conflicts regardless of timestamps."""
+    registries.areas.async_create("Workshop")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(
@@ -2317,6 +2384,7 @@ def test_managed_area_clear_is_explicit_then_allows_following_room_move(
     monkeypatch,
 ):
     """A managed Office to None to Workshop sequence remains intentional."""
+    registries.areas.async_create("Workshop")
     office = registries.areas.async_get_or_create("Office")
     _seed_managed_baseline(office.id)
     device = registries.devices.add(

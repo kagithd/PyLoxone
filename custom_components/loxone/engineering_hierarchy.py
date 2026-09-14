@@ -218,6 +218,7 @@ def _attach_nodes(
 
 def _attach_functions(
     rows: tuple[EngineeringInventoryRow, ...],
+    root: _MutableHierarchyNode,
     by_key: dict[str, _MutableHierarchyNode],
     by_identifier: dict[str, _MutableHierarchyNode],
     entity_ids: Mapping[str, str],
@@ -230,13 +231,19 @@ def _attach_functions(
     }
     for row in rows:
         node = row.node
-        if node.kind is not NodeKind.CHANNEL:
+        if node.element.key in by_key:
             continue
         owner = by_key.get(node.owner_key or "")
         if owner is None:
             owner = by_identifier.get(node.device_identifier or "")
         if owner is None:
-            continue
+            owner = next(
+                (child for child in root.children if child.identifier == _UNASSIGNED_IDENTIFIER),
+                None,
+            )
+            if owner is None:
+                owner = _MutableHierarchyNode(_UNASSIGNED_IDENTIFIER, "structural", None, None, None)
+                root.children.append(owner)
         status, entity_id = _status(row, entity_ids)
         counts[status] += 1
         owner.functions.append(
@@ -294,7 +301,7 @@ def build_engineering_hierarchy(
     builders_by_key, builders_by_identifier = _build_nodes(safe_rows)
     root = builders_by_key[root_row.node.element.key]
     _attach_nodes(safe_rows, root, builders_by_key, builders_by_identifier)
-    counts = _attach_functions(safe_rows, builders_by_key, builders_by_identifier, entity_ids)
+    counts = _attach_functions(safe_rows, root, builders_by_key, builders_by_identifier, entity_ids)
     protected = _attach_protected(snapshot, root, builders_by_key, builders_by_identifier)
 
     return EngineeringHierarchy(

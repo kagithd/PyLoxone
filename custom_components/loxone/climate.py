@@ -495,8 +495,14 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
         op_mode = self.operating_mode
         active_mode = self.active_mode
         is_fixed = active_mode in (ActiveMode.FIXED_DYNAMIC, ActiveMode.FIXED)
+        has_range = bool(self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE)
 
-        if is_fixed or active_mode == ActiveMode.MANUAL or op_mode in (OperatingMode.MANUAL_COOL, OperatingMode.MANUAL_HEAT) or (op_mode is OperatingMode.MANUAL_HEAT_COOL and not self._range_possible):
+        if (
+            is_fixed
+            or active_mode == ActiveMode.MANUAL
+            or op_mode in (OperatingMode.MANUAL_COOL, OperatingMode.MANUAL_HEAT)
+            or (op_mode is OperatingMode.MANUAL_HEAT_COOL and not has_range)
+        ):
             # Manual mode — set manual temperature directly
             if "temperature" in kwargs:
                 self.hass.bus.fire(
@@ -506,14 +512,15 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
                         value=f'setManualTemperature/{kwargs["temperature"]}',
                     ),
                 )
-        elif not is_fixed and self._range_possible and op_mode in (OperatingMode.AUTO_HEAT_COOL, OperatingMode.MANUAL_HEAT_COOL):
-            active = self.active_mode
+        elif has_range:
             if "target_temp_high" in kwargs:
-                comfort_cool = self.get_state_value("comfortTemperatureCool")
-                if comfort_cool is not None:
+                current_high = self.get_state_value(
+                    "heatProtectTemperature" if active_mode == ActiveMode.BUILDING_PROTECT else "comfortTemperatureCool"
+                )
+                if current_high is not None:
                     new_temp = kwargs["target_temp_high"]
-                    if active == ActiveMode.ECONOMY:
-                        new_temp = new_temp - comfort_cool
+                    if active_mode == ActiveMode.ECONOMY:
+                        new_temp = new_temp - current_high
                         new_temp = new_temp if new_temp >= 0.5 else 0.5
                         absent = self.get_state_value("absentMaxOffset")
                         if new_temp != absent:
@@ -521,24 +528,26 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setAbsentMaxTemperature/{new_temp}"),
                             )
-                    elif active == ActiveMode.COMFORT:
-                        if new_temp != comfort_cool:
+                    elif active_mode == ActiveMode.COMFORT:
+                        if new_temp != current_high:
                             self.hass.bus.fire(
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setComfortTemperatureCool/{new_temp}"),
                             )
-                    elif active == ActiveMode.BUILDING_PROTECT:
-                        if new_temp != comfort_cool:
+                    elif active_mode == ActiveMode.BUILDING_PROTECT:
+                        if new_temp != current_high:
                             self.hass.bus.fire(
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setecoplusmaxtemperature/{new_temp}"),
                             )
             if "target_temp_low" in kwargs:
-                comfort_heat = self.get_state_value("comfortTemperature")
-                if comfort_heat is not None:
+                current_low = self.get_state_value(
+                    "frostProtectTemperature" if active_mode == ActiveMode.BUILDING_PROTECT else "comfortTemperature"
+                )
+                if current_low is not None:
                     new_temp = kwargs["target_temp_low"]
-                    if active == ActiveMode.ECONOMY:
-                        new_temp = comfort_heat - new_temp
+                    if active_mode == ActiveMode.ECONOMY:
+                        new_temp = current_low - new_temp
                         new_temp = new_temp if new_temp >= 0.5 else 0.5
                         absent = self.get_state_value("absentMinOffset")
                         if new_temp != absent:
@@ -546,14 +555,14 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setAbsentMinTemperature/{new_temp}"),
                             )
-                    elif active == ActiveMode.COMFORT:
-                        if new_temp != comfort_heat:
+                    elif active_mode == ActiveMode.COMFORT:
+                        if new_temp != current_low:
                             self.hass.bus.fire(
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setComfortTemperature/{new_temp}"),
                             )
-                    elif active == ActiveMode.BUILDING_PROTECT:
-                        if new_temp != comfort_cool:
+                    elif active_mode == ActiveMode.BUILDING_PROTECT:
+                        if new_temp != current_low:
                             self.hass.bus.fire(
                                 SENDDOMAIN,
                                 dict(uuid=self.uuidAction, value=f"setecoplusmintemperature/{new_temp}"),
@@ -581,11 +590,10 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
     def target_temperature(self) -> float | None:
         """Return the temperature we try to reach."""
 
-        mode = self.operating_mode
         active = self.active_state
         if active.mode is ActiveMode.FIXED_DYNAMIC:
             return active.value
-        if mode not in (OperatingMode.AUTO_HEAT_COOL, OperatingMode.MANUAL_HEAT_COOL):
+        if not self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             return self.get_state_value("tempTarget")
         if active.mode is ActiveMode.MANUAL:
             return self.get_state_value("tempTarget")
@@ -599,9 +607,8 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
     def target_temperature_high(self) -> float | None:
         """Return the highbound target temperature we try to reach."""
 
-        mode = self.operating_mode
         active = self.active_mode
-        if mode in (OperatingMode.AUTO_HEAT_COOL, OperatingMode.MANUAL_HEAT_COOL):
+        if self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             if active == ActiveMode.COMFORT:
                 offset = self.get_state_value("comfortTemperatureOffset")
                 return self.get_state_value("comfortTemperatureCool")
@@ -618,9 +625,8 @@ class LoxoneRoomControllerV2(LoxoneEntity, ClimateEntity, ABC):
     def target_temperature_low(self) -> float | None:
         """Return the lowbound target temperature we try to reach."""
 
-        mode = self.operating_mode
         active = self.active_mode
-        if mode in (OperatingMode.AUTO_HEAT_COOL, OperatingMode.MANUAL_HEAT_COOL):
+        if self.supported_features & ClimateEntityFeature.TARGET_TEMPERATURE_RANGE:
             if active == ActiveMode.COMFORT:
                 return self.get_state_value("comfortTemperature")
             elif active == ActiveMode.ECONOMY:

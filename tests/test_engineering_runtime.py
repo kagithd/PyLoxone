@@ -10,6 +10,7 @@ import pytest
 from custom_components.loxone.engineering_config import EngineeringElement
 from custom_components.loxone.engineering_topology import resolve_engineering_topology
 from custom_components.loxone.engineering_runtime import (
+    MAX_RUNTIME_RESPONSE_BYTES,
     _parse_runtime_response,
     _probe_targets,
     _probe_element,
@@ -115,15 +116,25 @@ def test_all_response_keeps_explicit_child_uuid_but_scalar_has_no_state_uuid():
 
 class _Content:
     def __init__(self, payload):
-        self.payload = payload
+        self.chunks = list(payload) if isinstance(payload, tuple) else [payload]
+        self.bytes_read = 0
+        self.requests = []
 
-    async def read(self, _limit):
-        return self.payload
+    async def read(self, limit):
+        self.requests.append(limit)
+        if not self.chunks:
+            return b""
+        chunk = self.chunks.pop(0)
+        result = chunk[:limit]
+        if chunk[limit:]:
+            self.chunks.insert(0, chunk[limit:])
+        self.bytes_read += len(result)
+        return result
 
 
 class _Response:
     def __init__(self, status, payload):
-        self.status, self.content = status, _Content(payload)
+        self.status, self.content = status, payload if isinstance(payload, _Content) else _Content(payload)
 
     async def __aenter__(self):
         return self
@@ -153,6 +164,28 @@ def _probe_inventory(inventory, replies=()):
     client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
     result = asyncio.run(async_probe_engineering_runtime(inventory, client=client))
     return result, session
+
+
+@pytest.mark.anyio
+async def test_fragmented_runtime_response_is_read_through_eof():
+    content = _Content((b'<LL Code="200" ', b'u1="event" ', b'v1="20.5 C"/>'))
+    session = _Session([(200, content)])
+    client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
+    binding = await _probe_element(client, _element(), unique_io_name=False, binding_method="uuid_all")
+    assert (binding.status, binding.state_uuid, binding.numeric_value, binding.unit) == ("bound", "event", 20.5, "C")
+    assert len(content.requests) == 4
+
+
+@pytest.mark.anyio
+async def test_runtime_stream_aborts_at_limit_before_reading_remaining_body():
+    content = _Content((b'<LL Code="200" u1="event" v1="20.5"/>', b" " * MAX_RUNTIME_RESPONSE_BYTES, b"unread"))
+    session = _Session([(200, content)])
+    client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
+    binding = await _probe_element(client, _element(), unique_io_name=False, binding_method="uuid_all")
+    assert binding.status == "malformed_response"
+    assert content.bytes_read == MAX_RUNTIME_RESPONSE_BYTES + 1
+    assert content.chunks
+    assert all(0 < size <= MAX_RUNTIME_RESPONSE_BYTES + 1 for size in content.requests)
 
 
 def test_async_probe_preserves_auth_before_later_scalar_success():

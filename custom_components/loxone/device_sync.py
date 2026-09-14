@@ -10,7 +10,7 @@ from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 
-from .const import DOMAIN
+from .const import DOMAIN, VERSION_SENSOR_UNIQUE_ID_SUFFIX
 
 if TYPE_CHECKING:
     from homeassistant.config_entries import ConfigEntry
@@ -125,7 +125,7 @@ def async_migrate_version_sensor_unique_id(
         return 0
 
     entity_registry = er.async_get(hass)
-    stable_unique_id = f"{miniserver_serial}-loxone_software_version"
+    stable_unique_id = f"{miniserver_serial}-{VERSION_SENSOR_UNIQUE_ID_SUFFIX}"
     entries = [
         entity
         for entity in er.async_entries_for_config_entry(
