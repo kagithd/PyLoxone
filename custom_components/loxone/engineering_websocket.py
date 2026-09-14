@@ -126,26 +126,50 @@ def _provider_checked_devices(
     entry_id: str,
     snapshot: EngineeringSnapshot,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    """Return only devices whose exact integration identifier is in the snapshot."""
-    allowed_identifiers = {
-        node.device_identifier for node in snapshot.nodes if not node.sensitive and node.device_identifier is not None
+    """Return only devices whose exact identifier and current parent match."""
+    expected_via_by_identifier = {
+        node.device_identifier: node.via_device_identifier
+        for node in snapshot.nodes
+        if node.kind is not NodeKind.CHANNEL and not node.sensitive and node.device_identifier is not None
     }
     registry = dr.async_get(hass)
+    owned_devices = tuple(
+        device
+        for device in dr.async_entries_for_config_entry(registry, entry_id)
+        if getattr(device, "config_entry_id", None) == entry_id
+    )
+    owned_device_by_id = {
+        device_id: device
+        for device in owned_devices
+        if isinstance(device_id := getattr(device, "id", None), str) and device_id
+    }
     device_id_by_identifier: dict[str, str] = {}
     device_by_id: dict[str, Any] = {}
-    for device in dr.async_entries_for_config_entry(registry, entry_id):
-        if getattr(device, "config_entry_id", None) != entry_id:
-            continue
+    for device in owned_devices:
         identifiers = getattr(device, "identifiers", ())
         matches = sorted(
-            identifier for domain, identifier in identifiers if domain == DOMAIN and identifier in allowed_identifiers
+            identifier
+            for domain, identifier in identifiers
+            if domain == DOMAIN and identifier in expected_via_by_identifier
         )
         if len(matches) != 1:
             continue
         device_id = getattr(device, "id", None)
         if not isinstance(device_id, str) or not device_id:
             continue
-        device_id_by_identifier[matches[0]] = device_id
+        identifier = matches[0]
+        expected_via_identifier = expected_via_by_identifier[identifier]
+        current_via_id = getattr(device, "via_device_id", None)
+        if expected_via_identifier is None:
+            if current_via_id is not None:
+                continue
+        else:
+            current_parent = owned_device_by_id.get(current_via_id)
+            if current_parent is None or (DOMAIN, expected_via_identifier) not in getattr(
+                current_parent, "identifiers", ()
+            ):
+                continue
+        device_id_by_identifier[identifier] = device_id
         device_by_id[device_id] = device
     return device_id_by_identifier, device_by_id
 

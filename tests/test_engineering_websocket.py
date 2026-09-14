@@ -161,16 +161,19 @@ def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monke
             id="device-provider",
             config_entry_id="entry-a",
             identifiers={(DOMAIN, "serial-a")},
+            via_device_id=None,
         ),
         SimpleNamespace(
             id="device-endpoint",
             config_entry_id="entry-a",
             identifiers={(DOMAIN, "serial-a:device")},
+            via_device_id="device-provider",
         ),
         SimpleNamespace(
             id="device-foreign",
             config_entry_id="entry-a",
             identifiers={(DOMAIN, "serial-other:device")},
+            via_device_id=None,
         ),
     ]
     entities = [
@@ -302,6 +305,76 @@ def test_entries_and_hierarchy_return_scoped_enrichment_and_bounded_schema(monke
     assert all(
         set(item) == {"key", "label", "technical_type", "status", "reason", "entity_id"} for item in functions.values()
     )
+
+
+def test_registry_via_mismatch_removes_only_navigation_enrichment(monkeypatch):
+    """A moved registry device must stay visible without device/entity navigation."""
+    from custom_components.loxone import engineering_websocket as module
+
+    snapshot = make_snapshot(
+        inventory=inventory_of(
+            element("ms", "LoxLIVE", title="Provider", room=None),
+            element("device", "TreeDevice", parent_uuid="ms", title="Endpoint"),
+            element("channel", "VoltageIn", parent_uuid="device", title="Channel", io_name="AI1"),
+        ),
+        runtime=EngineeringRuntimeInventory((numeric_binding("channel", 1.0),)),
+    )
+    entry = _entry("entry-a")
+    hass = _hass(
+        entry,
+        coordinators={entry.entry_id: _coordinator(entry, snapshot=snapshot)},
+        states={"sensor.channel": SimpleNamespace(state="1")},
+    )
+    devices = [
+        SimpleNamespace(
+            id="device-provider",
+            config_entry_id="entry-a",
+            identifiers={(DOMAIN, "serial-a")},
+            via_device_id=None,
+        ),
+        SimpleNamespace(
+            id="device-wrong-parent",
+            config_entry_id="entry-a",
+            identifiers={(DOMAIN, "serial-a:unrelated")},
+            via_device_id=None,
+        ),
+        SimpleNamespace(
+            id="device-moved-endpoint",
+            config_entry_id="entry-a",
+            identifiers={(DOMAIN, "serial-a:device")},
+            via_device_id="device-wrong-parent",
+        ),
+    ]
+    entities = [
+        SimpleNamespace(
+            entity_id="sensor.channel",
+            unique_id="channel",
+            platform=DOMAIN,
+            config_entry_id="entry-a",
+            device_id="device-moved-endpoint",
+            disabled_by=None,
+        )
+    ]
+    monkeypatch.setattr(module.dr, "async_get", lambda _hass: object())
+    monkeypatch.setattr(module.dr, "async_entries_for_config_entry", lambda _registry, _entry_id: devices)
+    monkeypatch.setattr(module.er, "async_get", lambda _hass: object())
+    monkeypatch.setattr(module.er, "async_entries_for_config_entry", lambda _registry, _entry_id: entities)
+
+    connection = _Connection()
+    websocket_engineering_hierarchy(
+        hass,
+        connection,
+        {"id": 1, "type": "loxone/engineering_hierarchy", "entry_id": "entry-a"},
+    )
+
+    payload = connection.results[0][1]
+    assert payload["root"]["device_id"] == "device-provider"
+    endpoint = payload["root"]["children"][0]
+    assert endpoint["identifier"] == "serial-a:device"
+    assert endpoint["device_id"] is None
+    assert [(item["status"], item["entity_id"]) for item in endpoint["functions"]] == [("prepared", None)]
+    assert payload["summary"]["active_entity"] == 0
+    assert payload["summary"]["prepared"] == 1
 
 
 def test_registration_survives_failure_and_panel_tracks_first_last_entry(monkeypatch):
