@@ -3,31 +3,23 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from copy import deepcopy
 from dataclasses import replace
-from pathlib import Path
+from hashlib import sha256
 from types import SimpleNamespace
 
 import pytest
-import voluptuous as vol
 from homeassistant import data_entry_flow
 from homeassistant.components.repairs.const import DOMAIN as REPAIRS_DOMAIN
 from homeassistant.components.repairs.issue_handler import RepairsFlowManager
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers import area_registry as ar
 
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.engineering_registry import (
     EngineeringAreaConflict,
-    EngineeringAreaResolutionResult,
-)
-from tests.test_engineering_registry import (  # noqa: F401
-    FakeIntentStore,
-    _area_recovery_case,
-    _prepare_resolution_conflict,
-    registries,
+    EngineeringBatchAreaResolutionResult,
 )
 
 
@@ -41,6 +33,7 @@ def _conflict(
     desired_area_id: str | None | object = Ellipsis,
     display_name: str | None = "ST-F07",
     desired_action_valid: bool = True,
+    room_uuid: str | None = "room-a",
 ) -> EngineeringAreaConflict:
     return EngineeringAreaConflict(
         token=token,
@@ -54,6 +47,7 @@ def _conflict(
         generation_id="generation-a",
         reason="area_user_override_preserved",
         desired_action_valid=desired_action_valid,
+        room_uuid=room_uuid,
     )
 
 
@@ -114,6 +108,14 @@ def _repairs_harness(monkeypatch, conflicts):
     monkeypatch.setattr(repairs.ir, "async_get", lambda _hass: registry)
     monkeypatch.setattr(repairs.ir, "async_create_issue", create)
     monkeypatch.setattr(repairs.ir, "async_delete_issue", delete)
+    monkeypatch.setattr(
+        ar,
+        "async_get",
+        lambda _hass: SimpleNamespace(
+            async_get_area=lambda area_id: SimpleNamespace(id="office", name="Office") if area_id == "office" else None,
+            async_list_areas=lambda: [SimpleNamespace(id="office", name="Office")],
+        ),
+    )
     return SimpleNamespace(
         module=repairs,
         hass=hass,
@@ -161,643 +163,425 @@ async def _native_manager_harness(monkeypatch, tmp_path, conflicts):
     )
 
 
-@pytest.mark.parametrize("action", ("apply_loxone_room", "keep_ha_room"))
-def test_native_manager_opens_and_completes_exact_issue(monkeypatch, tmp_path, action):
-    """HA manager init data opens a form; one choice retires only its token."""
-    old = _conflict(entry_id="entry-a", token="a" * 64)
-    newer = _conflict(entry_id="entry-a", token="b" * 64)
-    foreign = _conflict(entry_id="entry-b", token="c" * 64)
-    resolver_calls = []
-
-    async def scenario():
-        harness = await _native_manager_harness(
-            monkeypatch,
-            tmp_path,
-            {"entry-a": [old], "entry-b": [foreign]},
-        )
-
-        async def resolve(_hass, entry_id, token, selected_action, **kwargs):
-            assert kwargs["is_current"]()
-            resolver_calls.append((entry_id, token, selected_action))
-            harness.current["entry-a"] = [newer]
-            return EngineeringAreaResolutionResult(
-                resolved=True,
-                action=selected_action,
-                reason="resolved",
-                conflict=old,
-            )
-
-        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-b")
-        old_id = harness.module.engineering_area_conflict_issue_id("entry-a", old.token)
-        opened = await harness.manager.async_init(
-            DOMAIN,
-            data={"issue_id": old_id},
-        )
-        assert opened["type"] is data_entry_flow.FlowResultType.FORM
-        assert resolver_calls == []
-
-        completed = await harness.manager.async_configure(opened["flow_id"], {"action": action})
-        assert completed["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-        issues = ir.async_get(harness.hass).issues
-        assert (DOMAIN, old_id) not in issues
-        assert any(newer.token in issue_id for domain, issue_id in issues if domain == DOMAIN)
-        assert any(foreign.token in issue_id for domain, issue_id in issues if domain == DOMAIN)
-
-    asyncio.run(scenario())
-    assert resolver_calls == [("entry-a", old.token, action)]
+def _fingerprint(*conflicts):
+    return sha256("".join(sorted(item.token for item in conflicts)).encode()).hexdigest()
 
 
-def test_native_manager_invalid_desired_offers_only_keep(monkeypatch, tmp_path):
-    """Native initialization retains the invalid-target fail-closed selector."""
-    conflict = _conflict(desired_action_valid=False)
-    resolver_calls = []
-
-    async def scenario():
-        harness = await _native_manager_harness(monkeypatch, tmp_path, {"entry-a": [conflict]})
-
-        async def resolve(_hass, entry_id, token, action, **kwargs):
-            assert kwargs["is_current"]()
-            resolver_calls.append((entry_id, token, action))
-            harness.current[entry_id] = []
-            return EngineeringAreaResolutionResult(
-                resolved=True,
-                action=action,
-                reason="resolved",
-                conflict=conflict,
-            )
-
-        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        opened = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_id})
-        assert opened["type"] is data_entry_flow.FlowResultType.FORM
-        assert opened["step_id"].endswith("desired_invalid")
-        with pytest.raises(vol.Invalid):
-            opened["data_schema"]({"action": "apply_loxone_room"})
-        assert resolver_calls == []
-
-        completed = await harness.manager.async_configure(opened["flow_id"], {"action": "keep_ha_room"})
-        assert completed["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-
-    asyncio.run(scenario())
-    assert resolver_calls == [("entry-a", conflict.token, "keep_ha_room")]
+async def _open(harness):
+    await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
+    issue = next(item for (domain, _), item in harness.registry.issues.items() if domain == DOMAIN)
+    flow = await harness.module.async_create_fix_flow(harness.hass, issue.issue_id, issue.data)
+    flow.hass = harness.hass
+    return flow
 
 
-def test_native_manager_stale_result_publishes_new_token(monkeypatch, tmp_path):
-    """A stale native submission aborts while its exact replacement survives."""
-    old = _conflict(token="a" * 64)
-    newer = _conflict(token="b" * 64)
-
-    async def scenario():
-        harness = await _native_manager_harness(monkeypatch, tmp_path, {"entry-a": [old]})
-
-        async def resolve(_hass, _entry_id, _token, action, **kwargs):
-            assert kwargs["is_current"]()
-            harness.current["entry-a"] = [newer]
-            return EngineeringAreaResolutionResult(
-                resolved=False,
-                action=action,
-                reason="stale_conflict",
-                conflict=newer,
-            )
-
-        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        old_id = harness.module.engineering_area_conflict_issue_id("entry-a", old.token)
-        opened = await harness.manager.async_init(DOMAIN, data={"issue_id": old_id})
-        result = await harness.manager.async_configure(opened["flow_id"], {"action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "conflict_changed"
-        issues = ir.async_get(harness.hass).issues
-        assert (DOMAIN, old_id) not in issues
-        assert any(newer.token in issue_id for domain, issue_id in issues if domain == DOMAIN)
-
-    asyncio.run(scenario())
+def _rows(form, key):
+    return next(marker.default() for marker in form["data_schema"].schema if marker.schema == key)
 
 
-def test_native_manager_cancellation_preserves_issue_and_retry(monkeypatch, tmp_path):
-    """A cancelled configure leaves the exact issue and manager flow retryable."""
-    conflict = _conflict()
-
-    async def scenario():
-        harness = await _native_manager_harness(monkeypatch, tmp_path, {"entry-a": [conflict]})
-        entered = asyncio.Event()
-
-        async def blocked(*_args, **_kwargs):
-            entered.set()
-            await asyncio.Event().wait()
-
-        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", blocked)
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        opened = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_id})
-        configure = asyncio.create_task(harness.manager.async_configure(opened["flow_id"], {"action": "keep_ha_room"}))
-        await entered.wait()
-        configure.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await configure
-        assert (DOMAIN, issue_id) in ir.async_get(harness.hass).issues
-
-        async def resolved(_hass, entry_id, _token, action, **kwargs):
-            assert kwargs["is_current"]()
-            harness.current[entry_id] = []
-            return EngineeringAreaResolutionResult(
-                resolved=True,
-                action=action,
-                reason="resolved",
-                conflict=conflict,
-            )
-
-        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolved)
-        retry = await harness.manager.async_configure(opened["flow_id"], {"action": "keep_ha_room"})
-        assert retry["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-        assert (DOMAIN, issue_id) not in ir.async_get(harness.hass).issues
-
-    asyncio.run(scenario())
-
-
-def test_native_init_shape_cannot_be_combined_with_a_crafted_action(
-    monkeypatch,
-):
-    """Only the manager's exact init object is lookup data; mixed input is invalid."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    resolver_calls = []
-
-    async def resolve(*args, **kwargs):
-        resolver_calls.append((args, kwargs))
-        raise AssertionError("crafted mixed input must not resolve")
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-
-    async def scenario():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        flow.init_data = {"issue_id": issue_id}
-        result = await flow.async_step_init({"issue_id": issue_id, "action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "invalid_action"
-
-    asyncio.run(scenario())
-    assert resolver_calls == []
-
-
-def test_issue_sync_is_entry_scoped_idempotent_and_minimal(monkeypatch):
-    """Changing one entry or replaying sync must not duplicate or delete peers."""
-    first = _conflict(entry_id="entry-a", token="a" * 64)
-    second = _conflict(entry_id="entry-b", token="b" * 64)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [first], "entry-b": [second]})
+def test_aggregate_twenty_conflicts_privacy_and_zero(monkeypatch):
+    conflicts = [
+        replace(_conflict(token=f"{index:064x}"), device_identifier=f"serial-entry-a:device-{index}")
+        for index in range(20)
+    ]
+    harness = _repairs_harness(monkeypatch, {"entry-a": conflicts})
 
     async def scenario():
         await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-b")
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-
-    asyncio.run(scenario())
-
-    issue_ids = {issue_id for domain, issue_id in harness.registry.issues if domain == DOMAIN}
-    assert len(issue_ids) == 2
-    assert all(first.token in issue_id or second.token in issue_id for issue_id in issue_ids)
-    first_call = next(call for call in harness.created if first.token in call[1])
-    assert first_call[2]["is_fixable"] is True
-    assert first_call[2]["severity"].value == "warning"
-    assert first_call[2]["data"] == {
-        "kind": "engineering_area_conflict",
-        "version": 1,
-        "entry_id": "entry-a",
-        "conflict_token": first.token,
-    }
-    assert first_call[2]["translation_placeholders"] == {"device": "ST-F07"}
-    assert harness.deleted == []
-
-
-def test_sync_replaces_changed_token_and_preserves_unrelated_issues(monkeypatch):
-    """A genuine conflict change gets a new issue without touching other issues."""
-    old = _conflict(token="a" * 64)
-    current = _conflict(token="b" * 64, current_room="Living Room")
-    harness = _repairs_harness(monkeypatch, {"entry-a": [old]})
-    unrelated = (DOMAIN, "unrelated_issue")
-    harness.registry.issues[unrelated] = SimpleNamespace()
-
-    asyncio.run(harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a"))
-    harness.current["entry-a"] = [current]
-    asyncio.run(harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a"))
-
-    ids = {key[1] for key in harness.registry.issues if key[0] == DOMAIN}
-    assert "unrelated_issue" in ids
-    assert any(current.token in issue_id for issue_id in ids)
-    assert not any(old.token in issue_id for issue_id in ids)
-
-
-def test_unchanged_sync_preserves_native_ignored_state(monkeypatch, tmp_path):
-    """Recreating an exact issue must retain Home Assistant's dismissal marker."""
-    from custom_components.loxone import repairs
-
-    conflict = _conflict()
-
-    async def load(_hass, entry_id):
-        assert entry_id == "entry-a"
-        return (conflict,)
-
-    monkeypatch.setattr(repairs, "async_load_engineering_area_conflicts", load)
-
-    async def scenario():
-        hass = HomeAssistant(str(tmp_path))
-        hass.config_entries = _ConfigEntries("entry-a")
-        entry = hass.config_entries._entries["entry-a"]
-        coordinator = SimpleNamespace(
-            config_entry=entry,
-            engineering_snapshot=SimpleNamespace(source=SimpleNamespace(provider_identifier="serial-entry-a")),
-            miniserver=SimpleNamespace(serial="serial-entry-a"),
-        )
-        hass.data[DOMAIN] = {"entry-a": coordinator}
-        repairs.async_register_engineering_area_conflict_reconciler(hass, entry, coordinator)
-        issue_id = repairs.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        await repairs.async_sync_engineering_area_conflict_issues(hass, "entry-a")
-        ir.async_ignore_issue(hass, DOMAIN, issue_id, True)
-        dismissed_version = ir.async_get(hass).issues[(DOMAIN, issue_id)].dismissed_version
-
-        await repairs.async_sync_engineering_area_conflict_issues(hass, "entry-a")
-
-        assert dismissed_version is not None
-        assert ir.async_get(hass).issues[(DOMAIN, issue_id)].dismissed_version == dismissed_version
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize("action", ("apply_loxone_room", "keep_ha_room"))
-def test_flow_displays_safe_choices_and_resolves_exact_current_token(
-    monkeypatch,
-    action,
-):
-    """The form reloads safe labels and delegates one exact public resolution."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = []
-
-    async def resolve(_hass, entry_id, token, selected_action, **kwargs):
-        assert kwargs["is_current"]()
-        calls.append((entry_id, token, selected_action))
-        harness.current[entry_id] = []
-        return EngineeringAreaResolutionResult(
-            resolved=True,
-            action=selected_action,
-            reason="resolved",
-            conflict=conflict,
-        )
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        shown = await flow.async_step_init()
-        assert shown["type"] is data_entry_flow.FlowResultType.FORM
-        assert shown["description_placeholders"] == {
-            "device": "ST-F07",
-            "current_room": "Office",
-            "desired_room": "Workshop",
+        assert len(harness.registry.issues) == 1
+        issue = next(iter(harness.registry.issues.values()))
+        assert issue.data == {
+            "kind": "engineering_area_conflict",
+            "version": 2,
+            "entry_id": "entry-a",
+            "conflict_fingerprint": _fingerprint(*conflicts),
         }
-        assert shown["data_schema"]({"action": action}) == {"action": action}
-        result = await flow.async_step_init({"action": action})
-        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert issue.translation_placeholders == {"count": "20"}
+        assert "device" not in repr(issue.data)
+        harness.current["entry-a"].reverse()
+        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
+        assert len(harness.registry.issues) == 1
+        harness.current["entry-a"] = []
+        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
+        assert not harness.registry.issues
 
     asyncio.run(scenario())
-    assert calls == [("entry-a", conflict.token, action)]
 
 
-def test_flow_presents_no_room_without_python_none(monkeypatch):
-    """An explicit room clear selects a localized no-room flow variant."""
-    conflict = _conflict(desired_room=None)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
+def test_step_one_groups_exact_room_identity_not_names(monkeypatch):
+    conflicts = [
+        _conflict(),
+        replace(_conflict(token="b" * 64), device_identifier="serial-entry-a:second"),
+        _conflict(token="c" * 64, room_uuid="room-b"),
+        _conflict(token="d" * 64, room_uuid=None),
+    ]
+    harness = _repairs_harness(monkeypatch, {"entry-a": conflicts})
 
     async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        shown = await flow.async_step_init()
-        assert shown["step_id"] == "current_named_desired_none"
-        assert "None" not in repr(shown["description_placeholders"])
+        form = await (await _open(harness)).async_step_init()
+        assert form["step_id"] == "rooms"
+        rows = _rows(form, "rooms")
+        assert {row["group_key"] for row in rows} == {"room-a", "room-b"}
+        assert len(rows) == 2
+        selector = next(iter(form["data_schema"].schema.values()))
+        assert selector.serialize()["selector"]["object"]["multiple"]
+        assert "area" in selector.serialize()["selector"]["object"]["fields"]["area_id"]["selector"]
 
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
-    ("issue_id", "data", "reason"),
+    "rows",
     [
-        ("not-a-loxone-area-issue", None, "invalid_repair"),
-        (
-            "engineering_area_conflict_invalid",
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-b",
-                "conflict_token": "a" * 64,
-            },
-            "invalid_repair",
-        ),
+        [],
+        [{"group_key": "unknown", "action": "keep_ha"}],
+        [{"group_key": "room-a", "action": "keep_ha"}] * 2,
+        [{"group_key": "room-a", "action": "use_existing"}],
+        [{"group_key": "room-a", "action": "use_existing", "area_id": "missing"}],
+        [{"group_key": "room-a", "action": "use_existing", "area_id": "office", "area_name": "New"}],
+        [{"group_key": "room-a", "action": "create", "area_name": " "}],
+        [{"group_key": "room-a", "action": "create", "area_name": "New", "area_id": "office"}],
+        [{"group_key": "room-a", "action": "keep_ha", "area_name": "New"}],
+        [{"group_key": "room-a", "action": "clear"}],
+        [{"group_key": ["room-a"], "action": "keep_ha"}],
+        [{"group_key": "room-a", "action": "keep_ha", "extra": "untrusted"}],
     ],
 )
-def test_malformed_or_foreign_flow_aborts_without_resolution(
-    monkeypatch,
-    issue_id,
-    data,
-    reason,
-):
-    """Untrusted issue input cannot select another entry or resolver action."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = []
-
-    async def resolve(*args, **_kwargs):
-        calls.append(args)
-        raise AssertionError("resolver must not run")
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
+def test_step_one_invalid_rows_preserve_input(monkeypatch, rows):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
 
     async def scenario():
-        flow = await harness.module.async_create_fix_flow(harness.hass, issue_id, data)
-        flow.hass = harness.hass
+        form = await (await _open(harness)).async_step_rooms({"rooms": rows})
+        assert form["type"] is data_entry_flow.FlowResultType.FORM
+        assert form["step_id"] == "rooms"
+        assert form["errors"]
+        assert _rows(form, "rooms") == rows
+
+    asyncio.run(scenario())
+
+
+def test_create_collision_preserves_input_and_requires_existing_selection(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+    rows = [{"group_key": "room-a", "action": "create", "area_name": "  OFFICE  "}]
+
+    async def scenario():
+        form = await (await _open(harness)).async_step_rooms({"rooms": rows})
+        assert form["step_id"] == "rooms"
+        assert form["errors"] == {"base": "area_name_collision"}
+        assert _rows(form, "rooms") == rows
+
+    asyncio.run(scenario())
+
+
+def test_mixed_room_overrides_and_no_room_build_exact_batch(monkeypatch):
+    conflicts = [
+        _conflict(),
+        _conflict(token="b" * 64),
+        _conflict(token="c" * 64, room_uuid=None),
+        _conflict(token="d" * 64, room_uuid=None),
+    ]
+    harness = _repairs_harness(monkeypatch, {"entry-a": conflicts})
+
+    async def resolve(_hass, entry_id, decisions, *, is_current):
+        assert entry_id == "entry-a" and is_current()
+        assert [(d.room_uuid, d.action, d.area_id, d.conflict_tokens, d.keep_conflict_tokens) for d in decisions] == [
+            ("room-a", "use_existing", "office", ("a" * 64, "b" * 64), ("b" * 64,)),
+            (None, "keep_ha", None, ("c" * 64,), ()),
+            (None, "clear", None, ("d" * 64,), ()),
+        ]
+        harness.current["entry-a"] = []
+        return EngineeringBatchAreaResolutionResult(3, 0, "resolved")
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms(
+            {"rooms": [{"group_key": "room-a", "action": "use_existing", "area_id": "office"}]}
+        )
+        assert form["step_id"] == "devices"
+        assert {marker.schema for marker in form["data_schema"].schema} == {"devices", "no_room_devices"}
+        rows = _rows(form, "devices")
+        no_room_rows = _rows(form, "no_room_devices")
+        assert len(rows) == len(no_room_rows) == 2
+        for marker, selector in form["data_schema"].schema.items():
+            actions = selector.serialize()["selector"]["object"]["fields"]["action"]["selector"]["select"]["options"]
+            assert actions == (["apply_group", "keep_ha"] if marker.schema == "devices" else ["keep_ha", "clear"])
+        for row, action in zip(rows + no_room_rows, ("apply_group", "keep_ha", "keep_ha", "clear"), strict=True):
+            row["action"] = action
+        result = await flow.async_step_devices({"devices": rows, "no_room_devices": no_room_rows})
+        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert not harness.registry.issues
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "unknown", "no_room_group", "room_clear", "cross_list"])
+def test_device_membership_and_action_validation_preserves_input(monkeypatch, case):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict(), _conflict(token="b" * 64, room_uuid=None)]})
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        rows = _rows(form, "devices")
+        no_room_rows = _rows(form, "no_room_devices")
+        if case == "missing":
+            rows.pop()
+        elif case == "duplicate":
+            rows.append(rows[0].copy())
+        elif case == "unknown":
+            rows[0]["device_key"] = "f" * 64
+        elif case == "no_room_group":
+            no_room_rows[0]["action"] = "apply_group"
+        elif case == "cross_list":
+            no_room_rows[0]["device_key"] = rows[0]["device_key"]
+        else:
+            rows[0]["action"] = "clear"
+        form = await flow.async_step_devices({"devices": rows, "no_room_devices": no_room_rows})
+        assert form["step_id"] == "devices" and form["errors"]
+        assert _rows(form, "devices") == rows
+        assert _rows(form, "no_room_devices") == no_room_rows
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("renew", [False, True])
+def test_real_manager_completes_only_after_empty_reload(monkeypatch, tmp_path, renew):
+    async def scenario():
+        old, new = _conflict(), _conflict(token="b" * 64)
+        harness = await _native_manager_harness(monkeypatch, tmp_path, {"entry-a": [old]})
+
+        async def resolve(*_args, **kwargs):
+            assert kwargs["is_current"]()
+            harness.current["entry-a"] = [new] if renew else []
+            return EngineeringBatchAreaResolutionResult(1, int(renew), "resolved" if not renew else "stale_conflict")
+
+        monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
+        issue_id = next(iter(ir.async_get(harness.hass).issues))[1]
+        form = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_id})
+        form = await harness.manager.async_configure(
+            form["flow_id"], {"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}
+        )
+        result = await harness.manager.async_configure(form["flow_id"], {"devices": _rows(form, "devices")})
+        issues = ir.async_get(harness.hass).issues
+        if renew:
+            assert result["type"] is data_entry_flow.FlowResultType.ABORT
+            assert len(issues) == 1
+            assert _fingerprint(new) in next(iter(issues))[1]
+        else:
+            assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
+            assert not issues
+
+    asyncio.run(scenario())
+
+
+def test_old_flow_resynchronizes_changed_fingerprint_without_deleting_new(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        await flow.async_step_init()
+        new = _conflict(token="b" * 64)
+        harness.current["entry-a"] = [new]
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        assert form["reason"] == "conflict_changed"
+        assert len(harness.registry.issues) == 1
+        assert _fingerprint(new) in next(iter(harness.registry.issues))[1]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["provider", "unload", "replace"])
+def test_flow_rechecks_binding_at_await_and_between_steps(monkeypatch, change):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        await flow.async_step_init()
+        coordinator = harness.hass.data[DOMAIN]["entry-a"]
+
+        async def load(*_args):
+            if change == "provider":
+                coordinator.miniserver.serial = "replacement"
+            elif change == "unload":
+                harness.unload_callbacks["entry-a"]()
+            else:
+                harness.module.async_register_engineering_area_conflict_reconciler(
+                    harness.hass, coordinator.config_entry, coordinator
+                )
+            await asyncio.sleep(0)
+            return tuple(harness.current["entry-a"])
+
+        monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
+        result = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        assert result["reason"] == "entry_unavailable"
+        assert len(harness.registry.issues) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("bad", ["foreign", "malformed", "duplicate"])
+def test_untrusted_conflict_set_never_grants_partial_authority(monkeypatch, bad):
+    conflict = _conflict()
+    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
+
+    async def scenario():
+        flow = await _open(harness)
+        before = set(harness.registry.issues)
+        other = (
+            replace(conflict, token="b" * 64, device_identifier="foreign:device")
+            if bad == "foreign"
+            else replace(conflict, token="invalid")
+            if bad == "malformed"
+            else conflict
+        )
+        harness.current["entry-a"].append(other)
+        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
         result = await flow.async_step_init()
         assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == reason
+        assert set(harness.registry.issues) == before
 
     asyncio.run(scenario())
-    assert calls == []
 
 
-def test_stale_or_concurrently_changed_flow_preserves_new_issue(monkeypatch):
-    """A stale decision aborts while a retokenized actionable Repair remains."""
-    old = _conflict(token="a" * 64)
-    new = _conflict(token="b" * 64, current_room="Living Room")
-    harness = _repairs_harness(monkeypatch, {"entry-a": [old]})
-    calls = []
-
-    async def resolve(_hass, entry_id, token, action, **kwargs):
-        assert kwargs["is_current"]()
-        calls.append((entry_id, token, action))
-        harness.current[entry_id] = [new]
-        return EngineeringAreaResolutionResult(
-            resolved=False,
-            action=action,
-            reason="stale_conflict",
-            conflict=new,
-        )
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-    old_issue = harness.module.engineering_area_conflict_issue_id("entry-a", old.token)
+def test_replaced_binding_reconciles_new_issue_only_after_old_lock_released(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
 
     async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            old_issue,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": old.token,
-            },
+        flow = await _open(harness)
+        await flow.async_step_init()
+        coordinator = harness.hass.data[DOMAIN]["entry-a"]
+        newer = _conflict(token="b" * 64)
+        harness.current["entry-a"] = [newer]
+        harness.module.async_register_engineering_area_conflict_reconciler(
+            harness.hass, coordinator.config_entry, coordinator
         )
-        flow.hass = harness.hass
-        result = await flow.async_step_init({"action": "keep_ha_room"})
+        # A recursive acquisition under the old lock would time out here.
+        result = await asyncio.wait_for(
+            flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}), 1
+        )
+        assert result["reason"] == "entry_unavailable"
+        assert len(harness.registry.issues) == 1
+        assert _fingerprint(newer) in next(iter(harness.registry.issues))[1]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("mutation", ["extra", "version_bool", "fingerprint", "id"])
+def test_exact_issue_payload_rejected_without_loading(monkeypatch, mutation):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        if mutation == "extra":
+            flow._flow_data["provider"] = "foreign"
+        elif mutation == "version_bool":
+            flow._flow_data["version"] = True
+        elif mutation == "fingerprint":
+            flow._flow_data["conflict_fingerprint"] = "b" * 64
+        else:
+            flow._issue_id = "foreign"
+        result = await flow.async_step_init()
+        assert result["reason"] == "invalid_repair"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "reason", ["pending_batch_exists", "created_area_missing", "created_area_changed", "area_name_collision"]
+)
+def test_bounded_batch_outcomes_do_not_silently_complete(monkeypatch, reason):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def resolve(*_args, **_kwargs):
+        return EngineeringBatchAreaResolutionResult(0, 1, reason)
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        result = await flow.async_step_devices({"devices": _rows(form, "devices")})
+        assert result["type"] is not data_entry_flow.FlowResultType.CREATE_ENTRY
+        assert len(harness.registry.issues) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("value", [False, 0, [], {}])
+def test_falsey_target_values_are_not_silently_discarded(monkeypatch, value):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha", "area_id": value}]})
+        assert form["step_id"] == "rooms" and form["errors"]
+
+    asyncio.run(scenario())
+
+
+def test_registry_validation_exception_never_becomes_an_error_identifier(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    def fail():
+        raise ValueError("private-storage-detail")
+
+    monkeypatch.setattr(ar, "async_get", lambda _: SimpleNamespace(async_list_areas=fail))
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "create", "area_name": "New"}]})
+        assert "private-storage-detail" not in repr(form)
+
+    asyncio.run(scenario())
+
+
+def test_flow_cancellation_propagates_and_preserves_issue(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def resolve(*_args, **_kwargs):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        before = set(harness.registry.issues)
+        with pytest.raises(asyncio.CancelledError):
+            await flow.async_step_devices({"devices": _rows(form, "devices")})
+        assert set(harness.registry.issues) == before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("outcome", ["load_failure", "binding_change"])
+def test_batch_success_never_completes_without_verified_final_read(monkeypatch, outcome):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def fail(*_args):
+        raise RuntimeError("private-storage-detail")
+
+    async def resolve(*_args, **_kwargs):
+        harness.current["entry-a"] = []
+        if outcome == "load_failure":
+            monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", fail)
+        else:
+            harness.hass.data[DOMAIN]["entry-a"].miniserver.serial = "replacement"
+        return EngineeringBatchAreaResolutionResult(1, 0, "resolved")
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        result = await flow.async_step_devices({"devices": _rows(form, "devices")})
         assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "conflict_changed"
+        assert "private-storage-detail" not in repr(result)
+        assert len(harness.registry.issues) == 1
 
     asyncio.run(scenario())
-    assert calls == [("entry-a", old.token, "keep_ha_room")]
-    assert any(new.token in issue_id for _, issue_id in harness.registry.issues)
-
-
-def test_resolver_failure_aborts_with_bounded_reason_and_keeps_issue(monkeypatch):
-    """A storage/resolution failure must not escape the native Repairs flow."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-
-    async def resolve(*args, **_kwargs):
-        del args
-        raise RuntimeError("arbitrary private failure")
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        result = await flow.async_step_init({"action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "resolution_failed"
-
-    asyncio.run(scenario())
-    assert any(conflict.token in item for _, item in harness.registry.issues)
-
-
-def test_invalid_desired_conflict_offers_only_safe_keep_action(monkeypatch):
-    """Unsafe desired metadata remains truthful and offers only Keep HA."""
-    conflict = _conflict(desired_action_valid=False)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        shown = await flow.async_step_init()
-        assert shown["type"] is data_entry_flow.FlowResultType.FORM
-        assert shown["step_id"] == "current_named_desired_invalid"
-        assert shown["data_schema"]({"action": "keep_ha_room"}) == {"action": "keep_ha_room"}
-        with pytest.raises(Exception):  # voluptuous rejects hidden Apply.
-            shown["data_schema"]({"action": "apply_loxone_room"})
-
-    asyncio.run(scenario())
-    assert any(conflict.token in issue_id for _, issue_id in harness.registry.issues)
-
-
-def test_invalid_desired_keep_uses_public_resolver_and_completes(monkeypatch):
-    """Keep HA remains an explicit Task 5 action for malformed desired data."""
-    conflict = _conflict(desired_action_valid=False)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = []
-
-    async def resolve(_hass, entry_id, token, action, **kwargs):
-        assert kwargs["is_current"]()
-        calls.append((entry_id, token, action))
-        harness.current[entry_id] = []
-        return EngineeringAreaResolutionResult(True, action, "resolved", conflict)
-
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        result = await flow.async_step_init({"action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-
-    asyncio.run(scenario())
-    assert calls == [("entry-a", conflict.token, "keep_ha_room")]
-
-
-def test_invalid_desired_apply_fails_closed_without_resolver(monkeypatch):
-    """A crafted Apply submission cannot turn invalid metadata into a clear."""
-    conflict = _conflict(desired_action_valid=False)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = []
-
-    async def resolve(*args, **_kwargs):
-        calls.append(args)
-        raise AssertionError("resolver must not run")
-
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        result = await flow.async_step_init({"action": "apply_loxone_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "invalid_desired_area"
-
-    asyncio.run(scenario())
-    assert calls == []
-
-
-def test_unavailable_or_replaced_entry_cannot_resolve(monkeypatch):
-    """Only the loaded exact config-entry/coordinator binding may resolve."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = []
-
-    async def resolve(*args, **_kwargs):
-        calls.append(args)
-        raise AssertionError("resolver must not run")
-
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-    data = {
-        "kind": "engineering_area_conflict",
-        "version": 1,
-        "entry_id": "entry-a",
-        "conflict_token": conflict.token,
-    }
-
-    async def scenario():
-        entry = harness.hass.config_entries._entries["entry-a"]
-        entry.state = ConfigEntryState.NOT_LOADED
-        flow = await harness.module.async_create_fix_flow(harness.hass, issue_id, data)
-        flow.hass = harness.hass
-        opened = await flow.async_step_init()
-        assert opened["type"] is data_entry_flow.FlowResultType.ABORT
-        assert opened["reason"] == "entry_unavailable"
-
-        entry.state = ConfigEntryState.LOADED
-        available_flow = await harness.module.async_create_fix_flow(harness.hass, issue_id, data)
-        available_flow.hass = harness.hass
-        shown = await available_flow.async_step_init()
-        assert shown["type"] is data_entry_flow.FlowResultType.FORM
-        entry.state = ConfigEntryState.NOT_LOADED
-        unavailable_submission = await available_flow.async_step_init({"action": "keep_ha_room"})
-        assert unavailable_submission["type"] is data_entry_flow.FlowResultType.ABORT
-        assert unavailable_submission["reason"] == "entry_unavailable"
-
-        entry.state = ConfigEntryState.LOADED
-        replacement = SimpleNamespace(entry_id="entry-a", domain=DOMAIN, state=ConfigEntryState.LOADED)
-        harness.hass.config_entries._entries["entry-a"] = replacement
-        submitted = await flow.async_step_init({"action": "keep_ha_room"})
-        assert submitted["type"] is data_entry_flow.FlowResultType.ABORT
-        assert submitted["reason"] == "entry_unavailable"
-
-    asyncio.run(scenario())
-    assert calls == []
 
 
 def test_explicit_startup_sync_cannot_publish_for_not_loaded_entry(monkeypatch):
@@ -819,207 +603,6 @@ def test_explicit_startup_sync_cannot_publish_for_not_loaded_entry(monkeypatch):
 
     assert harness.registry.issues == {}
     assert harness.created == []
-
-
-def test_unload_during_flow_load_cannot_cross_resolver_boundary(monkeypatch):
-    """An unload observed after the awaited load prevents the public mutation."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    calls = []
-
-    async def load(_hass, _entry_id):
-        entered.set()
-        await release.wait()
-        return (conflict,)
-
-    async def resolve(*args, **_kwargs):
-        calls.append(args)
-        raise AssertionError("resolver must not run")
-
-    monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-
-    async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        task = asyncio.create_task(flow.async_step_init({"action": "keep_ha_room"}))
-        await entered.wait()
-        harness.hass.config_entries._entries["entry-a"].state = ConfigEntryState.UNLOAD_IN_PROGRESS
-        if callback := harness.unload_callbacks.get("entry-a"):
-            callback()
-        release.set()
-        result = await task
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "entry_unavailable"
-
-    asyncio.run(scenario())
-    assert calls == []
-
-
-@pytest.mark.parametrize("replacement", ("entry", "provider", "removed"))
-def test_flow_never_adopts_replacement_while_waiting_for_repairs_lock(
-    monkeypatch,
-    replacement,
-):
-    """The binding captured before the lock remains the only valid authority."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    resolver_calls = []
-
-    async def resolve(*args, **kwargs):
-        resolver_calls.append((args, kwargs))
-        raise AssertionError("old queued flow must not adopt a replacement")
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-
-    async def scenario():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        state = harness.module._reconciler(harness.hass, "entry-a")
-        await state.lock.acquire()
-        task = asyncio.create_task(flow.async_step_init({"action": "apply_loxone_room"}))
-        await asyncio.sleep(0)
-
-        old_entry = harness.hass.config_entries._entries["entry-a"]
-        old_coordinator = harness.hass.data[DOMAIN]["entry-a"]
-        harness.unload_callbacks["entry-a"]()
-        if replacement == "removed":
-            harness.hass.config_entries._entries.pop("entry-a")
-            harness.hass.data[DOMAIN].pop("entry-a")
-        else:
-            entry = SimpleNamespace(
-                entry_id="entry-a",
-                domain=DOMAIN,
-                state=ConfigEntryState.LOADED,
-            )
-            provider = "serial-entry-a" if replacement == "entry" else "serial-new"
-            coordinator = SimpleNamespace(
-                config_entry=entry,
-                engineering_snapshot=SimpleNamespace(source=SimpleNamespace(provider_identifier=provider)),
-                miniserver=SimpleNamespace(serial=provider),
-            )
-            harness.hass.config_entries._entries["entry-a"] = entry
-            harness.hass.data[DOMAIN]["entry-a"] = coordinator
-            harness.module.async_register_engineering_area_conflict_reconciler(
-                harness.hass,
-                entry,
-                coordinator,
-            )
-        del old_entry, old_coordinator
-        state.lock.release()
-
-        result = await task
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "entry_unavailable"
-
-    asyncio.run(scenario())
-    assert resolver_calls == []
-
-
-@pytest.mark.parametrize(
-    "change",
-    ("unload", "removed", "entry_replacement", "provider_replacement"),
-)
-def test_flow_rechecks_original_binding_after_public_resolver(
-    monkeypatch,
-    change,
-):
-    """A resolver cannot report success after its caller binding is unloaded."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    entered = asyncio.Event()
-    release = asyncio.Event()
-
-    async def resolve(_hass, _entry_id, _token, action, *, is_current):
-        assert is_current()
-        entered.set()
-        await release.wait()
-        assert not is_current()
-        return EngineeringAreaResolutionResult(
-            resolved=True,
-            action=action,
-            reason="resolved",
-            conflict=conflict,
-        )
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-
-    async def scenario():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        task = asyncio.create_task(flow.async_step_init({"action": "keep_ha_room"}))
-        await entered.wait()
-        harness.unload_callbacks["entry-a"]()
-        if change == "unload":
-            harness.hass.config_entries._entries["entry-a"].state = ConfigEntryState.UNLOAD_IN_PROGRESS
-        elif change == "removed":
-            harness.hass.config_entries._entries.pop("entry-a")
-            harness.hass.data[DOMAIN].pop("entry-a")
-        else:
-            entry = SimpleNamespace(
-                entry_id="entry-a",
-                domain=DOMAIN,
-                state=ConfigEntryState.LOADED,
-            )
-            provider = "serial-entry-a" if change == "entry_replacement" else "serial-new"
-            coordinator = SimpleNamespace(
-                config_entry=entry,
-                engineering_snapshot=SimpleNamespace(source=SimpleNamespace(provider_identifier=provider)),
-                miniserver=SimpleNamespace(serial=provider),
-            )
-            harness.hass.config_entries._entries["entry-a"] = entry
-            harness.hass.data[DOMAIN]["entry-a"] = coordinator
-            harness.module.async_register_engineering_area_conflict_reconciler(
-                harness.hass,
-                entry,
-                coordinator,
-            )
-        release.set()
-        result = await task
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "entry_unavailable"
-
-    asyncio.run(scenario())
 
 
 def test_sync_serializes_observation_and_create_before_prune(monkeypatch):
@@ -1067,10 +650,12 @@ def test_sync_serializes_observation_and_create_before_prune(monkeypatch):
 
     asyncio.run(scenario())
     issue_ids = {issue_id for domain, issue_id in harness.registry.issues if domain == DOMAIN}
-    assert any(new.token in issue_id for issue_id in issue_ids)
-    assert not any(old.token in issue_id for issue_id in issue_ids)
+    assert any(_fingerprint(new) in issue_id for issue_id in issue_ids)
+    assert not any(_fingerprint(old) in issue_id for issue_id in issue_ids)
     new_create = next(index for index, event in enumerate(events) if event == ("create", next(iter(issue_ids))))
-    old_delete = next(index for index, event in enumerate(events) if event[0] == "delete" and old.token in event[1])
+    old_delete = next(
+        index for index, event in enumerate(events) if event[0] == "delete" and _fingerprint(old) in event[1]
+    )
     assert new_create < old_delete
 
 
@@ -1094,7 +679,7 @@ def test_sync_locks_are_entry_scoped(monkeypatch):
         task = asyncio.create_task(harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a"))
         await blocked.wait()
         await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-b")
-        assert any(second.token in issue_id for _, issue_id in harness.registry.issues)
+        assert any(_fingerprint(second) in issue_id for _, issue_id in harness.registry.issues)
         release.set()
         await task
 
@@ -1141,59 +726,6 @@ def test_sync_discards_observation_after_binding_replacement(monkeypatch, replac
     assert harness.registry.issues == {}
     assert harness.created == []
     assert harness.deleted == []
-
-
-def test_flow_reconcile_and_coordinator_sync_share_one_entry_fence(monkeypatch):
-    """A flow retry cannot overwrite a newer coordinator observation."""
-    old = _conflict(token="a" * 64)
-    new = _conflict(token="b" * 64)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [old]})
-    second_entered = asyncio.Event()
-    release_second = asyncio.Event()
-    loads = 0
-
-    async def load(_hass, _entry_id):
-        nonlocal loads
-        loads += 1
-        if loads == 1:
-            return ()
-        if loads == 2:
-            second_entered.set()
-            await release_second.wait()
-            return (old,)
-        return (new,)
-
-    monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", old.token)
-
-    async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": old.token,
-            },
-        )
-        flow.hass = harness.hass
-        retry = asyncio.create_task(flow.async_step_init())
-        await second_entered.wait()
-        coordinator = asyncio.create_task(
-            harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        )
-        await asyncio.sleep(0)
-        assert loads == 2
-        release_second.set()
-        result = await retry
-        await coordinator
-        assert result["reason"] == "conflict_changed"
-
-    asyncio.run(scenario())
-    issue_ids = {issue_id for _, issue_id in harness.registry.issues}
-    assert any(new.token in issue_id for issue_id in issue_ids)
-    assert not any(old.token in issue_id for issue_id in issue_ids)
 
 
 def test_cancelled_sync_never_prunes_and_can_retry(monkeypatch):
@@ -1286,208 +818,6 @@ def test_failed_sync_is_not_an_empty_authoritative_set(monkeypatch):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("case", ("missing", "invalid_action", "invalid_desired", "stale_result"))
-def test_secondary_reconciliation_failure_is_bounded(monkeypatch, caplog, case):
-    """A second-load failure returns a translated reason without unsafe mutation."""
-    conflict = _conflict(desired_action_valid=case != "invalid_desired")
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-    calls = 0
-    resolver_calls = []
-
-    async def load(_hass, _entry_id):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("synthetic-private-marker")
-        return () if case == "missing" else (conflict,)
-
-    async def resolve(*args, **_kwargs):
-        resolver_calls.append(args)
-        if case == "stale_result":
-            return EngineeringAreaResolutionResult(
-                resolved=False,
-                action="keep_ha_room",
-                reason="stale_conflict",
-            )
-        raise AssertionError("resolver must not run")
-
-    monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-
-    async def scenario():
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        input_data = {
-            "missing": None,
-            "invalid_action": {"action": "invalid"},
-            "invalid_desired": {"action": "apply_loxone_room"},
-            "stale_result": {"action": "keep_ha_room"},
-        }[case]
-        result = await flow.async_step_init(input_data)
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "repair_unavailable"
-        assert "synthetic-private-marker" not in repr(result)
-
-    asyncio.run(scenario())
-    assert (len(resolver_calls) == 1) is (case == "stale_result")
-    assert "synthetic-private-marker" not in caplog.text
-
-
-def test_successful_resolution_is_authoritative_when_final_sync_fails(monkeypatch):
-    """A bounded post-resolution load failure cannot undo a successful choice."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    calls = 0
-
-    async def load(_hass, _entry_id):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            raise RuntimeError("synthetic-private-marker")
-        return (conflict,)
-
-    async def resolve(*_args, **_kwargs):
-        return EngineeringAreaResolutionResult(
-            resolved=True,
-            action="keep_ha_room",
-            reason="resolved",
-            conflict=conflict,
-        )
-
-    monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
-    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflict", resolve)
-
-    async def scenario():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        result = await flow.async_step_init({"action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-
-    asyncio.run(scenario())
-
-
-def test_invalid_desired_keep_reopens_after_real_task5_stale_refresh(
-    registries,  # noqa: F811
-    monkeypatch,
-):
-    """The native flow follows Task 5's refreshed token, then safely keeps HA."""
-    from custom_components.loxone import repairs
-
-    office = registries.areas.async_get_or_create("Office")
-    living = registries.areas.async_get_or_create("Living Room")
-    device = registries.devices.add(
-        "serial-entry-a:device",
-        "entry-a",
-        area_id=office.id,
-        name="ST-F07",
-    )
-    FakeIntentStore.data = {
-        "generation_id": "generation-a",
-        "area_intents": [],
-        "managed_baselines": [],
-        "area_conflicts": [
-            {
-                "token": "a" * 64,
-                "entry_id": "entry-a",
-                "device_identifier": "serial-entry-a:device",
-                "display_name": "ST-F07",
-                "current_area_id": office.id,
-                "current_area_name": "Office",
-                "desired_area_id": [],
-                "desired_area_name": None,
-                "generation_id": "generation-a",
-                "reason": "area_user_override_preserved",
-                "desired_action_valid": True,
-            }
-        ],
-        "released_identifiers": [],
-    }
-    entries = _ConfigEntries("entry-a")
-    coordinator = SimpleNamespace(
-        config_entry=entries._entries["entry-a"],
-        engineering_snapshot=SimpleNamespace(source=SimpleNamespace(provider_identifier="serial-entry-a")),
-        miniserver=SimpleNamespace(serial="serial-entry-a"),
-    )
-    registry = _IssueRegistry()
-    registries.hass.config_entries = entries
-    registries.hass.data[DOMAIN] = {"entry-a": coordinator}
-    repairs.async_register_engineering_area_conflict_reconciler(
-        registries.hass, entries._entries["entry-a"], coordinator
-    )
-
-    def create(_hass, domain, issue_id, **kwargs):
-        registry.issues[(domain, issue_id)] = SimpleNamespace(**kwargs)
-
-    monkeypatch.setattr(repairs.ir, "async_get", lambda _hass: registry)
-    monkeypatch.setattr(repairs.ir, "async_create_issue", create)
-    monkeypatch.setattr(
-        repairs.ir,
-        "async_delete_issue",
-        lambda _hass, domain, issue_id: registry.issues.pop((domain, issue_id), None),
-    )
-
-    async def flow_for(token):
-        flow = await repairs.async_create_fix_flow(
-            registries.hass,
-            repairs.engineering_area_conflict_issue_id("entry-a", token),
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": token,
-            },
-        )
-        flow.hass = registries.hass
-        return flow
-
-    async def scenario():
-        await repairs.async_sync_engineering_area_conflict_issues(registries.hass, "entry-a")
-        old_flow = await flow_for("a" * 64)
-        shown = await old_flow.async_step_init()
-        assert shown["type"] is data_entry_flow.FlowResultType.FORM
-        assert shown["step_id"].endswith("desired_invalid")
-
-        registries.devices.async_update_device(device.id, area_id=living.id)
-        stale = await old_flow.async_step_init({"action": "keep_ha_room"})
-        assert stale["type"] is data_entry_flow.FlowResultType.ABORT
-        assert stale["reason"] == "conflict_changed"
-        refreshed = (await repairs.async_load_engineering_area_conflicts(registries.hass, "entry-a"))[0]
-        assert refreshed.token != "a" * 64
-        assert any(refreshed.token in issue_id for _, issue_id in registry.issues)
-        assert not any("a" * 64 in issue_id for _, issue_id in registry.issues)
-
-        fresh_flow = await flow_for(refreshed.token)
-        reopened = await fresh_flow.async_step_init()
-        assert reopened["type"] is data_entry_flow.FlowResultType.FORM
-        kept = await fresh_flow.async_step_init({"action": "keep_ha_room"})
-        assert kept["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
-        assert (await repairs.async_load_engineering_area_conflicts(registries.hass, "entry-a")) == ()
-        assert device.area_id == living.id
-        assert registry.issues == {}
-
-    asyncio.run(scenario())
-
-
 @pytest.mark.parametrize(
     ("serial", "snapshot_provider", "expected_provider"),
     (
@@ -1525,15 +855,15 @@ def test_current_provider_and_serialless_cold_start_open_repairs(
     )
 
     async def scenario():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
+        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", _fingerprint(conflict))
         flow = await harness.module.async_create_fix_flow(
             harness.hass,
             issue_id,
             {
                 "kind": "engineering_area_conflict",
-                "version": 1,
+                "version": 2,
                 "entry_id": "entry-a",
-                "conflict_token": conflict.token,
+                "conflict_fingerprint": _fingerprint(conflict),
             },
         )
         flow.hass = harness.hass
@@ -1617,7 +947,7 @@ def test_real_coordinator_constructor_defers_first_provider_until_setup_sync(
         )
         issue_id = repairs.engineering_area_conflict_issue_id(
             entry.entry_id,
-            conflict.token,
+            _fingerprint(conflict),
         )
         assert (DOMAIN, issue_id) in ir.async_get(hass).issues
 
@@ -1636,7 +966,7 @@ def test_real_coordinator_constructor_defers_first_provider_until_setup_sync(
             data={"issue_id": issue_id},
         )
         assert opened["type"] is data_entry_flow.FlowResultType.FORM
-        assert opened["description_placeholders"]["device"] == "ST-F07"
+        assert opened["step_id"] == "rooms"
 
         coordinator.miniserver.serial = "serial-replacement"
         before_issues = set(ir.async_get(hass).issues)
@@ -1672,8 +1002,8 @@ def test_current_serial_mismatch_with_retained_snapshot_blocks_sync_and_open(
             harness.hass,
             "entry-a",
         )
-        exact_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        newer_id = harness.module.engineering_area_conflict_issue_id("entry-a", newer.token)
+        exact_id = harness.module.engineering_area_conflict_issue_id("entry-a", _fingerprint(conflict))
+        newer_id = harness.module.engineering_area_conflict_issue_id("entry-a", _fingerprint(newer))
         foreign_id = "foreign_issue"
         harness.registry.issues[(DOMAIN, newer_id)] = SimpleNamespace()
         harness.registry.issues[(DOMAIN, foreign_id)] = SimpleNamespace()
@@ -1693,9 +1023,9 @@ def test_current_serial_mismatch_with_retained_snapshot_blocks_sync_and_open(
             exact_id,
             {
                 "kind": "engineering_area_conflict",
-                "version": 1,
+                "version": 2,
                 "entry_id": "entry-a",
-                "conflict_token": conflict.token,
+                "conflict_fingerprint": _fingerprint(conflict),
             },
         )
         flow.hass = harness.hass
@@ -1703,247 +1033,6 @@ def test_current_serial_mismatch_with_retained_snapshot_blocks_sync_and_open(
         assert blocked["type"] is data_entry_flow.FlowResultType.ABORT
         assert blocked["reason"] == "entry_unavailable"
         assert set(harness.registry.issues) == before
-
-    asyncio.run(scenario())
-
-
-def test_queued_flow_rejects_current_serial_mismatch_with_retained_snapshot(
-    monkeypatch,
-):
-    """A queued flow preserves its old provider binding and never resolves."""
-    conflict = _conflict()
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    resolver_calls = []
-
-    async def resolve(*args, **kwargs):
-        resolver_calls.append((args, kwargs))
-        raise AssertionError("provider-mismatched queued flow must not resolve")
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        resolve,
-    )
-
-    async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(
-            harness.hass,
-            "entry-a",
-        )
-        before = set(harness.registry.issues)
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        flow = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = harness.hass
-        state = harness.module._reconciler(harness.hass, "entry-a")
-        await state.lock.acquire()
-        task = asyncio.create_task(flow.async_step_init({"action": "apply_loxone_room"}))
-        await asyncio.sleep(0)
-        harness.hass.data[DOMAIN]["entry-a"].miniserver.serial = "serial-replacement"
-        state.lock.release()
-        blocked = await task
-        assert blocked["type"] is data_entry_flow.FlowResultType.ABORT
-        assert blocked["reason"] == "entry_unavailable"
-        assert resolver_calls == []
-        assert set(harness.registry.issues) == before
-
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize(
-    ("action", "room", "boundary"),
-    (
-        ("apply_loxone_room", "Workshop", "intent_admission"),
-        ("apply_loxone_room", "Workshop", "reload"),
-        ("apply_loxone_room", None, "intent_admission"),
-        ("apply_loxone_room", None, "reload"),
-        ("keep_ha_room", "Workshop", "keep_admission"),
-    ),
-)
-def test_current_serial_change_during_task5_resolution_cannot_mutate_or_retire(
-    registries,  # noqa: F811
-    monkeypatch,
-    action,
-    room,
-    boundary,
-):
-    """Task 5 rejects a live-source change while the old snapshot is retained."""
-    from custom_components.loxone import repairs
-
-    office, snapshot, committed = _area_recovery_case(
-        registries,
-        monkeypatch,
-        room,
-    )
-
-    async def scenario():
-        conflict = await _prepare_resolution_conflict(
-            registries,
-            snapshot,
-            committed,
-            office,
-        )
-        entries = _ConfigEntries("entry-a")
-        coordinator = SimpleNamespace(
-            config_entry=entries._entries["entry-a"],
-            engineering_snapshot=snapshot,
-            miniserver=SimpleNamespace(serial="serial-a"),
-        )
-        registries.hass.config_entries = entries
-        registries.hass.data[DOMAIN] = {"entry-a": coordinator}
-        repairs.async_register_engineering_area_conflict_reconciler(
-            registries.hass,
-            entries._entries["entry-a"],
-            coordinator,
-        )
-        issue_registry = _IssueRegistry()
-        deleted = []
-
-        def delete(_hass, domain, issue_id):
-            deleted.append((domain, issue_id))
-            issue_registry.issues.pop((domain, issue_id), None)
-
-        monkeypatch.setattr(repairs.ir, "async_get", lambda _hass: issue_registry)
-        monkeypatch.setattr(repairs.ir, "async_create_issue", lambda *_args, **_kwargs: None)
-        monkeypatch.setattr(repairs.ir, "async_delete_issue", delete)
-        exact_id = repairs.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        newer_id = repairs.engineering_area_conflict_issue_id("entry-a", "b" * 64)
-        foreign_id = "foreign_issue"
-        for issue_id in (exact_id, newer_id, foreign_id):
-            issue_registry.issues[(DOMAIN, issue_id)] = SimpleNamespace()
-        before_issues = set(issue_registry.issues)
-        before_state = deepcopy(FakeIntentStore.data)
-        before_mutations = registries.mutations
-        entered = asyncio.Event()
-        release = asyncio.Event()
-
-        if boundary == "reload":
-            original_load = FakeIntentStore.async_load
-            loads = 0
-
-            async def held_reload(store):
-                nonlocal loads
-                loads += 1
-                data = await original_load(store)
-                if loads == 3:
-                    entered.set()
-                    await release.wait()
-                return data
-
-            monkeypatch.setattr(FakeIntentStore, "async_load", held_reload)
-        else:
-            original_save = FakeIntentStore.async_save_acknowledged
-
-            async def held_admission(store, data, *, before_commit=None):
-                is_target = bool(data.get("released_identifiers" if boundary == "keep_admission" else "area_intents"))
-                if is_target and not entered.is_set():
-                    entered.set()
-                    await release.wait()
-                await original_save(store, data, before_commit=before_commit)
-
-            monkeypatch.setattr(
-                FakeIntentStore,
-                "async_save_acknowledged",
-                held_admission,
-            )
-
-        flow = await repairs.async_create_fix_flow(
-            registries.hass,
-            exact_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        flow.hass = registries.hass
-        task = asyncio.create_task(flow.async_step_init({"action": action}))
-        await entered.wait()
-        coordinator.miniserver.serial = "serial-replacement"
-        release.set()
-        result = await task
-
-        assert result["type"] is data_entry_flow.FlowResultType.ABORT
-        assert result["reason"] == "entry_unavailable"
-        assert registries.device("serial-a:device").area_id == office.id
-        assert registries.mutations == before_mutations
-        assert set(issue_registry.issues) == before_issues
-        assert deleted == []
-        assert FakeIntentStore.data["area_conflicts"]
-        if boundary != "reload":
-            assert FakeIntentStore.data == before_state
-
-    asyncio.run(scenario())
-
-
-def test_invalid_desired_keep_cancellation_preserves_retry(monkeypatch):
-    """Cancellation propagates without retiring the unresolved exact issue."""
-    conflict = _conflict(desired_action_valid=False)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-    entered = asyncio.Event()
-
-    async def cancelled_resolver(*_args, **_kwargs):
-        entered.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(
-        harness.module,
-        "async_resolve_engineering_area_conflict",
-        cancelled_resolver,
-    )
-
-    async def flow():
-        issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-        created = await harness.module.async_create_fix_flow(
-            harness.hass,
-            issue_id,
-            {
-                "kind": "engineering_area_conflict",
-                "version": 1,
-                "entry_id": "entry-a",
-                "conflict_token": conflict.token,
-            },
-        )
-        created.hass = harness.hass
-        return created
-
-    async def scenario():
-        await harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a")
-        before = set(harness.registry.issues)
-        first = await flow()
-        task = asyncio.create_task(first.async_step_init({"action": "keep_ha_room"}))
-        await entered.wait()
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert set(harness.registry.issues) == before
-
-        async def resolved(*_args, **_kwargs):
-            harness.current["entry-a"] = []
-            return EngineeringAreaResolutionResult(
-                resolved=True,
-                action="keep_ha_room",
-                reason="resolved",
-                conflict=conflict,
-            )
-
-        monkeypatch.setattr(
-            harness.module,
-            "async_resolve_engineering_area_conflict",
-            resolved,
-        )
-        retry = await flow()
-        result = await retry.async_step_init({"action": "keep_ha_room"})
-        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
 
     asyncio.run(scenario())
 
@@ -1972,7 +1061,7 @@ def test_unload_preserves_ignored_issue_but_genuine_removal_retires_it(monkeypat
         callback = repairs.async_register_engineering_area_conflict_reconciler(
             hass, entries._entries["entry-a"], coordinator
         )
-        issue_id = repairs.engineering_area_conflict_issue_id("entry-a", conflict.token)
+        issue_id = repairs.engineering_area_conflict_issue_id("entry-a", _fingerprint(conflict))
         await repairs.async_sync_engineering_area_conflict_issues(hass, "entry-a")
         ir.async_ignore_issue(hass, DOMAIN, issue_id, True)
         dismissed = ir.async_get(hass).issues[(DOMAIN, issue_id)].dismissed_version
@@ -1995,102 +1084,6 @@ def test_unload_preserves_ignored_issue_but_genuine_removal_retires_it(monkeypat
         assert (DOMAIN, issue_id) not in ir.async_get(hass).issues
 
     asyncio.run(scenario())
-
-
-def test_room_state_variants_and_generic_device_never_expose_raw_ids(monkeypatch):
-    """No-room, unknown-room and generic-device states stay distinct and bounded."""
-    cases = (
-        (
-            _conflict(current_room=None, desired_room="Workshop"),
-            "current_none_desired_named",
-        ),
-        (
-            _conflict(current_room=None, current_area_id="hidden-current"),
-            "current_unknown_desired_named",
-        ),
-        (
-            _conflict(desired_room=None, desired_area_id="hidden-desired"),
-            "current_named_desired_unknown",
-        ),
-        (
-            _conflict(display_name=None),
-            "current_named_desired_named",
-        ),
-    )
-
-    async def scenario():
-        for index, (conflict, step_id) in enumerate(cases):
-            conflict = EngineeringAreaConflict(
-                token=f"{index + 1:x}" * 64,
-                entry_id=conflict.entry_id,
-                device_identifier=conflict.device_identifier,
-                display_name=conflict.display_name,
-                current_area_id=conflict.current_area_id,
-                current_area_name=conflict.current_area_name,
-                desired_area_id=conflict.desired_area_id,
-                desired_area_name=conflict.desired_area_name,
-                generation_id=conflict.generation_id,
-                reason=conflict.reason,
-                desired_action_valid=conflict.desired_action_valid,
-            )
-            harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
-            issue_id = harness.module.engineering_area_conflict_issue_id("entry-a", conflict.token)
-            flow = await harness.module.async_create_fix_flow(
-                harness.hass,
-                issue_id,
-                {
-                    "kind": "engineering_area_conflict",
-                    "version": 1,
-                    "entry_id": "entry-a",
-                    "conflict_token": conflict.token,
-                },
-            )
-            flow.hass = harness.hass
-            shown = await flow.async_step_init()
-            assert shown["step_id"] == step_id
-            serialized = repr(shown["description_placeholders"])
-            assert "hidden-current" not in serialized
-            assert "hidden-desired" not in serialized
-            if conflict.display_name is None:
-                assert shown["description_placeholders"]["device"].startswith("#")
-                assert "Device" not in shown["description_placeholders"]["device"]
-
-    asyncio.run(scenario())
-
-
-def test_every_safe_room_state_has_english_and_german_copy():
-    """All runtime step IDs have complete localized text in both languages."""
-    root = Path(__file__).parents[1] / "custom_components" / "loxone"
-    expected = {
-        f"current_{current}_desired_{desired}"
-        for current in ("named", "none", "unknown")
-        for desired in ("named", "none", "unknown", "invalid")
-    }
-    for path in (
-        root / "strings.json",
-        root / "translations" / "en.json",
-        root / "translations" / "de.json",
-    ):
-        document = json.loads(path.read_text(encoding="utf-8"))
-        steps = document["issues"]["engineering_area_conflict"]["fix_flow"]["step"]
-        assert expected <= steps.keys()
-
-
-def test_entry_issue_cleanup_never_deletes_peer_or_unrelated_issue(monkeypatch):
-    """The unload helper owns only the exact hashed entry namespace."""
-    first = _conflict(entry_id="entry-a", token="a" * 64)
-    second = _conflict(entry_id="entry-b", token="b" * 64)
-    harness = _repairs_harness(monkeypatch, {"entry-a": [first], "entry-b": [second]})
-    asyncio.run(harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a"))
-    asyncio.run(harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-b"))
-    harness.registry.issues[(DOMAIN, "unrelated_issue")] = SimpleNamespace()
-
-    harness.module.async_remove_engineering_area_conflict_issues(harness.hass, "entry-a")
-
-    remaining = {issue_id for domain, issue_id in harness.registry.issues if domain == DOMAIN}
-    assert "unrelated_issue" in remaining
-    assert any(second.token in issue_id for issue_id in remaining)
-    assert not any(first.token in issue_id for issue_id in remaining)
 
 
 def test_genuine_removal_releases_objects_but_reuses_the_waiter_lock(monkeypatch):

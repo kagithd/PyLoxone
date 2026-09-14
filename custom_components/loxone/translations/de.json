@@ -77,96 +77,99 @@
     }
   },
   "selector": {
-    "engineering_area_conflict_action": {
-      "options": {
-        "apply_loxone_room": "Loxone-Raum übernehmen",
-        "keep_ha_room": "HA-Raum beibehalten"
-      }
-    },
     "stale_device_grace_mode": {
       "options": {
         "observations": "Erfolgreiche Strukturabrufe",
         "time": "Verstrichene Zeit",
         "combined": "Beide Grenzen"
       }
+    },
+    "engineering_area_decision": {
+      "options": {
+        "use_existing": "Vorhandenen Bereich auswählen",
+        "create": "Neuen Bereich anlegen",
+        "keep_ha": "Home Assistant beibehalten",
+        "apply_group": "Gruppenentscheidung anwenden",
+        "clear": "Bereich leeren"
+      }
+    },
+    "engineering_area_rooms": {
+      "fields": {
+        "group_key": {
+          "name": "Gruppenschlüssel (nicht ändern)"
+        },
+        "device_key": {
+          "name": "Geräteschlüssel (nicht ändern)"
+        },
+        "description": {
+          "name": "Beschreibung"
+        },
+        "action": {
+          "name": "Entscheidung"
+        },
+        "area_id": {
+          "name": "Vorhandener Bereich"
+        },
+        "area_name": {
+          "name": "Name des neuen Bereichs"
+        }
+      }
+    },
+    "engineering_area_devices": {
+      "fields": {
+        "group_key": {
+          "name": "Gruppenschlüssel (nicht ändern)"
+        },
+        "device_key": {
+          "name": "Geräteschlüssel (nicht ändern)"
+        },
+        "description": {
+          "name": "Beschreibung"
+        },
+        "action": {
+          "name": "Entscheidung"
+        },
+        "area_id": {
+          "name": "Vorhandener Bereich"
+        },
+        "area_name": {
+          "name": "Name des neuen Bereichs"
+        }
+      }
     }
   },
   "issues": {
     "engineering_area_conflict": {
-      "title": "Raum für {device} auswählen",
-      "description": "Für **{device}** besteht ein Konflikt bei der Raumzuordnung. Öffne die Reparatur, um die aktuelle Home-Assistant-Zuordnung und die Loxone-Vorgabe zu prüfen.",
+      "title": "{count} Raumzuordnungskonflikte prüfen",
+      "description": "Für {count} Geräte stehen Raumentscheidungen aus. In dieser Reparatur lassen sich Raumgruppen und Ausnahmen je Gerät festlegen.",
       "fix_flow": {
         "abort": {
-          "conflict_changed": "Die Raumzuordnung hat sich geändert, während diese Reparatur geöffnet war. Prüfe die aktuelle Reparatur und versuche es erneut.",
-          "entry_unavailable": "Der Loxone-Konfigurationseintrag ist nicht mehr verfügbar.",
-          "invalid_action": "Die ausgewählte Raumaktion wird nicht unterstützt. Öffne die Reparatur erneut und wähle eine der verfügbaren Aktionen.",
-          "invalid_desired_area": "Der angeforderte Loxone-Raum ist nicht mehr gültig. Aktualisiere das Engineering-Inventar und versuche es erneut.",
-          "invalid_repair": "Diese Reparatur entspricht keinem aktuellen Loxone-Raumkonflikt.",
-          "repair_unavailable": "Der aktuelle Raumkonflikt konnte nicht geladen werden. Versuche es nach der nächsten Aktualisierung der Integration erneut.",
-          "resolution_failed": "Die Raumentscheidung konnte nicht abgeschlossen werden. Prüfe die aktuelle Reparatur und versuche es erneut."
+          "conflict_changed": "Die Konfliktmenge hat sich geändert. Die aktuelle Reparatur erneut öffnen und die aktualisierten Geräte prüfen.",
+          "entry_unavailable": "Der Konfigurationseintrag wurde geändert oder ist nicht verfügbar. Nach der Aktualisierung der Integration die aktuelle Reparatur erneut öffnen.",
+          "invalid_repair": "Diese Reparatur gehört nicht zu einer aktuellen Raumkonfliktmenge.",
+          "repair_unavailable": "Die aktuelle Konfliktmenge konnte nicht bestätigt werden. Die Reparatur nach der Aktualisierung der Integration erneut öffnen.",
+          "resolution_failed": "Einige Entscheidungen sind noch offen. Die aktuelle Reparatur erneut öffnen und alle verbleibenden Gruppen prüfen. Ein ausstehender oder geänderter neu angelegter Bereich kann die manuelle Auswahl eines vorhandenen Bereichs erfordern. Globale Bereiche werden weder gelöscht noch zurückgesetzt."
+        },
+        "error": {
+          "invalid_rows": "Jede ursprüngliche Zeile genau einmal beibehalten und ihren Schlüssel nicht ändern. Die eingegebenen Werte prüfen.",
+          "invalid_target": "Eine unterstützte Aktion und nur das dafür erforderliche Ziel wählen: einen vorhandenen Bereich, einen neuen Namen oder kein Ziel bei Home Assistant beibehalten.",
+          "area_name_collision": "Ein Bereich mit diesem normalisierten Namen existiert bereits. Diesen vorhandenen Bereich ausdrücklich auswählen, statt ihn neu anzulegen oder anhand des Namens zu übernehmen."
         },
         "step": {
-          "current_named_desired_named": {
-            "title": "Raum für {device} auswählen",
-            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nAngeforderter Loxone-Raum: **{desired_room}**",
+          "rooms": {
+            "title": "Zuordnungen für Raumgruppen auswählen",
+            "description": "Jede Zeile gruppiert Geräte nach einer eindeutigen Raumidentität, nicht nach dem Namen. Einen vorhandenen Bereich auswählen, einen neuen Bereich ausdrücklich anlegen oder die Home-Assistant-Zuordnungen beibehalten. Unbenutzte Zielfelder leer lassen. Gruppenschlüssel nicht ändern. Erst beim Absenden des Geräteschritts wird geschrieben.",
             "data": {
-              "action": "Raumzuordnung"
+              "rooms": "Raumgruppen"
             }
           },
-          "current_named_desired_none": {
-            "title": "Raum für {device} auswählen",
-            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nLoxone fordert **keinen Raum** an.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_named_desired_unknown": {
-            "title": "Raum für {device} auswählen",
-            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nDer sichere Anzeigename des angeforderten Loxone-Raums ist nicht verfügbar.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_named_desired_invalid": {
-            "title": "Aktuellen Raum für {device} beibehalten",
-            "description": "Aktueller Home-Assistant-Raum: **{current_room}**\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_none_desired_named": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nAngeforderter Loxone-Raum: **{desired_room}**",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_none_desired_none": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nAuch Loxone fordert **keinen Raum** an.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_none_desired_unknown": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nDer sichere Anzeigename des angeforderten Loxone-Raums ist nicht verfügbar.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_none_desired_invalid": {
-            "title": "Aktuellen Raum für {device} beibehalten",
-            "description": "In Home Assistant ist derzeit **kein Raum** zugeordnet.\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_unknown_desired_named": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nAngeforderter Loxone-Raum: **{desired_room}**",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_unknown_desired_none": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nLoxone fordert **keinen Raum** an.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_unknown_desired_unknown": {
-            "title": "Raum für {device} auswählen",
-            "description": "In Home Assistant und Loxone sind Räume zugeordnet, deren sichere Anzeigenamen nicht verfügbar sind.",
-            "data": {"action": "Raumzuordnung"}
-          },
-          "current_unknown_desired_invalid": {
-            "title": "Aktuellen Raum für {device} beibehalten",
-            "description": "In Home Assistant ist ein Raum zugeordnet, dessen sicherer Anzeigename nicht verfügbar ist.\n\nDer angeforderte Loxone-Raum ist ungültig. Nur **HA-Raum beibehalten** ist verfügbar.",
-            "data": {"action": "Raumzuordnung"}
+          "devices": {
+            "title": "Entscheidungen je Gerät prüfen",
+            "description": "Bei Geräten einer Raumgruppe die Gruppenentscheidung anwenden oder die aktuelle Home-Assistant-Zuordnung beibehalten. Ohne Raumidentität sind nur Home Assistant beibehalten oder Bereich leeren zulässig. Geräteschlüssel nicht ändern. Absenden wendet diese ausdrücklichen Entscheidungen an.",
+            "data": {
+              "devices": "Geräte einer Raumgruppe",
+              "no_room_devices": "Geräte ohne Raumidentität"
+            }
           }
         }
       }

@@ -86,27 +86,41 @@ managed by this running integration process. Area equality, timestamps, and
 history are not treated as ownership evidence. Automatic room synchronization
 pauses only for the affected device; other safe registry updates can continue.
 
-Open **Settings → System → Repairs** to resolve a reported room conflict.
-For a normal valid conflict, the native repair offers exactly these choices:
+Open **Settings → System → Repairs**. One aggregate issue per loaded config
+entry covers all current conflicts; notifications contain only their bounded
+count. Names and device summaries are shown inside the native repair form.
 
-- **Apply Loxone room** applies the desired room for that exact, still-current
-  conflict.
-- **Keep HA room** keeps the Home Assistant assignment and records it as
-  user-owned.
+1. Review room groups. Group membership uses exact opaque room UUIDs, never
+   matching labels. Select an existing Home Assistant area by ID, explicitly
+   create a new area with a normalized name, or keep Home Assistant assignments.
+   A name collision requires explicit selection of the existing area; it never
+   authorizes adoption by name.
+2. Review each device. Room-group members can apply the group decision or keep
+   their current Home Assistant assignment as an individual override. Devices
+   without a room UUID can only keep their assignment or explicitly clear it.
+   All decisions are checked again when submitted.
 
-If the desired Loxone room is invalid or unsafe, **Apply Loxone room** is not
-offered and only **Keep HA room** remains available.
+Keys identify the original rows and must not be edited, duplicated, or omitted.
+Unused target fields stay empty. Ordinary validation errors retain entered
+values. Changed conflicts or lifecycle/provider bindings invalidate the open
+flow: reopen the synchronized current repair instead of submitting old choices.
+A successful repair completes only after a fresh read proves no conflicts
+remain for that entry. Dismissing the notification is not consent.
 
-An intentional Loxone no-room assignment can clear a Home Assistant area only
-with matching current-process managed-ownership evidence or the explicit
-exact-token repair decision. Restarting Home Assistant, refreshing the
-inventory, dismissing a notification, or waiting is not consent. If a conflict
-changes while its repair is open, reopen the current repair and decide again.
+The batch boundary records bounded write-ahead progress. A partial result or
+restart leaves current conflicts available for retry. If creation succeeded but
+its exact returned area identity was not durably acknowledged, or the created
+area was removed or renamed, retry can require manual selection of an existing
+area. It does not silently create another area, adopt by name, delete a global
+Home Assistant area, or roll one back. Refreshing or waiting is not consent to
+clear an area. The flow performs no Loxone writes.
 
-For example, moving `ST-F07` from `Office` to `Workshop` updates a proven
-integration-managed assignment. If the current Home Assistant assignment is
-unexplained or ambiguous, it remains unchanged until one of the two repair
-choices is confirmed.
+The generic hierarchy view supports review of controller roots, supported
+branches and devices without product-specific filtering. Unsupported and
+protected/suppressed inventory statuses remain explicit and non-writable;
+hierarchy presentation does not grant registry ownership. The native Repairs
+flow is the only area-decision write interface; the hierarchy is a read-only
+view, not a second custom write panel.
 
 ## Consumer-impact warnings
 

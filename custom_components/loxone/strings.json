@@ -1,90 +1,93 @@
 {
   "issues": {
     "engineering_area_conflict": {
-      "title": "Choose the room for {device}",
-      "description": "A room assignment conflict is active for **{device}**. Open the repair to review the current Home Assistant assignment and the Loxone request.",
+      "title": "Review {count} room assignment conflicts",
+      "description": "Room decisions are pending for {count} devices. Open this repair to choose room-group targets and per-device overrides.",
       "fix_flow": {
         "abort": {
-          "conflict_changed": "The room assignment changed while this repair was open. Review the current repair and try again.",
-          "entry_unavailable": "The Loxone configuration entry is no longer available.",
-          "invalid_action": "The selected room action is not supported. Open the repair again and choose one of the available actions.",
-          "invalid_desired_area": "The requested Loxone room is no longer valid. Refresh the engineering inventory before trying again.",
-          "invalid_repair": "This repair does not match a current Loxone room conflict.",
-          "repair_unavailable": "The current room conflict could not be loaded. Try again after the integration has refreshed.",
-          "resolution_failed": "The room decision could not be completed. Review the current repair and try again."
+          "conflict_changed": "The conflict set changed. Reopen the current repair and review the updated devices.",
+          "entry_unavailable": "The configuration entry changed or is unavailable. Reopen the current repair after the integration has refreshed.",
+          "invalid_repair": "This repair does not match a current room-conflict set.",
+          "repair_unavailable": "The current conflict set could not be verified. Reopen the repair after the integration has refreshed.",
+          "resolution_failed": "Some decisions remain unresolved. Reopen the current repair and review all remaining groups. A pending or changed created area can require manual selection of an existing area. No global area is deleted or rolled back."
+        },
+        "error": {
+          "invalid_rows": "Keep every original row exactly once and do not edit its key. Review the submitted values.",
+          "invalid_target": "Choose a supported action and only its required target: an existing area, a new name, or no target for Keep Home Assistant.",
+          "area_name_collision": "An area already has this normalized name. Select that existing area explicitly instead of creating or adopting it by name."
         },
         "step": {
-          "current_named_desired_named": {
-            "title": "Choose the room for {device}",
-            "description": "Current Home Assistant room: **{current_room}**\n\nRequested Loxone room: **{desired_room}**",
+          "rooms": {
+            "title": "Choose room-group assignments",
+            "description": "Each row groups devices by an exact room identity, not its name. Select an existing area, explicitly create a new area, or keep Home Assistant assignments. Leave unused target fields empty. Do not edit group keys. Nothing is written until the device step is submitted.",
             "data": {
-              "action": "Room assignment"
+              "rooms": "Room groups"
             }
           },
-          "current_named_desired_none": {
-            "title": "Choose the room for {device}",
-            "description": "Current Home Assistant room: **{current_room}**\n\nLoxone requests **no room**.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_named_desired_unknown": {
-            "title": "Choose the room for {device}",
-            "description": "Current Home Assistant room: **{current_room}**\n\nThe safe display name of the requested Loxone room is unavailable.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_named_desired_invalid": {
-            "title": "Keep the current room for {device}",
-            "description": "Current Home Assistant room: **{current_room}**\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_none_desired_named": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant currently has **no room** assigned.\n\nRequested Loxone room: **{desired_room}**",
-            "data": {"action": "Room assignment"}
-          },
-          "current_none_desired_none": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant currently has **no room** assigned.\n\nLoxone also requests **no room**.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_none_desired_unknown": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant currently has **no room** assigned.\n\nThe safe display name of the requested Loxone room is unavailable.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_none_desired_invalid": {
-            "title": "Keep the current room for {device}",
-            "description": "Home Assistant currently has **no room** assigned.\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_unknown_desired_named": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nRequested Loxone room: **{desired_room}**",
-            "data": {"action": "Room assignment"}
-          },
-          "current_unknown_desired_none": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nLoxone requests **no room**.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_unknown_desired_unknown": {
-            "title": "Choose the room for {device}",
-            "description": "Home Assistant and Loxone both have room assignments whose safe display names are unavailable.",
-            "data": {"action": "Room assignment"}
-          },
-          "current_unknown_desired_invalid": {
-            "title": "Keep the current room for {device}",
-            "description": "Home Assistant has a room assigned, but its safe display name is unavailable.\n\nThe requested Loxone room is invalid. Only **Keep HA room** is available.",
-            "data": {"action": "Room assignment"}
+          "devices": {
+            "title": "Review individual device decisions",
+            "description": "For room-group members, apply the group choice or keep the current Home Assistant assignment. For devices without a room identity, only Keep Home Assistant or Clear area is valid. Do not edit device keys. Submitting applies these explicit decisions.",
+            "data": {
+              "devices": "Room-group devices",
+              "no_room_devices": "Devices without a room identity"
+            }
           }
         }
       }
     }
   },
   "selector": {
-    "engineering_area_conflict_action": {
+    "engineering_area_decision": {
       "options": {
-        "apply_loxone_room": "Apply Loxone room",
-        "keep_ha_room": "Keep HA room"
+        "use_existing": "Select existing area",
+        "create": "Create new area",
+        "keep_ha": "Keep Home Assistant",
+        "apply_group": "Apply group choice",
+        "clear": "Clear area"
+      }
+    },
+    "engineering_area_rooms": {
+      "fields": {
+        "group_key": {
+          "name": "Group key (do not edit)"
+        },
+        "device_key": {
+          "name": "Device key (do not edit)"
+        },
+        "description": {
+          "name": "Description"
+        },
+        "action": {
+          "name": "Decision"
+        },
+        "area_id": {
+          "name": "Existing area"
+        },
+        "area_name": {
+          "name": "New area name"
+        }
+      }
+    },
+    "engineering_area_devices": {
+      "fields": {
+        "group_key": {
+          "name": "Group key (do not edit)"
+        },
+        "device_key": {
+          "name": "Device key (do not edit)"
+        },
+        "description": {
+          "name": "Description"
+        },
+        "action": {
+          "name": "Decision"
+        },
+        "area_id": {
+          "name": "Existing area"
+        },
+        "area_name": {
+          "name": "New area name"
+        }
       }
     }
   }

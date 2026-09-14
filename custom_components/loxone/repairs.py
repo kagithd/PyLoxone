@@ -4,24 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import re
-from dataclasses import dataclass
+from contextlib import suppress
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any
 
 import voluptuous as vol
 from homeassistant.components.repairs import RepairsFlow, RepairsFlowResult
 from homeassistant.config_entries import ConfigEntryState
+from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import issue_registry as ir
-from homeassistant.helpers.selector import SelectSelector, SelectSelectorConfig
+from homeassistant.helpers.selector import (
+    AreaSelector,
+    ObjectSelector,
+    ObjectSelectorConfig,
+    SelectSelector,
+    SelectSelectorConfig,
+    TextSelector,
+)
 
 from .const import DOMAIN
 from .engineering_registry import (
     EngineeringAreaConflict,
     async_load_engineering_area_conflicts,
-    async_resolve_engineering_area_conflict,
+    async_resolve_engineering_area_conflicts,
 )
 from .engineering_snapshot import (
+    EngineeringAreaDecision,
     EngineeringSnapshotError,
+    normalize_engineering_area_decision,
     validate_engineering_presentation,
 )
 
@@ -32,13 +43,22 @@ if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
 
 _ISSUE_KIND = "engineering_area_conflict"
-_ISSUE_VERSION = 1
+_ISSUE_VERSION = 2
 _ISSUE_PREFIX = f"{_ISSUE_KIND}_"
 _RECONCILER_DATA = f"{DOMAIN}_engineering_area_reconcilers"
 _ENTRY_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _CONFLICT_TOKEN = re.compile(r"^[0-9a-f]{64}$")
-_ACTIONS = frozenset({"apply_loxone_room", "keep_ha_room"})
 _INVALID_IDENTITY = "invalid engineering area conflict identity"
+_INVALID_ROWS = "invalid_rows"
+_INVALID_TARGET = "invalid_target"
+_AREA_COLLISION = "area_name_collision"
+_ENTRY_UNAVAILABLE = "entry_unavailable"
+_REPAIR_UNAVAILABLE = "repair_unavailable"
+_ROOM_UUID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$")
+
+
+class _FlowError(ValueError):
+    """Only fixed, translated validation codes cross the form boundary."""
 
 
 @dataclass(slots=True)
@@ -73,11 +93,11 @@ def _owned_issue_prefix(entry_id: str) -> str:
     return f"{_ISSUE_PREFIX}{_entry_scope(entry_id)}_"
 
 
-def engineering_area_conflict_issue_id(entry_id: str, conflict_token: str) -> str:
-    """Build an issue identity fenced by config entry and exact conflict token."""
-    if not _ENTRY_ID.fullmatch(entry_id) or not _CONFLICT_TOKEN.fullmatch(conflict_token):
+def engineering_area_conflict_issue_id(entry_id: str, conflict_fingerprint: str) -> str:
+    """Build an issue identity fenced by config entry and exact aggregate fingerprint."""
+    if not _ENTRY_ID.fullmatch(entry_id) or not _CONFLICT_TOKEN.fullmatch(conflict_fingerprint):
         raise ValueError(_INVALID_IDENTITY)
-    return f"{_owned_issue_prefix(entry_id)}{conflict_token}"
+    return f"{_owned_issue_prefix(entry_id)}{conflict_fingerprint}"
 
 
 def _reconciler(hass: HomeAssistant, entry_id: str) -> _EntryReconciler:
@@ -227,32 +247,6 @@ def _device_reference(conflict: EngineeringAreaConflict) -> str:
     return _safe_text(conflict.display_name) or f"#{sha256(conflict.device_identifier.encode()).hexdigest()[:8]}"
 
 
-def _room_presentation(
-    conflict: EngineeringAreaConflict,
-) -> tuple[str, dict[str, str]]:
-    current_name = _safe_text(conflict.current_area_name)
-    desired_name = _safe_text(conflict.desired_area_name)
-    current_state = "none" if conflict.current_area_id is None else "named" if current_name is not None else "unknown"
-    if not conflict.desired_action_valid:
-        desired_state = "invalid"
-    elif desired_name is not None:
-        desired_state = "named"
-    elif conflict.desired_area_id is None:
-        desired_state = "none"
-    else:
-        desired_state = "unknown"
-    placeholders = {"device": _device_reference(conflict)}
-    if current_name is not None and current_state == "named":
-        placeholders["current_room"] = current_name
-    if desired_name is not None and desired_state == "named":
-        placeholders["desired_room"] = desired_name
-    return f"current_{current_state}_desired_{desired_state}", placeholders
-
-
-def _issue_placeholders(conflict: EngineeringAreaConflict) -> dict[str, str]:
-    return {"device": _device_reference(conflict)}
-
-
 def _owned_issue_ids(hass: HomeAssistant, entry_id: str) -> set[str]:
     prefix = _owned_issue_prefix(entry_id)
     issues = getattr(ir.async_get(hass), "issues", {})
@@ -278,30 +272,67 @@ def async_remove_engineering_area_conflict_issues(
         state.active = False
 
 
-def _create_issue(
+def _trusted_conflicts(
+    conflicts: tuple[EngineeringAreaConflict, ...],
+    entry_id: str,
+    active: _ActiveBinding,
+) -> bool:
+    """Reject the entire observation if any member cannot grant authority."""
+    tokens: set[str] = set()
+    for conflict in conflicts:
+        if (
+            not isinstance(conflict, EngineeringAreaConflict)
+            or conflict.entry_id != entry_id
+            or not isinstance(conflict.token, str)
+            or not _CONFLICT_TOKEN.fullmatch(conflict.token)
+            or conflict.token in tokens
+            or not isinstance(conflict.device_identifier, str)
+            or not _conflict_belongs_to_provider(conflict, active.provider_identifier)
+            or (
+                conflict.room_uuid is not None
+                and (not isinstance(conflict.room_uuid, str) or not _ROOM_UUID.fullmatch(conflict.room_uuid))
+            )
+        ):
+            return False
+        tokens.add(conflict.token)
+    return True
+
+
+def _fingerprint(conflicts: tuple[EngineeringAreaConflict, ...]) -> str:
+    """Hash fixed-width exact tokens without names or traversal ordering."""
+    return sha256("".join(sorted(item.token for item in conflicts)).encode()).hexdigest()
+
+
+def _publish_conflicts(
     hass: HomeAssistant,
     entry_id: str,
-    conflict: EngineeringAreaConflict,
-) -> str:
-    issue_id = engineering_area_conflict_issue_id(entry_id, conflict.token)
-    ir.async_create_issue(
-        hass,
-        DOMAIN,
-        issue_id,
-        data={
-            "kind": _ISSUE_KIND,
-            "version": _ISSUE_VERSION,
-            "entry_id": entry_id,
-            "conflict_token": conflict.token,
-        },
-        is_fixable=True,
-        is_persistent=True,
-        issue_domain=DOMAIN,
-        severity=ir.IssueSeverity.WARNING,
-        translation_key=_ISSUE_KIND,
-        translation_placeholders=_issue_placeholders(conflict),
-    )
-    return issue_id
+    conflicts: tuple[EngineeringAreaConflict, ...],
+) -> None:
+    """Publish the validated current aggregate before retiring obsolete issues."""
+    desired: set[str] = set()
+    if conflicts:
+        fingerprint = _fingerprint(conflicts)
+        issue_id = engineering_area_conflict_issue_id(entry_id, fingerprint)
+        desired.add(issue_id)
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            issue_id,
+            data={
+                "kind": _ISSUE_KIND,
+                "version": _ISSUE_VERSION,
+                "entry_id": entry_id,
+                "conflict_fingerprint": fingerprint,
+            },
+            is_fixable=True,
+            is_persistent=True,
+            issue_domain=DOMAIN,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key=_ISSUE_KIND,
+            translation_placeholders={"count": str(min(len(conflicts), 99999))},
+        )
+    for issue_id in _owned_issue_ids(hass, entry_id) - desired:
+        ir.async_delete_issue(hass, DOMAIN, issue_id)
 
 
 async def _async_reconcile_locked(
@@ -313,24 +344,11 @@ async def _async_reconcile_locked(
 ) -> bool:
     """Load and reconcile one authoritative set while its entry lock is held."""
     conflicts = await async_load_engineering_area_conflicts(hass, entry_id)
-    if not _binding_is_current(
-        hass,
-        entry_id,
-        active,
-        require_loaded=require_loaded,
-    ):
+    if not _binding_is_current(hass, entry_id, active, require_loaded=require_loaded):
         return False
-    desired_issue_ids: set[str] = set()
-    for conflict in conflicts:
-        if (
-            conflict.entry_id != entry_id
-            or not _CONFLICT_TOKEN.fullmatch(conflict.token)
-            or not _conflict_belongs_to_provider(conflict, active.provider_identifier)
-        ):
-            continue
-        desired_issue_ids.add(_create_issue(hass, entry_id, conflict))
-    for issue_id in _owned_issue_ids(hass, entry_id) - desired_issue_ids:
-        ir.async_delete_issue(hass, DOMAIN, issue_id)
+    if not _trusted_conflicts(conflicts, entry_id, active):
+        return False
+    _publish_conflicts(hass, entry_id, conflicts)
     return True
 
 
@@ -341,7 +359,7 @@ async def async_sync_engineering_area_conflict_issues(
     config_entry: ConfigEntry | None = None,
     coordinator: object | None = None,
 ) -> None:
-    """Serialize durable Task 5 conflicts into entry-scoped native issues."""
+    """Serialize durable engineering conflicts into entry-scoped native issues."""
     if not _ENTRY_ID.fullmatch(entry_id):
         return
     configured = _configured_entry(hass, entry_id)
@@ -385,13 +403,14 @@ def _validated_flow_data(
         "kind",
         "version",
         "entry_id",
-        "conflict_token",
+        "conflict_fingerprint",
     }:
         return None
     entry_id = data.get("entry_id")
-    token = data.get("conflict_token")
+    token = data.get("conflict_fingerprint")
     if (
         data.get("kind") != _ISSUE_KIND
+        or type(data.get("version")) is not int
         or data.get("version") != _ISSUE_VERSION
         or not isinstance(entry_id, str)
         or not isinstance(token, str)
@@ -403,151 +422,312 @@ def _validated_flow_data(
     return entry_id, token
 
 
-class EngineeringAreaConflictFixFlow(RepairsFlow):
-    """Show and resolve one exact current area conflict."""
+def _room_groups(conflicts: tuple[EngineeringAreaConflict, ...]) -> dict[str, tuple[EngineeringAreaConflict, ...]]:
+    return {
+        room: tuple(item for item in conflicts if item.room_uuid == room)
+        for room in sorted({item.room_uuid for item in conflicts if item.room_uuid})
+    }
 
-    def __init__(
-        self,
-        issue_id: str,
-        data: dict[str, str | int | float | None] | None,
-    ) -> None:
-        """Initialize a flow with untrusted issue registry input."""
+
+def _device_key(conflict: EngineeringAreaConflict) -> str:
+    return sha256(conflict.token.encode()).hexdigest()
+
+
+def _exact_rows(user_input: Any, field: str, key: str, expected: set[str], allowed: set[str]) -> list[dict[str, Any]]:
+    """Treat native object rows as untrusted, including edits to identity fields."""
+    if not isinstance(user_input, dict) or set(user_input) != {field}:
+        raise _FlowError(_INVALID_ROWS)
+    rows = user_input[field]
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        raise _FlowError(_INVALID_ROWS)
+    seen: set[str] = set()
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or not set(row) <= allowed
+            or not isinstance(row.get(key), str)
+            or row[key] not in expected
+            or row[key] in seen
+            or not isinstance(row.get("action"), str)
+            or ("description" in row and _safe_text(row["description"]) != row["description"])
+        ):
+            raise _FlowError(_INVALID_ROWS)
+        seen.add(row[key])
+    return rows
+
+
+class EngineeringAreaConflictFixFlow(RepairsFlow):
+    """Two native forms fenced by one exact aggregate and lifecycle binding."""
+
+    def __init__(self, issue_id: str, data: dict[str, str | int | float | None] | None) -> None:
+        """Capture untrusted data and bind the first opened lifecycle."""
         super().__init__()
         self._issue_id = issue_id
-        self._flow_data = data
+        self._flow_data = dict(data) if isinstance(data, dict) else data
+        self._active: _ActiveBinding | None = None
+        self._room_input: dict[str, Any] | None = None
+        self._decisions: tuple[EngineeringAreaDecision, ...] | None = None
 
-    async def _async_secondary_reconcile(
+    def _form(
         self,
-        entry_id: str,
-        active: _ActiveBinding,
-    ) -> bool:
-        try:
-            return await _async_reconcile_locked(
-                self.hass,
-                entry_id,
-                active,
-                require_loaded=True,
+        step: str,
+        conflicts: tuple[EngineeringAreaConflict, ...],
+        user_input: dict[str, Any] | None = None,
+        error: str | None = None,
+    ) -> RepairsFlowResult:
+        schema = {}
+        if step == "rooms":
+            row_sets = {
+                "rooms": [
+                    {
+                        "group_key": room,
+                        "description": (
+                            (_safe_text(members[0].desired_area_name) or "#" + sha256(room.encode()).hexdigest()[:8])
+                            + " · "
+                            + ", ".join(_device_reference(item) for item in members[:3])
+                        )[:200],
+                        "action": "keep_ha",
+                    }
+                    for room, members in _room_groups(conflicts).items()
+                ]
+            }
+        else:
+            row_sets = {
+                field: [
+                    {
+                        "device_key": _device_key(item),
+                        "description": _device_reference(item),
+                        "action": "apply_group" if item.room_uuid else "keep_ha",
+                    }
+                    for item in sorted(conflicts, key=lambda item: item.token)
+                    if bool(item.room_uuid) == (field == "devices")
+                ]
+                for field in ("devices", "no_room_devices")
+            }
+            row_sets = {field: rows for field, rows in row_sets.items() if rows}
+        for field, rows in row_sets.items():
+            actions = {
+                "rooms": ["use_existing", "create", "keep_ha"],
+                "devices": ["apply_group", "keep_ha"],
+                "no_room_devices": ["keep_ha", "clear"],
+            }[field]
+            fields = {
+                "group_key" if step == "rooms" else "device_key": {"required": True, "selector": TextSelector()},
+                "description": {"selector": TextSelector()},
+                "action": {
+                    "required": True,
+                    "selector": SelectSelector(
+                        SelectSelectorConfig(
+                            options=actions,
+                            translation_key="engineering_area_decision",
+                        )
+                    ),
+                },
+            }
+            if step == "rooms":
+                fields.update({"area_id": {"selector": AreaSelector()}, "area_name": {"selector": TextSelector()}})
+            values = user_input.get(field, rows) if isinstance(user_input, dict) else rows
+            schema[vol.Required(field, default=values)] = ObjectSelector(
+                ObjectSelectorConfig(
+                    multiple=True,
+                    fields=fields,
+                    description_field="description",
+                    translation_key="engineering_area_" + step,
+                )
             )
-        except Exception:  # noqa: BLE001 -- return only a translated bounded reason.
-            return False
+        return self.async_show_form(
+            step_id=step,
+            data_schema=vol.Schema(schema),
+            errors={"base": error} if error else {},
+        )
 
-    async def _async_step(  # noqa: PLR0911, PLR0912 -- explicit Repairs outcomes are the flow state machine.
-        self,
-        user_input: dict[str, Any] | None,
+    def _validate_rooms(
+        self, user_input: dict[str, Any], conflicts: tuple[EngineeringAreaConflict, ...]
+    ) -> tuple[EngineeringAreaDecision, ...]:
+        groups = _room_groups(conflicts)
+        rows = _exact_rows(
+            user_input,
+            "rooms",
+            "group_key",
+            set(groups),
+            {"group_key", "description", "action", "area_id", "area_name"},
+        )
+        decisions = []
+        names: set[str] = set()
+        areas = ar.async_get(self.hass)
+        for row in rows:
+            if any(
+                row.get(field) is not None and not isinstance(row[field], str) for field in ("area_id", "area_name")
+            ):
+                raise _FlowError(_INVALID_TARGET)
+            if row["action"] not in {"use_existing", "create", "keep_ha"}:
+                raise _FlowError(_INVALID_TARGET)
+            try:
+                decision = normalize_engineering_area_decision(
+                    EngineeringAreaDecision(
+                        room_uuid=row["group_key"],
+                        action=row["action"],
+                        area_id=row.get("area_id") or None,
+                        area_name=row.get("area_name") or None,
+                        conflict_tokens=tuple(item.token for item in groups[row["group_key"]]),
+                    )
+                )
+            except EngineeringSnapshotError:
+                raise _FlowError(_INVALID_TARGET) from None
+            if decision.action == "use_existing" and areas.async_get_area(decision.area_id) is None:
+                raise _FlowError(_INVALID_TARGET)
+            if decision.action == "create":
+                normalized = ar.normalize_name(decision.area_name)
+                if normalized in names or any(
+                    ar.normalize_name(area.name) == normalized for area in areas.async_list_areas()
+                ):
+                    raise _FlowError(_AREA_COLLISION)
+                names.add(normalized)
+            decisions.append(decision)
+        return tuple(sorted(decisions, key=lambda item: item.room_uuid))
+
+    def _validate_devices(
+        self, user_input: dict[str, Any], conflicts: tuple[EngineeringAreaConflict, ...]
+    ) -> tuple[EngineeringAreaDecision, ...]:
+        by_key = {_device_key(item): item for item in conflicts}
+        memberships = {
+            field: {key for key, item in by_key.items() if bool(item.room_uuid) == (field == "devices")}
+            for field in ("devices", "no_room_devices")
+        }
+        memberships = {field: keys for field, keys in memberships.items() if keys}
+        if not isinstance(user_input, dict) or set(user_input) != set(memberships):
+            raise _FlowError(_INVALID_ROWS)
+        rows = []
+        for field, keys in memberships.items():
+            rows.extend(
+                _exact_rows(
+                    {field: user_input[field]},
+                    field,
+                    "device_key",
+                    keys,
+                    {"device_key", "description", "action"},
+                )
+            )
+        actions = {}
+        for row in rows:
+            conflict = by_key[row["device_key"]]
+            allowed = {"apply_group", "keep_ha"} if conflict.room_uuid else {"keep_ha", "clear"}
+            if row["action"] not in allowed:
+                raise _FlowError(_INVALID_TARGET)
+            actions[conflict.token] = row["action"]
+        decisions = [
+            replace(
+                decision,
+                keep_conflict_tokens=tuple(token for token in decision.conflict_tokens if actions[token] == "keep_ha"),
+            )
+            for decision in self._decisions
+        ]
+        decisions.extend(
+            EngineeringAreaDecision(room_uuid=None, action=actions[item.token], conflict_tokens=(item.token,))
+            for item in sorted(conflicts, key=lambda item: item.token)
+            if item.room_uuid is None
+        )
+        return tuple(decisions)
+
+    async def _load(self, entry_id: str, active: _ActiveBinding) -> tuple[EngineeringAreaConflict, ...]:
+        conflicts = await async_load_engineering_area_conflicts(self.hass, entry_id)
+        if not _binding_is_current(self.hass, entry_id, active):
+            raise _FlowError(_ENTRY_UNAVAILABLE)
+        if not _trusted_conflicts(conflicts, entry_id, active):
+            raise _FlowError(_REPAIR_UNAVAILABLE)
+        return conflicts
+
+    async def _async_step(self, step: str, user_input: dict[str, Any] | None) -> RepairsFlowResult:
+        result = await self._async_step_bound(step, user_input)
+        if result.get("reason") != "entry_unavailable":
+            return result
+        # The old flow's lock is released. A fresh binding may synchronize only
+        # its issues; it never supplies mutation authority to this old flow.
+        validated = _validated_flow_data(self._issue_id, self._flow_data)
+        if validated is not None and _active_binding(self.hass, validated[0], require_loaded=True) is not None:
+            # Normal coordinator synchronization remains the fallback.
+            with suppress(Exception):
+                await async_sync_engineering_area_conflict_issues(self.hass, validated[0])
+        return result
+
+    async def _async_step_bound(  # noqa: PLR0911, PLR0912 -- explicit bounded Repairs state transitions.
+        self, step: str, user_input: dict[str, Any] | None
     ) -> RepairsFlowResult:
         validated = _validated_flow_data(self._issue_id, self._flow_data)
         if validated is None:
             return self.async_abort(reason="invalid_repair")
-        entry_id, token = validated
-        active = _active_binding(self.hass, entry_id, require_loaded=True)
-        if active is None:
-            if _configured_entry(self.hass, entry_id) is None:
-                async_remove_engineering_area_conflict_issues(self.hass, entry_id)
+        entry_id, fingerprint = validated
+        active = self._active or _active_binding(self.hass, entry_id, require_loaded=True)
+        if active is None or not _binding_is_current(self.hass, entry_id, active):
             return self.async_abort(reason="entry_unavailable")
+        self._active = active
         async with active.state.lock:
             if not _binding_is_current(self.hass, entry_id, active):
                 return self.async_abort(reason="entry_unavailable")
             try:
-                conflicts = await async_load_engineering_area_conflicts(self.hass, entry_id)
-            except Exception:  # noqa: BLE001 -- never expose private storage details.
-                return self.async_abort(reason="repair_unavailable")
-            if not _binding_is_current(self.hass, entry_id, active):
-                return self.async_abort(reason="entry_unavailable")
-            conflict = next(
-                (
-                    item
-                    for item in conflicts
-                    if item.entry_id == entry_id
-                    and item.token == token
-                    and _conflict_belongs_to_provider(item, active.provider_identifier)
-                ),
-                None,
-            )
-            if conflict is None:
-                if not await self._async_secondary_reconcile(entry_id, active):
-                    return self.async_abort(reason="repair_unavailable")
-                return self.async_abort(reason="conflict_changed")
-            step_id, placeholders = _room_presentation(conflict)
-            if user_input is None:
-                actions = ("keep_ha_room",) if not conflict.desired_action_valid else tuple(sorted(_ACTIONS))
-                return self.async_show_form(
-                    step_id=step_id,
-                    data_schema=vol.Schema(
-                        {
-                            vol.Required("action"): SelectSelector(
-                                SelectSelectorConfig(
-                                    options=list(actions),
-                                    translation_key="engineering_area_conflict_action",
-                                )
-                            )
-                        }
-                    ),
-                    description_placeholders=placeholders,
-                )
-
-            action = user_input.get("action")
-            if set(user_input) != {"action"} or not isinstance(action, str) or action not in _ACTIONS:
-                if not await self._async_secondary_reconcile(entry_id, active):
-                    return self.async_abort(reason="repair_unavailable")
-                return self.async_abort(reason="invalid_action")
-            if not conflict.desired_action_valid and action != "keep_ha_room":
-                if not await self._async_secondary_reconcile(entry_id, active):
-                    return self.async_abort(reason="repair_unavailable")
-                return self.async_abort(reason="invalid_desired_area")
-            if not _binding_is_current(self.hass, entry_id, active):
-                return self.async_abort(reason="entry_unavailable")
-            try:
-                result = await async_resolve_engineering_area_conflict(
+                conflicts = await self._load(entry_id, active)
+                if not conflicts or _fingerprint(conflicts) != fingerprint:
+                    _publish_conflicts(self.hass, entry_id, conflicts)
+                    return self.async_abort(reason="conflict_changed")
+                if user_input is None:
+                    return self._form(step, conflicts)
+                if step == "rooms":
+                    try:
+                        self._decisions = self._validate_rooms(user_input, conflicts)
+                    except _FlowError as err:
+                        return self._form("rooms", conflicts, user_input, str(err))
+                    self._room_input = user_input
+                    return self._form("devices", conflicts)
+                if self._decisions is None:
+                    return self._form("rooms", conflicts, error="invalid_rows")
+                try:
+                    decisions = self._validate_devices(user_input, conflicts)
+                except _FlowError as err:
+                    return self._form("devices", conflicts, user_input, str(err))
+                # Repeat exact observation immediately before entering the batch boundary.
+                conflicts = await self._load(entry_id, active)
+                if not conflicts or _fingerprint(conflicts) != fingerprint:
+                    _publish_conflicts(self.hass, entry_id, conflicts)
+                    return self.async_abort(reason="conflict_changed")
+                result = await async_resolve_engineering_area_conflicts(
                     self.hass,
                     entry_id,
-                    conflict.token,
-                    action,
-                    is_current=lambda: _binding_is_current(
-                        self.hass,
-                        entry_id,
-                        active,
-                    ),
+                    decisions,
+                    is_current=lambda: _binding_is_current(self.hass, entry_id, active),
                 )
+                if not _binding_is_current(self.hass, entry_id, active):
+                    return self.async_abort(reason="entry_unavailable")
+                remaining = await self._load(entry_id, active)
+                _publish_conflicts(self.hass, entry_id, remaining)
+                if not remaining and result.reason == "resolved" and result.unresolved_groups == 0:
+                    # No await between authoritative empty publication and manager completion.
+                    return self.async_create_entry(data={})
+                if remaining and _fingerprint(remaining) != fingerprint:
+                    return self.async_abort(reason="conflict_changed")
+                if result.reason == "area_name_collision":
+                    return self._form("rooms", remaining, self._room_input, "area_name_collision")
+                return self.async_abort(reason="resolution_failed")
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 -- never surface private storage details.
-                return self.async_abort(reason="resolution_failed")
-            if not _binding_is_current(self.hass, entry_id, active):
-                return self.async_abort(reason="entry_unavailable")
-            reason = {
-                "stale_conflict": "conflict_changed",
-                "invalid_desired_area": "invalid_desired_area",
-                "invalid_action": "invalid_action",
-                "lifecycle_changed": "entry_unavailable",
-            }.get(result.reason, "resolution_failed")
-            reconciled = await self._async_secondary_reconcile(entry_id, active)
-            if result.resolved:
-                return self.async_create_entry(data={})
-            if not reconciled:
+            except _FlowError as err:
+                reason = str(err) if str(err) in {"entry_unavailable", "repair_unavailable"} else "repair_unavailable"
+                return self.async_abort(reason=reason)
+            except Exception:  # noqa: BLE001 -- no storage errors or private values leave the adapter.
                 return self.async_abort(reason="repair_unavailable")
-            return self.async_abort(reason=reason)
 
-    async def async_step_init(
-        self,
-        user_input: dict[str, Any] | None = None,
-    ) -> RepairsFlowResult:
-        """Load the exact current conflict and apply only an explicit choice."""
+    async def async_step_init(self, user_input: dict[str, Any] | None = None) -> RepairsFlowResult:
+        """Discard only HA manager's exact initialization envelope."""
         if user_input is getattr(self, "init_data", None) and user_input == {"issue_id": self._issue_id}:
             user_input = None
-        return await self._async_step(user_input)
+        return await self._async_step("rooms", user_input)
 
-    async_step_current_named_desired_named = async_step_init
-    async_step_current_named_desired_none = async_step_init
-    async_step_current_named_desired_unknown = async_step_init
-    async_step_current_named_desired_invalid = async_step_init
-    async_step_current_none_desired_named = async_step_init
-    async_step_current_none_desired_none = async_step_init
-    async_step_current_none_desired_unknown = async_step_init
-    async_step_current_none_desired_invalid = async_step_init
-    async_step_current_unknown_desired_named = async_step_init
-    async_step_current_unknown_desired_none = async_step_init
-    async_step_current_unknown_desired_unknown = async_step_init
-    async_step_current_unknown_desired_invalid = async_step_init
+    async def async_step_rooms(self, user_input: dict[str, Any] | None = None) -> RepairsFlowResult:
+        """Validate every room-group choice without writing any registry."""
+        return await self._async_step("rooms", user_input)
+
+    async def async_step_devices(self, user_input: dict[str, Any] | None = None) -> RepairsFlowResult:
+        """Validate overrides and submit the exact batch to the registry boundary."""
+        return await self._async_step("devices", user_input)
 
 
 async def async_create_fix_flow(
@@ -555,6 +735,6 @@ async def async_create_fix_flow(
     issue_id: str,
     data: dict[str, str | int | float | None] | None,
 ) -> RepairsFlow:
-    """Create a defensive flow that validates all issue input on first use."""
+    """Create a defensive flow with untrusted issue registry input."""
     del hass
     return EngineeringAreaConflictFixFlow(issue_id, data)
