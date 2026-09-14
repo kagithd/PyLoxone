@@ -13,7 +13,6 @@ import pytest
 
 import custom_components.loxone.engineering_registry as engineering_registry
 from custom_components.loxone.const import DOMAIN
-from custom_components.loxone.coordinator import LoxoneCoordinator
 from custom_components.loxone.engineering_capabilities import (
     resolve_engineering_capabilities,
 )
@@ -2388,69 +2387,3 @@ def test_legacy_metadata_round_trip_preserves_audit_scope_without_generation(
     assert metadata.room_names == frozenset({"Office"})
     assert metadata.applied_generation is None
     assert metadata.provider_identifier is None
-
-
-def test_unchanged_coordinator_still_passes_legacy_specs_to_metadata_adapter(
-    monkeypatch,
-):
-    """The current manual-refresh caller remains compatible before Task 7 wiring."""
-    inventory = inventory_of(
-        element("ms", "LoxLIVE", title="Miniserver", room=None),
-        element("device", "Lox1wireDevice", parent_uuid="ms", title="ST-F07"),
-        element(
-            "temperature",
-            "Lox1wireAsensor",
-            parent_uuid="device",
-            title="Temperature",
-            io_name="AI1",
-            platform="sensor",
-        ),
-    )
-    runtime = EngineeringRuntimeInventory(bindings=(numeric_binding("temperature", 21.0, "Lox1wireAsensor"),))
-    stored: list[object] = []
-
-    class FakeHass:
-        async def async_add_executor_job(self, job):
-            return job()
-
-    coordinator = object.__new__(LoxoneCoordinator)
-    coordinator.hass = FakeHass()
-    coordinator._host = ""
-    coordinator._username = ""
-    coordinator._password = ""
-    coordinator._verify_ssl = True
-    coordinator.api = SimpleNamespace(scheme="https", url="example.invalid")
-    coordinator.config_entry = SimpleNamespace(entry_id="entry-a")
-    monkeypatch.setattr(
-        "custom_components.loxone.coordinator.download_engineering_inventory",
-        lambda *args, **kwargs: inventory,
-    )
-    monkeypatch.setattr(
-        "custom_components.loxone.coordinator.async_get_clientsession",
-        lambda hass: object(),
-    )
-
-    async def probe(*args, **kwargs):
-        return runtime
-
-    async def store(hass, entry_id, payload):
-        del hass
-        stored.append((entry_id, payload))
-
-    monkeypatch.setattr(
-        "custom_components.loxone.coordinator.async_probe_engineering_runtime",
-        probe,
-    )
-    monkeypatch.setattr(
-        "custom_components.loxone.coordinator.async_store_engineering_registry_metadata",
-        store,
-    )
-    monkeypatch.setattr(
-        "custom_components.loxone.coordinator.async_dispatcher_send",
-        lambda *args: None,
-    )
-
-    asyncio.run(coordinator.async_refresh_engineering_inventory())
-
-    assert stored[0][0] == "entry-a"
-    assert stored[0][1] == build_engineering_sensor_specs(inventory, runtime)

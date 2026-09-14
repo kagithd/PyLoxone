@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -16,10 +15,15 @@ from homeassistant.helpers.entity import entity_sources
 
 from .const import DOMAIN
 from .device_sync import control_identifiers_from_lox_config, device_rooms_from_lox_config
+from .engineering_changes import EngineeringEntityImpact, EngineeringImpactPlan, diff_engineering_snapshots
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from homeassistant.config_entries import ConfigEntry
     from homeassistant.core import HomeAssistant
+
+    from .engineering_snapshot import EngineeringSnapshot
 
 NOTIFICATION_ID_PREFIX = f"{DOMAIN}_config_impact"
 REFERENCE_TYPES = (
@@ -29,6 +33,88 @@ REFERENCE_TYPES = (
     ItemType.GROUP,
     ItemType.PERSON,
 )
+
+
+async def async_find_engineering_change_impacts(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    previous: EngineeringSnapshot | None,
+    candidate: EngineeringSnapshot,
+) -> EngineeringImpactPlan:
+    """Discover consumer references against pre-mutation global entity identity."""
+    if previous is None:
+        return EngineeringImpactPlan(candidate.generation_id, ())
+    changes = diff_engineering_snapshots(previous, candidate)
+    registry = er.async_get(hass)
+    impacts = []
+    for change in (*changes.removed, *changes.metadata_changed):
+        removed = change in changes.removed
+        if not removed and change.old_semantic_platform == change.new_semantic_platform:
+            continue
+        if change.old_semantic_platform is None:
+            continue
+        entity_id = registry.async_get_entity_id(change.old_semantic_platform, DOMAIN, change.unique_id)
+        entry = registry.async_get(entity_id) if entity_id else None
+        if entry is None or entry.config_entry_id != config_entry.entry_id:
+            continue
+        results = Searcher(hass, entity_sources(hass)).async_search(ItemType.ENTITY, entity_id)
+        references = {
+            kind.value: values for kind, values in _relevant_references(results).items() if kind != ItemType.PERSON
+        }
+        if references:
+            impacts.append(
+                EngineeringEntityImpact(
+                    change.unique_id, (entity_id,), "removed" if removed else "platform_changed", references
+                )
+            )
+    return EngineeringImpactPlan(candidate.generation_id, tuple(impacts))
+
+
+async def async_publish_engineering_impact_plan(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    provider_identifier: str,
+    plan: EngineeringImpactPlan,
+    *,
+    recheck: bool = False,
+) -> None:
+    """Idempotently replace one source-scoped count-only impact notification."""
+    notification_id = f"loxone_engineering_impact_{config_entry.entry_id}_{provider_identifier}"
+    impacts = plan.impacts
+    if recheck and impacts:
+        registry = er.async_get(hass)
+        sources = entity_sources(hass)
+        applicable = []
+        for impact in impacts:
+            for entity_id in impact.entity_ids:
+                entry = registry.async_get(entity_id)
+                if (
+                    entry is None
+                    or entry.config_entry_id != config_entry.entry_id
+                    or entry.unique_id != impact.unique_id
+                ):
+                    continue
+                results = Searcher(hass, sources).async_search(ItemType.ENTITY, entity_id)
+                if any(
+                    set(results.get(kind, ())) & set(impact.references.get(kind.value, ()))
+                    for kind in REFERENCE_TYPES
+                    if kind != ItemType.PERSON
+                ):
+                    applicable.append(impact)
+                    break
+        impacts = tuple(applicable)
+    if not impacts:
+        persistent_notification.async_dismiss(hass, notification_id)
+        return
+    persistent_notification.async_create(
+        hass,
+        (
+            f"{len(impacts)} engineering channel change(s) affect Home Assistant consumers. "
+            "Review the affected configuration; entity identifiers were not renamed."
+        ),
+        title="PyLoxone engineering configuration review",
+        notification_id=notification_id,
+    )
 
 
 @dataclass(frozen=True)

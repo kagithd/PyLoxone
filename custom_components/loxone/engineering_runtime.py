@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -14,6 +14,7 @@ from xml.etree import ElementTree as ET
 import aiohttp
 
 if TYPE_CHECKING:
+    from .engineering_capabilities import EngineeringInventoryRow
     from .engineering_config import EngineeringElement, EngineeringInventory
     from .engineering_topology import ResolvedEngineeringInventory
 
@@ -318,11 +319,14 @@ async def _probe_element(
     element: EngineeringElement,
     *,
     unique_io_name: bool,
+    binding_method: str | None = None,
 ) -> EngineeringRuntimeBinding:
     """Probe one engineering channel without issuing a state-changing command."""
     last_code: int | None = None
     failures: set[str] = set()
     targets = _probe_targets(element, unique_io_name=unique_io_name)
+    if binding_method is not None:
+        targets = tuple(target for target in targets if target[0] == binding_method)
     if not targets:
         return EngineeringRuntimeBinding(
             engineering_uuid=element.uuid or "",
@@ -496,3 +500,26 @@ async def async_probe_engineering_runtime(
         )
     )
     return EngineeringRuntimeInventory(bindings=tuple(bindings))
+
+
+async def async_rebind_engineering_runtime(
+    rows: tuple[EngineeringInventoryRow, ...],
+    *,
+    client: RuntimeProbeClient,
+) -> EngineeringRuntimeInventory:
+    """Re-read only saved safe descriptors, without exploring alternative targets."""
+    bindings = await asyncio.gather(
+        *(
+            _probe_element(
+                client,
+                row.node.element,
+                unique_io_name=row.binding.binding_method == "io_name_state",
+                binding_method=row.binding.binding_method,
+            )
+            for row in rows
+            if row.binding is not None and not row.node.sensitive
+        )
+    )
+    if any(item.status in {"auth_error", "transport_error", "malformed_response"} for item in bindings):
+        bindings = [replace(item, status="unavailable", numeric_value=None, numeric_states=()) for item in bindings]
+    return EngineeringRuntimeInventory(tuple(bindings))

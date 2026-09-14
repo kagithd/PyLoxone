@@ -349,6 +349,14 @@ async def async_setup_entry(hass, config_entry):
     )
 
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = coordinator
+    try:
+        await coordinator.async_restore_engineering_snapshot()
+    except asyncio.CancelledError:
+        await coordinator.async_cleanup()
+        raise
+    except Exception as err:
+        await coordinator.async_cleanup()
+        raise ConfigEntryNotReady("Engineering cache reconciliation is pending") from err
 
     migrated_version_sensors = async_migrate_version_sensor_unique_id(hass, config_entry, coordinator.miniserver.serial)
     if migrated_version_sensors:
@@ -364,6 +372,8 @@ async def async_setup_entry(hass, config_entry):
 
     if setup_tasks:
         await asyncio.wait(setup_tasks)
+
+    await coordinator.async_schedule_engineering_refresh()
 
     config_impacts = async_warn_about_config_impacts(hass, config_entry, coordinator.miniserver.lox_config.json)
     if config_impacts:
@@ -386,7 +396,9 @@ async def async_setup_entry(hass, config_entry):
             updated_device_areas,
         )
 
-    maintenance = await async_run_registry_maintenance(hass, config_entry, coordinator.miniserver.lox_config.json)
+    maintenance = await async_run_registry_maintenance(
+        hass, config_entry, coordinator.miniserver.lox_config.json, bounded_notification=True
+    )
     if maintenance.skipped:
         _LOGGER.warning("Skipped Loxone registry maintenance because the structure contained no controls")
     elif maintenance.removed_devices or maintenance.removed_entities:

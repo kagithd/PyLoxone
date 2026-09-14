@@ -14,8 +14,7 @@ from homeassistant.components.button import ButtonEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity import EntityCategory
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import dt as dt_util
@@ -77,35 +76,34 @@ class LoxoneEngineeringInventoryButton(ButtonEntity):
         self._attr_extra_state_attributes = {"status": "loading"}
         self.async_write_ha_state()
         try:
-            inventory = await self._coordinator.async_refresh_engineering_inventory()
-        except Exception as err:
+            snapshot = await self._coordinator.async_refresh_engineering_inventory(force=True)
+        except Exception:
             self._attr_extra_state_attributes = {
                 "status": "error",
-                "error": str(err),
             }
             self.async_write_ha_state()
-            raise HomeAssistantError(f"Engineering inventory could not be loaded: {err}") from err
+            raise HomeAssistantError("Engineering inventory could not be loaded. Retry the refresh.") from None
 
-        summary = inventory.summary()
-        runtime_summary = self._coordinator.engineering_runtime.summary()
+        runtime = self._coordinator.engineering_runtime
+        summary = {
+            "node_count": len(snapshot.nodes),
+            "prepared_count": sum(row.capability.exposure.value == "prepared_disabled" for row in snapshot.rows),
+            "bound_count": sum(binding.status == "bound" for binding in runtime.bindings) if runtime else 0,
+        }
         self._attr_extra_state_attributes = {
             "status": "loaded",
             **summary,
-            "runtime": runtime_summary,
         }
         self.async_write_ha_state()
         persistent_notification.async_create(
             self.hass,
             (
-                f"Loaded {summary['candidate_count']} onboarding candidates from "
-                f"{summary['source_archive']}; {runtime_summary['bound_count']} of "
-                f"{runtime_summary['probed_count']} direct channels were reachable at runtime. "
-                "Open the PyLoxone diagnostics download "
-                "to inspect the prepared tree data. The read used local FTPS and did "
-                "not modify the Miniserver."
+                f"Loaded {summary['node_count']} engineering nodes; "
+                f"{summary['prepared_count']} read-only channels are prepared and "
+                f"{summary['bound_count']} bindings are reachable. The read did not modify the Miniserver."
             ),
             title="PyLoxone engineering inventory",
-            notification_id=f"pyloxone_engineering_inventory_{self._config_entry.entry_id}",
+            notification_id=f"pyloxone_engineering_inventory_{self._config_entry.entry_id}_{snapshot.source.provider_identifier}",
         )
 
 

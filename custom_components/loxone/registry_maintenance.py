@@ -327,10 +327,12 @@ def _stored_tracking_state(
     )
 
 
-async def async_run_registry_maintenance(
+async def async_run_registry_maintenance(  # noqa: PLR0915 -- one ordered maintenance transaction.
     hass: HomeAssistant,
     config_entry: ConfigEntry,
     lox_config: Mapping[str, Any],
+    *,
+    bounded_notification: bool = False,
 ) -> RegistryMaintenanceResult:
     """Audit and optionally clean registry entries after a grace period."""
     engineering_metadata = await async_load_engineering_registry_metadata(
@@ -472,10 +474,17 @@ async def async_run_registry_maintenance(
         removed_entities=removed_entities,
     )
     notification_id = f"{NOTIFICATION_ID_PREFIX}_{config_entry.entry_id}"
+    if bounded_notification and engineering_metadata.provider_identifier:
+        notification_id += f"_{engineering_metadata.provider_identifier}"
     if pending or removed or orphan_rooms:
         persistent_notification.async_create(
             hass,
-            format_registry_maintenance_message(
+            (
+                f"Registry audit: {len(pending)} pending device(s), {len(removed)} removed device(s), "
+                f"{len(orphan_rooms)} orphan room(s). Automatic cleanup is {'enabled' if auto_cleanup else 'disabled'}."
+            )
+            if bounded_notification
+            else format_registry_maintenance_message(
                 result,
                 grace_mode,
                 grace_observations,
