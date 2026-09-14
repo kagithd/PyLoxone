@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from collections.abc import Callable, Mapping, MutableMapping
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from homeassistant.core import callback
 from homeassistant.helpers import area_registry as ar
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 
-from .const import DOMAIN
+from .const import DOMAIN, ENGINEERING_STATE_SIGNAL
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -46,6 +48,16 @@ class EngineeringEntitySpec:
     config_version: int
     runtime_binding: str | None
     enabled_by_default: bool = False
+
+
+class PreparedEngineeringEntity(Protocol):
+    """Minimal platform entity surface used by the shared reconciler."""
+
+    def update_spec(self, spec: EngineeringEntitySpec) -> None:
+        """Apply a current prepared specification."""
+
+    def mark_unavailable(self) -> None:
+        """Retain the entity while marking its live binding unavailable."""
 
 
 ENGINEERING_REGISTRY_STORAGE_VERSION = 1
@@ -135,6 +147,107 @@ def build_engineering_entity_specs(
 def engineering_inventory_updated_signal(entry_id: str) -> str:
     """Return the config-entry-scoped engineering refresh signal."""
     return f"loxone_engineering_inventory_updated_{entry_id}"
+
+
+def engineering_state_updated_signal(entry_id: str, state_uuid: str) -> str:
+    """Return the private signal for one config-entry and proven state UUID."""
+    return f"{ENGINEERING_STATE_SIGNAL}:{entry_id}:{state_uuid}"
+
+
+@callback
+def async_dispatch_engineering_state_updates(
+    hass: HomeAssistant,
+    entry_id: str,
+    message: object,
+) -> None:
+    """Project websocket values onto private source-scoped state signals."""
+    if not isinstance(message, Mapping):
+        return
+    for state_uuid, value in message.items():
+        if isinstance(state_uuid, str) and state_uuid:
+            async_dispatcher_send(
+                hass,
+                engineering_state_updated_signal(entry_id, state_uuid),
+                value,
+            )
+
+
+def filter_existing_loxapp_entities(
+    specs: tuple[EngineeringEntitySpec, ...],
+    existing_uuids: set[str] | frozenset[str],
+) -> tuple[EngineeringEntitySpec, ...]:
+    """Keep normal LoxAPP entities authoritative for matching UUIDs."""
+    return tuple(spec for spec in specs if spec.unique_id not in existing_uuids)
+
+
+def engineering_event_value(
+    platform: Literal["sensor", "binary_sensor"],
+    value: object,
+) -> float | bool | None:
+    """Return a platform-safe live value, or None for an invalid event."""
+    if platform == "binary_sensor":
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            if math.isfinite(numeric) and numeric in {0.0, 1.0}:
+                return bool(numeric)
+        return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        numeric = float(value)
+        if math.isfinite(numeric):
+            return numeric
+    return None
+
+
+@dataclass(slots=True)
+class EngineeringPlatformReconciler:
+    """Source-scoped owner of one platform's prepared entity set."""
+
+    entry_id: str
+    platform: Literal["sensor", "binary_sensor"]
+    existing_uuids: frozenset[str]
+    entity_factory: Callable[[EngineeringEntitySpec], PreparedEngineeringEntity]
+    async_add_entities: Callable[[list[Any]], None]
+    prepared_entities: MutableMapping[str, PreparedEngineeringEntity] = field(default_factory=dict)
+
+    async def async_reconcile(
+        self,
+        hass: HomeAssistant,
+        specs: tuple[EngineeringEntitySpec, ...],
+    ) -> None:
+        """Update prepared entities without stealing global identities."""
+        from .engineering_registry import async_filter_entity_identity_conflicts  # noqa: PLC0415
+
+        platform_specs = tuple(spec for spec in specs if spec.platform == self.platform)
+        platform_specs = filter_existing_loxapp_entities(platform_specs, self.existing_uuids)
+        accepted, _rejected = await async_filter_entity_identity_conflicts(
+            hass,
+            self.entry_id,
+            platform_specs,
+        )
+        current_specs = {spec.unique_id: spec for spec in accepted}
+        for unique_id, entity in self.prepared_entities.items():
+            if spec := current_specs.get(unique_id):
+                entity.update_spec(spec)
+            else:
+                entity.mark_unavailable()
+
+        new_specs = tuple(spec for spec in accepted if spec.unique_id not in self.prepared_entities)
+        if not new_specs:
+            return
+        last_checked, _rejected = await async_filter_entity_identity_conflicts(
+            hass,
+            self.entry_id,
+            new_specs,
+        )
+        new_entities: list[Any] = []
+        for spec in last_checked:
+            entity = self.entity_factory(spec)
+            self.prepared_entities[spec.unique_id] = entity
+            new_entities.append(entity)
+        if new_entities:
+            self.async_add_entities(new_entities)
 
 
 def _is_physical_device(element: EngineeringElement) -> bool:

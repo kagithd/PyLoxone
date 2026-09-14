@@ -1,5 +1,5 @@
 """
-Loxone constants
+Loxone constants.
 
 For more details about this component, please refer to the documentation at
 https://github.com/JoDehli/PyLoxone
@@ -35,6 +35,7 @@ DEFAULT_DELAY_SCENE = 3
 DEFAULT_IP = ""
 
 EVENT = "loxone_event"
+ENGINEERING_STATE_SIGNAL = "loxone_engineering_state"
 DOMAIN = "loxone"
 LOX_CONFIG = "loxconfig"
 
@@ -99,7 +100,7 @@ cfmt description
 (?:h|l|ll|w|I|I32|I64)?            # size
 [cCdiouxXeEfgGaAnpsSZ]             # type
 ) |                                # OR
-%%) 
+%%)
 """
 
 cfmt = r"(%(?:(?:[-+0 #]{0,5})(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:h|l|ll|w|I|I32|I64)?[cCdiouxXeEfgGaAnpsSZ])|%%)"

@@ -7,8 +7,10 @@ from custom_components.loxone.engineering_config import (
     EngineeringInventory,
 )
 from custom_components.loxone.engineering_entities import (
+    EngineeringEntitySpec,
     build_engineering_sensor_specs,
     engineering_inventory_updated_signal,
+    filter_existing_loxapp_entities,
     normalize_engineering_unit,
 )
 from custom_components.loxone.engineering_runtime import (
@@ -102,31 +104,43 @@ def test_refresh_signal_is_scoped_to_config_entry():
     assert engineering_inventory_updated_signal("entry-1") != engineering_inventory_updated_signal("entry-2")
 
 
-def test_prepared_sensor_uses_engineering_uuid_and_starts_disabled():
-    device = _element("device-1", "Lox1wireDevice")
-    element = _element("sensor-1", "Lox1wireAsensor", parent_uuid=device.uuid, platform="sensor")
-    binding = EngineeringRuntimeBinding(
-        "sensor-1",
-        "AWI1",
-        element.loxone_type,
-        element.title,
-        element.room,
-        "sensor",
-        "bound",
-        numeric_value=21.5,
-        unit="°",
+def _entity_spec(unique_id: str = "sensor-1") -> EngineeringEntitySpec:
+    return EngineeringEntitySpec(
+        unique_id=unique_id,
+        state_uuid=f"{unique_id}-state",
+        platform="sensor",
+        name="Cellar Temperature",
+        native_value=21.5,
+        unit="°C",
+        available=True,
+        owner_identifier="serial-a:device-1",
+        owner_name="ST-F01",
+        owner_model="Lox1wireDevice",
+        room="Cellar",
+        loxone_type="Lox1wireAsensor",
+        io_name="AWI1",
+        config_version=7,
+        runtime_binding="uuid_all",
+        enabled_by_default=False,
     )
-    spec = build_engineering_sensor_specs(
-        _inventory(device, element),
-        EngineeringRuntimeInventory(bindings=(binding,)),
-    )[0]
 
-    entity = LoxoneEngineeringSensor(spec, "miniserver-serial")
+
+def test_prepared_sensor_uses_engineering_uuid_and_resolved_owner_only():
+    entity = LoxoneEngineeringSensor(_entity_spec())
 
     assert entity.unique_id == "sensor-1"
     assert entity.entity_registry_enabled_default is False
     assert entity.native_value == 21.5
     assert entity.native_unit_of_measurement == "°C"
-    assert entity.device_info["identifiers"] == {("loxone", "device-1")}
-    assert entity.device_info["via_device"] == ("loxone", "miniserver-serial")
-    assert entity.extra_state_attributes["engineering_config_version"] == 1
+    assert entity.device_info == {"identifiers": {("loxone", "serial-a:device-1")}}
+    assert entity.extra_state_attributes == {
+        "uuid": "sensor-1",
+        "io_name": "AWI1",
+        "loxone_type": "Lox1wireAsensor",
+        "engineering_config_version": 7,
+        "runtime_binding": "uuid_all",
+    }
+
+
+def test_public_loxapp_uuid_suppresses_duplicate_engineering_entity():
+    assert filter_existing_loxapp_entities((_entity_spec("existing-uuid"),), {"existing-uuid"}) == ()

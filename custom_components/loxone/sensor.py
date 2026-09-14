@@ -13,17 +13,31 @@ from typing import Any
 
 import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
-from homeassistant.components.sensor import (CONF_STATE_CLASS, PLATFORM_SCHEMA,
-                                             SensorDeviceClass, SensorEntity,
-                                             SensorEntityDescription,
-                                             SensorStateClass)
+from homeassistant.components.sensor import (
+    CONF_STATE_CLASS,
+    PLATFORM_SCHEMA,
+    SensorDeviceClass,
+    SensorEntity,
+    SensorEntityDescription,
+    SensorStateClass,
+)
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (CONF_DEVICE_CLASS, CONF_NAME,
-                                 CONF_UNIT_OF_MEASUREMENT, CONF_VALUE_TEMPLATE,
-                                 LIGHT_LUX, PERCENTAGE, STATE_UNKNOWN,
-                                 UnitOfEnergy, UnitOfPower, UnitOfRatio,
-                                 UnitOfSpeed, UnitOfTemperature, UnitOfVolume,
-                                 UnitOfVolumeFlowRate)
+from homeassistant.const import (
+    CONF_DEVICE_CLASS,
+    CONF_NAME,
+    CONF_UNIT_OF_MEASUREMENT,
+    CONF_VALUE_TEMPLATE,
+    LIGHT_LUX,
+    PERCENTAGE,
+    STATE_UNKNOWN,
+    UnitOfEnergy,
+    UnitOfPower,
+    UnitOfRatio,
+    UnitOfSpeed,
+    UnitOfTemperature,
+    UnitOfVolume,
+    UnitOfVolumeFlowRate,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
@@ -31,17 +45,18 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util import dt as dt_util
 
-from . import LoxoneEntity, MiniServer
+from . import LoxoneEntity
 from .const import CLIMATE_EVENT, CONF_ACTIONID, DOMAIN, EVENT, SENDDOMAIN, THROTTLE_KEEP_ALIVE_TIME
-from .helpers import (add_room_and_cat_to_value_values, clean_unit, get_all,
-                      get_or_create_device)
 from .engineering_entities import (
-    EngineeringSensorSpec,
-    async_sync_engineering_sensor_registry,
-    build_engineering_sensor_specs,
+    EngineeringEntitySpec,
+    EngineeringPlatformReconciler,
+    build_engineering_entity_specs,
+    engineering_event_value,
     engineering_inventory_updated_signal,
-    normalize_engineering_unit,
+    engineering_state_updated_signal,
 )
+from .engineering_snapshot import async_load_engineering_state
+from .helpers import add_room_and_cat_to_value_values, clean_unit, get_all, get_or_create_device
 from .miniserver import get_miniserver_from_hass
 
 NEW_SENSOR = "sensors"
@@ -72,6 +87,7 @@ OVERRIDE_REASONS = {
     8: "Overridden by source",
     14: "Fixed",
 }
+
 
 class LoxoneEntityDescription(SensorEntityDescription, frozen_or_thawed=True):
     """
@@ -168,6 +184,7 @@ UNAMBIGUOUS_UNITS: frozenset[str] = frozenset(
     for u in desc.loxone_format_strings
 )
 """Units that map to exactly one device class without needing keyword disambiguation."""
+
 
 def match_sensor_description(
     unit: str,
@@ -274,33 +291,37 @@ async def async_setup_entry(
     for irc in get_all(loxconfig, "IRoomControllerV2"):
         irc = add_room_and_cat_to_value_values(loxconfig, irc)
         states = irc.get("states", {})
-        device_info = get_or_create_device(
-            irc["uuidAction"], irc["name"], "RoomControllerV2", irc.get("room", "")
-        )
+        device_info = get_or_create_device(irc["uuidAction"], irc["name"], "RoomControllerV2", irc.get("room", ""))
 
         if "overrideReason" in states:
-            entities.append(LoxoneRoomControllerOverrideSensor(
-                name=f"{irc['name']} Override Reason",
-                uuid=states["overrideReason"],
-                device_info=device_info,
-                parent_uuid=irc["uuidAction"],
-            ))
+            entities.append(
+                LoxoneRoomControllerOverrideSensor(
+                    name=f"{irc['name']} Override Reason",
+                    uuid=states["overrideReason"],
+                    device_info=device_info,
+                    parent_uuid=irc["uuidAction"],
+                )
+            )
 
         if "comfortTemperature" in states:
-            entities.append(LoxoneRoomControllerTemperatureSensor(
-                name=f"{irc['name']} Comfort Temperature",
-                uuid=states["comfortTemperature"],
-                device_info=device_info,
-                parent_uuid=irc["uuidAction"],
-            ))
+            entities.append(
+                LoxoneRoomControllerTemperatureSensor(
+                    name=f"{irc['name']} Comfort Temperature",
+                    uuid=states["comfortTemperature"],
+                    device_info=device_info,
+                    parent_uuid=irc["uuidAction"],
+                )
+            )
 
         if "comfortTemperatureCool" in states:
-            entities.append(LoxoneRoomControllerTemperatureSensor(
-                name=f"{irc['name']} Comfort Temperature Cool",
-                uuid=states["comfortTemperatureCool"],
-                device_info=device_info,
-                parent_uuid=irc["uuidAction"],
-            ))
+            entities.append(
+                LoxoneRoomControllerTemperatureSensor(
+                    name=f"{irc['name']} Comfort Temperature Cool",
+                    uuid=states["comfortTemperatureCool"],
+                    device_info=device_info,
+                    parent_uuid=irc["uuidAction"],
+                )
+            )
 
     @callback
     def async_add_sensors(_):
@@ -310,59 +331,33 @@ async def async_setup_entry(
         async_dispatcher_connect(hass, miniserver.async_signal_new_device(NEW_SENSOR), async_add_sensors)
     )
 
-    standard_sensor_uuids = {
-        sensor["uuidAction"]
-        for sensor_type in ("InfoOnlyAnalog", "TextInput")
-        for sensor in get_all(loxconfig, sensor_type)
-        if sensor.get("uuidAction")
-    }
-    standard_sensor_uuids.update(
-        state_uuid
-        for meter in get_all(loxconfig, "Meter")
-        for state_uuid in meter.get("states", {}).values()
-        if state_uuid
+    standard_sensor_uuids = frozenset(
+        unique_id for entity in entities if isinstance((unique_id := entity.unique_id), str) and unique_id
     )
-    prepared_entities: dict[str, LoxoneEngineeringSensor] = {}
+    engineering_platform = EngineeringPlatformReconciler(
+        config_entry.entry_id,
+        "sensor",
+        standard_sensor_uuids,
+        lambda spec: LoxoneEngineeringSensor(spec, config_entry.entry_id),
+        async_add_entities,
+    )
 
-    @callback
-    def async_refresh_engineering_sensors() -> None:
-        inventory = coordinator.engineering_inventory
-        runtime = coordinator.engineering_runtime
-        if inventory is None or runtime is None:
-            return
-
-        specs = tuple(
-            spec
-            for spec in build_engineering_sensor_specs(inventory, runtime)
-            if spec.element.uuid not in standard_sensor_uuids
-        )
-        current_specs = {spec.element.uuid: spec for spec in specs if spec.element.uuid}
-        for engineering_uuid, entity in prepared_entities.items():
-            if spec := current_specs.get(engineering_uuid):
-                entity.update_spec(spec)
-            else:
-                entity.mark_unavailable()
-
-        new_entities: list[LoxoneEngineeringSensor] = []
-        for spec in specs:
-            engineering_uuid = spec.element.uuid
-            if (
-                engineering_uuid is None
-                or engineering_uuid in prepared_entities
-            ):
-                continue
-            entity = LoxoneEngineeringSensor(
-                spec,
-                miniserver.serial or config_entry.entry_id,
+    async def async_refresh_engineering_sensors(*, use_runtime: bool = True) -> None:
+        try:
+            stored = await async_load_engineering_state(hass, config_entry.entry_id)
+        except Exception:
+            _LOGGER.warning("Unable to restore the safe engineering sensor snapshot", exc_info=True)
+            specs = ()
+        else:
+            runtime = coordinator.engineering_runtime if use_runtime else None
+            snapshot = stored.snapshot
+            specs = (
+                ()
+                if snapshot is None or stored.registry_applied_generation != snapshot.generation_id
+                else build_engineering_entity_specs(snapshot.rows, runtime)
             )
-            prepared_entities[engineering_uuid] = entity
-            new_entities.append(entity)
-        if new_entities:
-            async_add_entities(new_entities)
-        async_sync_engineering_sensor_registry(
+        await engineering_platform.async_reconcile(
             hass,
-            config_entry.entry_id,
-            miniserver.serial or config_entry.entry_id,
             specs,
         )
 
@@ -375,7 +370,7 @@ async def async_setup_entry(
     )
 
     async_add_entities(entities, update_before_add=True)
-    async_refresh_engineering_sensors()
+    await async_refresh_engineering_sensors(use_runtime=False)
 
 
 class LoxoneEngineeringSensor(SensorEntity):
@@ -384,67 +379,90 @@ class LoxoneEngineeringSensor(SensorEntity):
     _attr_entity_registry_enabled_default = False
     _attr_should_poll = False
 
-    def __init__(self, spec: EngineeringSensorSpec, miniserver_serial: str) -> None:
+    def __init__(self, spec: EngineeringEntitySpec, config_entry_id: str | None = None) -> None:
         """Initialize the prepared engineering sensor."""
         self._spec = spec
-        self._attr_unique_id = spec.element.uuid
-        self._attr_name = spec.element.title or spec.element.io_name or spec.element.uuid
-        self._attr_native_value = spec.binding.numeric_value
-        self._attr_native_unit_of_measurement = normalize_engineering_unit(
-            spec.binding.unit,
-            title=spec.element.title,
-            loxone_type=spec.element.loxone_type,
-        )
+        self._config_entry_id = config_entry_id
+        self._event_unsub = None
+        self._attr_unique_id = spec.unique_id
+        self._attr_name = spec.name
+        self._attr_native_value = engineering_event_value("sensor", spec.native_value)
+        self._attr_native_unit_of_measurement = spec.unit
         description = match_sensor_description(
             self._attr_native_unit_of_measurement or "",
             self._attr_name or "",
-            spec.element.category or "",
         )
         if description:
             self.entity_description = description
         else:
             self._attr_state_class = SensorStateClass.MEASUREMENT
-        self._attr_available = True
-        self._set_device_info(spec, miniserver_serial)
+        self._attr_available = spec.available and self._attr_native_value is not None
+        self._attr_entity_registry_enabled_default = spec.enabled_by_default
+        self._set_device_info(spec)
         self._update_attributes(spec)
 
-    def _set_device_info(self, spec: EngineeringSensorSpec, miniserver_serial: str) -> None:
-        device = spec.device or spec.element
-        device_uuid = device.uuid or spec.element.uuid
+    def _set_device_info(self, spec: EngineeringEntitySpec) -> None:
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, device_uuid)},
-            name=device.title or device.io_name or self._attr_name,
-            manufacturer="Loxone",
-            model=device.loxone_type or "Engineering device",
-            suggested_area=spec.element.room,
-            via_device=(DOMAIN, miniserver_serial),
+            identifiers={(DOMAIN, spec.owner_identifier)},
         )
 
-    def _update_attributes(self, spec: EngineeringSensorSpec) -> None:
+    def _update_attributes(self, spec: EngineeringEntitySpec) -> None:
         self._attr_extra_state_attributes = {
-            "uuid": spec.element.uuid,
-            "io_name": spec.element.io_name,
-            "loxone_type": spec.element.loxone_type,
-            "room": spec.element.room,
-            "category": spec.element.category,
+            "uuid": spec.unique_id,
+            "io_name": spec.io_name,
+            "loxone_type": spec.loxone_type,
             "engineering_config_version": spec.config_version,
-            "runtime_binding": spec.binding.binding_method,
-            "runtime_substate_count": spec.binding.substate_count,
+            "runtime_binding": spec.runtime_binding,
         }
 
+    async def async_added_to_hass(self) -> None:
+        """Subscribe only to the source-scoped proven state mapping."""
+        await super().async_added_to_hass()
+        self._subscribe_state_updates()
+        self.async_on_remove(self._unsubscribe_state_updates)
+
     @callback
-    def update_spec(self, spec: EngineeringSensorSpec) -> None:
-        """Apply the newest manually refreshed engineering snapshot."""
-        self._spec = spec
-        self._attr_name = spec.element.title or spec.element.io_name or spec.element.uuid
-        self._attr_native_value = spec.binding.numeric_value
-        self._attr_native_unit_of_measurement = normalize_engineering_unit(
-            spec.binding.unit,
-            title=spec.element.title,
-            loxone_type=spec.element.loxone_type,
+    def _subscribe_state_updates(self) -> None:
+        self._unsubscribe_state_updates()
+        if self.hass is None or self._config_entry_id is None:
+            return
+        self._event_unsub = async_dispatcher_connect(
+            self.hass,
+            engineering_state_updated_signal(self._config_entry_id, self._spec.state_uuid),
+            self._handle_engineering_value,
         )
+
+    @callback
+    def _unsubscribe_state_updates(self) -> None:
+        if self._event_unsub is not None:
+            self._event_unsub()
+            self._event_unsub = None
+
+    @callback
+    def _handle_engineering_value(self, value: object) -> None:
+        native_value = engineering_event_value("sensor", value)
+        if native_value is None:
+            return
+        self._attr_native_value = native_value
         self._attr_available = True
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def update_spec(self, spec: EngineeringEntitySpec) -> None:
+        """Apply the newest manually refreshed engineering snapshot."""
+        if spec.unique_id != self.unique_id or spec.platform != "sensor":
+            raise ValueError("engineering sensor specification identity changed")
+        state_uuid_changed = spec.state_uuid != self._spec.state_uuid
+        self._spec = spec
+        self._attr_name = spec.name
+        if (native_value := engineering_event_value("sensor", spec.native_value)) is not None:
+            self._attr_native_value = native_value
+        self._attr_native_unit_of_measurement = spec.unit
+        self._attr_available = spec.available and native_value is not None
         self._update_attributes(spec)
+        if state_uuid_changed and self.hass is not None:
+            self._subscribe_state_updates()
         if self.hass is not None:
             self.async_write_ha_state()
 
@@ -553,6 +571,7 @@ class LoxoneVersionSensor(LoxoneEntity, SensorEntity):
         """Return a unique ID."""
         return f"{self._miniserver_serial}-{self._attr_unique_id}"
 
+
 class LoxoneTextSensor(LoxoneEntity, SensorEntity):
     """Representation of a Text Sensor."""
 
@@ -577,9 +596,7 @@ class LoxoneTextSensor(LoxoneEntity, SensorEntity):
 
     async def async_set_value(self, value):
         """Set new value."""
-        self.hass.bus.async_fire(
-            SENDDOMAIN, dict(uuid=self.uuidAction, value=f"{value}")
-        )
+        self.hass.bus.async_fire(SENDDOMAIN, dict(uuid=self.uuidAction, value=f"{value}"))
         self.async_schedule_update_ha_state()
 
     @property
@@ -626,9 +643,7 @@ class LoxoneSensor(LoxoneEntity, SensorEntity):
             _uuid = self._parent_id
 
         self.type = "Sensor analog"
-        self._attr_device_info = get_or_create_device(
-            _uuid, self.name, self.type, self.room
-        )
+        self._attr_device_info = get_or_create_device(_uuid, self.name, self.type, self.room)
 
     def _parse_digits_after_decimal(self, format_string):
         """Parse digits after the decimal point from the format string."""
@@ -685,6 +700,7 @@ class LoxoneMeterSensor(LoxoneSensor, SensorEntity):
             model=model,
         )
 
+
 class LoxoneRoomControllerTemperatureSensor(SensorEntity):
     """Sensor for IRoomControllerV2 comfort temperature states."""
 
@@ -703,14 +719,13 @@ class LoxoneRoomControllerTemperatureSensor(SensorEntity):
 
     async def async_added_to_hass(self):
         """Subscribe to Loxone events."""
-        self.async_on_remove(
-            self.hass.bus.async_listen(EVENT, self.event_handler)
-        )
+        self.async_on_remove(self.hass.bus.async_listen(EVENT, self.event_handler))
 
     async def event_handler(self, e):
         if self._uuid in e.data:
             self._attr_native_value = e.data[self._uuid]
             self.async_schedule_update_ha_state()
+
 
 class LoxoneRoomControllerOverrideSensor(SensorEntity):
     """Sensor for IRoomControllerV2 override reason."""
@@ -729,9 +744,7 @@ class LoxoneRoomControllerOverrideSensor(SensorEntity):
 
     async def async_added_to_hass(self):
         """Subscribe to Loxone events."""
-        self.async_on_remove(
-            self.hass.bus.async_listen(EVENT, self.event_handler)
-        )
+        self.async_on_remove(self.hass.bus.async_listen(EVENT, self.event_handler))
 
     async def event_handler(self, e):
         if self._uuid in e.data:
@@ -741,6 +754,7 @@ class LoxoneRoomControllerOverrideSensor(SensorEntity):
             if self._attr_native_value.startswith("Unknown") and self._attr_native_value not in self._attr_options:
                 self._attr_options.append(self._attr_native_value)
             self.async_schedule_update_ha_state()
+
 
 class LoxoneClimateController(LoxoneEntity, SensorEntity):
     """Climate controller sensor that fires demand events for IRoomControllerV2.
@@ -759,9 +773,7 @@ class LoxoneClimateController(LoxoneEntity, SensorEntity):
         self._cool_demand = 0
         self.type = "ClimateController"
 
-        self._attr_device_info = get_or_create_device(
-            self.unique_id, self.name, self.type, self.room
-        )
+        self._attr_device_info = get_or_create_device(self.unique_id, self.name, self.type, self.room)
 
     async def event_handler(self, e):
         update = False

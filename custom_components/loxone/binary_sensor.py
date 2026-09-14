@@ -5,24 +5,32 @@ from __future__ import annotations
 import logging
 from typing import Literal, final
 
-import homeassistant.helpers.config_validation as cv
-import voluptuous as vol
-from homeassistant.components.binary_sensor import (BinarySensorDeviceClass,
-                                                    BinarySensorEntity)
-from homeassistant.components.sensor import CONF_STATE_CLASS
+from homeassistant.components.binary_sensor import BinarySensorDeviceClass, BinarySensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import (CONF_DEVICE_CLASS, CONF_NAME,
-                                 CONF_UNIT_OF_MEASUREMENT, CONF_VALUE_TEMPLATE,
-                                 STATE_OFF, STATE_ON, STATE_UNKNOWN)
+from homeassistant.const import (
+    CONF_VALUE_TEMPLATE,
+    STATE_OFF,
+    STATE_ON,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
+from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
 from . import LoxoneEntity
-from .const import CONF_ACTIONID, DOMAIN, SENDDOMAIN
-from .helpers import (add_room_and_cat_to_value_values, get_all,
-                      get_or_create_device)
+from .const import DOMAIN
+from .engineering_entities import (
+    EngineeringEntitySpec,
+    EngineeringPlatformReconciler,
+    build_engineering_entity_specs,
+    engineering_event_value,
+    engineering_inventory_updated_signal,
+    engineering_state_updated_signal,
+)
+from .engineering_snapshot import async_load_engineering_state
+from .helpers import add_room_and_cat_to_value_values, get_all, get_or_create_device
 from .miniserver import get_miniserver_from_hass
 
 _LOGGER = logging.getLogger(__name__)
@@ -62,6 +70,7 @@ async def async_setup_entry(
 ) -> None:
     """Set up entry."""
     miniserver = get_miniserver_from_hass(hass, config_entry)
+    coordinator = hass.data[DOMAIN][config_entry.entry_id]
     loxconfig = miniserver.lox_config.json
     entities = []
 
@@ -92,6 +101,128 @@ async def async_setup_entry(
         )
     )
     async_add_entities(entities)
+    standard_binary_sensor_uuids = frozenset(
+        unique_id for entity in entities if isinstance((unique_id := entity.unique_id), str) and unique_id
+    )
+    engineering_platform = EngineeringPlatformReconciler(
+        config_entry.entry_id,
+        "binary_sensor",
+        standard_binary_sensor_uuids,
+        lambda spec: LoxoneEngineeringBinarySensor(spec, config_entry.entry_id),
+        async_add_entities,
+    )
+
+    async def async_refresh_engineering_binary_sensors(*, use_runtime: bool = True) -> None:
+        try:
+            stored = await async_load_engineering_state(hass, config_entry.entry_id)
+        except Exception:
+            _LOGGER.warning("Unable to restore the safe engineering binary-sensor snapshot", exc_info=True)
+            specs = ()
+        else:
+            runtime = coordinator.engineering_runtime if use_runtime else None
+            snapshot = stored.snapshot
+            specs = (
+                ()
+                if snapshot is None or stored.registry_applied_generation != snapshot.generation_id
+                else build_engineering_entity_specs(snapshot.rows, runtime)
+            )
+        await engineering_platform.async_reconcile(
+            hass,
+            specs,
+        )
+
+    miniserver.listeners.append(
+        async_dispatcher_connect(
+            hass,
+            engineering_inventory_updated_signal(config_entry.entry_id),
+            async_refresh_engineering_binary_sensors,
+        )
+    )
+    await async_refresh_engineering_binary_sensors(use_runtime=False)
+
+
+class LoxoneEngineeringBinarySensor(BinarySensorEntity):
+    """A disabled-by-default read-only engineering binary sensor."""
+
+    _attr_should_poll = False
+
+    def __init__(self, spec: EngineeringEntitySpec, config_entry_id: str | None = None) -> None:
+        self._spec = spec
+        self._config_entry_id = config_entry_id
+        self._event_unsub = None
+        self._attr_unique_id = spec.unique_id
+        self._attr_name = spec.name
+        self._attr_is_on = engineering_event_value("binary_sensor", spec.native_value)
+        self._attr_available = spec.available and self._attr_is_on is not None
+        self._attr_entity_registry_enabled_default = spec.enabled_by_default
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, spec.owner_identifier)})
+        self._update_attributes(spec)
+
+    def _update_attributes(self, spec: EngineeringEntitySpec) -> None:
+        self._attr_extra_state_attributes = {
+            "uuid": spec.unique_id,
+            "io_name": spec.io_name,
+            "loxone_type": spec.loxone_type,
+            "engineering_config_version": spec.config_version,
+            "runtime_binding": spec.runtime_binding,
+        }
+
+    async def async_added_to_hass(self) -> None:
+        """Subscribe only to the source-scoped proven state mapping."""
+        await super().async_added_to_hass()
+        self._subscribe_state_updates()
+        self.async_on_remove(self._unsubscribe_state_updates)
+
+    @callback
+    def _subscribe_state_updates(self) -> None:
+        self._unsubscribe_state_updates()
+        if self.hass is None or self._config_entry_id is None:
+            return
+        self._event_unsub = async_dispatcher_connect(
+            self.hass,
+            engineering_state_updated_signal(self._config_entry_id, self._spec.state_uuid),
+            self._handle_engineering_value,
+        )
+
+    @callback
+    def _unsubscribe_state_updates(self) -> None:
+        if self._event_unsub is not None:
+            self._event_unsub()
+            self._event_unsub = None
+
+    @callback
+    def _handle_engineering_value(self, value: object) -> None:
+        is_on = engineering_event_value("binary_sensor", value)
+        if is_on is None:
+            return
+        self._attr_is_on = is_on
+        self._attr_available = True
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def update_spec(self, spec: EngineeringEntitySpec) -> None:
+        """Apply a current compatible prepared specification."""
+        if spec.unique_id != self.unique_id or spec.platform != "binary_sensor":
+            raise ValueError("engineering binary sensor specification identity changed")
+        state_uuid_changed = spec.state_uuid != self._spec.state_uuid
+        self._spec = spec
+        self._attr_name = spec.name
+        if (is_on := engineering_event_value("binary_sensor", spec.native_value)) is not None:
+            self._attr_is_on = is_on
+        self._attr_available = spec.available and is_on is not None
+        self._update_attributes(spec)
+        if state_uuid_changed and self.hass is not None:
+            self._subscribe_state_updates()
+        if self.hass is not None:
+            self.async_write_ha_state()
+
+    @callback
+    def mark_unavailable(self) -> None:
+        """Retain the last safe state while disabling the live binding."""
+        self._attr_available = False
+        if self.hass is not None:
+            self.async_write_ha_state()
 
 
 class LoxoneDigitalSensor(LoxoneEntity, BinarySensorEntity):
@@ -107,12 +238,7 @@ class LoxoneDigitalSensor(LoxoneEntity, BinarySensorEntity):
         self._attr_is_on = STATE_UNKNOWN
         self._from_loxone_config = False
 
-        if (
-            "type" in kwargs
-            and "room" in kwargs
-            and "cat" in kwargs
-            and hasattr(self, "states")
-        ):
+        if "type" in kwargs and "room" in kwargs and "cat" in kwargs and hasattr(self, "states"):
             self._from_loxone_config = True
             if self.type == "smoke":
                 self._state_uuid = self.states["areAlarmSignalsOff"]
@@ -138,13 +264,9 @@ class LoxoneDigitalSensor(LoxoneEntity, BinarySensorEntity):
             self.uuidAction = self._parent_id
 
         if self._from_loxone_config:
-            self._attr_device_info = get_or_create_device(
-                self.unique_id, self.name, self.type, self.room
-            )
+            self._attr_device_info = get_or_create_device(self.unique_id, self.name, self.type, self.room)
         else:
-            self._attr_device_info = get_or_create_device(
-                self.unique_id, self.name, self.type, ""
-            )
+            self._attr_device_info = get_or_create_device(self.unique_id, self.name, self.type, "")
 
         if self._from_loxone_config:
             self._attr_extra_state_attributes.update(
