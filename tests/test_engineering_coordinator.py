@@ -210,6 +210,28 @@ def test_scalar_revision(value, want):
     assert getattr(module, "extract_loxapp_last_modified", lambda value: "missing")({"lastModified": value}) == want
 
 
+def test_migrated_room_name_without_identity_requires_fresh_inventory():
+    def snapshot(room, room_uuid):
+        element = SimpleNamespace(room=room, room_uuid=room_uuid)
+        return SimpleNamespace(nodes=(SimpleNamespace(element=element),))
+
+    assert not module._engineering_room_identity_incomplete(snapshot(None, None))
+    assert module._engineering_room_identity_incomplete(snapshot("Workshop", None))
+    assert not module._engineering_room_identity_incomplete(snapshot("Workshop", "room-a"))
+
+
+def test_unchanged_revision_redownloads_incomplete_room_identity(transaction, monkeypatch):
+    async def scenario():
+        coordinator = transaction.make()
+        await coordinator.async_refresh_engineering_inventory(force=True)
+        monkeypatch.setattr(module, "_engineering_room_identity_incomplete", lambda _snapshot: True)
+
+        assert await coordinator.async_refresh_engineering_inventory() is not None
+        assert transaction.calls.count("download") == 2
+
+    asyncio.run(scenario())
+
+
 def test_forced_refresh_and_unchanged_rebind(transaction, monkeypatch):
     async def scenario():
         coordinator = transaction.make()

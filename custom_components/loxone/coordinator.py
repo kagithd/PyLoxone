@@ -87,6 +87,11 @@ def extract_loxapp_last_modified(lox_config: Mapping) -> str | None:
     return f"source:{hashlib.sha256(normalized.encode()).hexdigest()}"
 
 
+def _engineering_room_identity_incomplete(snapshot: EngineeringSnapshot) -> bool:
+    """Detect migrated snapshots that retained room labels but predate room UUIDs."""
+    return any(node.element.room is not None and node.element.room_uuid is None for node in snapshot.nodes)
+
+
 class LoxoneCoordinator(DataUpdateCoordinator):
     """Class to manage fetching data from the Loxone Miniserver."""
 
@@ -330,6 +335,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             if (
                 not force
                 and previous is not None
+                and not _engineering_room_identity_incomplete(previous)
                 and revision is not None
                 and revision == previous.source.loxapp_last_modified
             ):
