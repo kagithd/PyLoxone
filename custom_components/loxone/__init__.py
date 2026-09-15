@@ -194,7 +194,7 @@ def _handle_listening_task_result(
     except LoxoneOutOfServiceException:
         _LOGGER.debug("Loxone LoxoneOutOfServiceException received. Try to reloading Loxone integration.")
         hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
-    except (LoxoneConnectionError, TimeoutError, websockets.exceptions.ConnectionClosedError):
+    except (LoxoneConnectionError, ConnectionError, TimeoutError, websockets.exceptions.ConnectionClosedError):
         _LOGGER.debug("Loxone connection failed. Trying to reload the config entry.")
         hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
     except (

@@ -164,12 +164,13 @@ def test_started_listener_is_tracked_for_unload():
     asyncio.run(scenario())
 
 
-def test_listener_timeout_schedules_entry_recovery():
-    """Transport timeouts are expected connection failures, not callback errors."""
+@pytest.mark.parametrize("failure", [TimeoutError("connection timed out"), ConnectionError("connection reset")])
+def test_listener_transport_failure_schedules_entry_recovery(failure):
+    """Transport failures are recovered instead of escaping from the task callback."""
 
     async def scenario():
         async def fail_listener():
-            raise TimeoutError("connection timed out")
+            raise failure
 
         listener = asyncio.create_task(fail_listener())
         await asyncio.sleep(0)
