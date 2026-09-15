@@ -584,7 +584,13 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                     else item
                     for item in values
                 ]
-            schema[vol.Required(field, default=values)] = ObjectSelector(
+            schema[
+                vol.Required(
+                    field,
+                    default=values,
+                    description={"suggested_value": values},
+                )
+            ] = ObjectSelector(
                 ObjectSelectorConfig(
                     multiple=True,
                     fields=fields,

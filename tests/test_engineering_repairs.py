@@ -281,7 +281,8 @@ def test_step_one_groups_exact_room_identity_not_names(monkeypatch):
         rows = _rows(form, "rooms")
         assert {row["group_key"] for row in rows} == {"room-a", "room-b"}
         assert len(rows) == 2
-        selector = next(iter(form["data_schema"].schema.values()))
+        marker, selector = next(iter(form["data_schema"].schema.items()))
+        assert marker.description == {"suggested_value": rows}
         assert selector.serialize()["selector"]["object"]["multiple"]
         assert "area" in selector.serialize()["selector"]["object"]["fields"]["area_id"]["selector"]
 
