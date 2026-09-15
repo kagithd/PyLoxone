@@ -623,13 +623,17 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 row.get(field) is not None and not isinstance(row[field], str) for field in ("area_id", "area_name")
             ):
                 raise _FlowError(_INVALID_TARGET)
-            if row["action"] not in {"use_existing", "create", "keep_ha"}:
+            # Native ObjectSelector editors can serialize an untouched select
+            # as an empty string. With no target that has the safe, visible
+            # default meaning: preserve Home Assistant's current assignment.
+            action = row["action"] or "keep_ha"
+            if action not in {"use_existing", "create", "keep_ha"}:
                 raise _FlowError(_INVALID_TARGET)
             try:
                 decision = normalize_engineering_area_decision(
                     EngineeringAreaDecision(
                         room_uuid=row["group_key"],
-                        action=row["action"],
+                        action=action,
                         area_id=row.get("area_id") or None,
                         area_name=row.get("area_name") or None,
                         conflict_tokens=tuple(item.token for item in groups[row["group_key"]]),

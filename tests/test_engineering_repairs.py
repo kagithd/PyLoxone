@@ -351,6 +351,19 @@ def test_create_collision_preserves_input_and_requires_existing_selection(monkey
     asyncio.run(scenario())
 
 
+def test_step_one_blank_default_action_keeps_home_assistant(monkeypatch):
+    """A native object editor may submit its untouched select field as empty."""
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": ""}]})
+        assert form["step_id"] == "devices"
+        assert flow._decisions[0].action == "keep_ha"
+
+    asyncio.run(scenario())
+
+
 def test_mixed_room_overrides_and_no_room_build_exact_batch(monkeypatch):
     conflicts = [
         _conflict(),
