@@ -134,20 +134,13 @@ class EngineeringSnapshot:
         """Detach every nested collection from caller-owned mutable aliases."""
         original_nodes = tuple(self.nodes)
         frozen_nodes = tuple(_freeze_node(node) for node in original_nodes)
+        frozen_nodes_by_identity = {
+            id(original): frozen
+            for original, frozen in zip(original_nodes, frozen_nodes, strict=True)
+        }
         frozen_rows: list[EngineeringInventoryRow] = []
         for row in tuple(self.rows):
-            frozen_row_node = next(
-                (
-                    frozen
-                    for original, frozen in zip(
-                        original_nodes,
-                        frozen_nodes,
-                        strict=True,
-                    )
-                    if row.node == original
-                ),
-                None,
-            )
+            frozen_row_node = frozen_nodes_by_identity.get(id(row.node))
             frozen_rows.append(
                 replace(
                     row,

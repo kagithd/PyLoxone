@@ -1145,6 +1145,28 @@ def test_snapshot_detaches_nested_path_and_attribute_aliases():
     assert isinstance(candidate.nodes[0].element.attributes, MappingProxyType)
 
 
+def test_snapshot_rebinds_rows_by_stable_key_without_node_equality_scan(monkeypatch):
+    """Freezing a large snapshot must not compare every row with every node."""
+    snapshot = make_snapshot()
+
+    def fail_on_deep_equality(_self, _other):
+        raise AssertionError("snapshot row rebinding performed a deep node equality scan")
+
+    monkeypatch.setattr(type(snapshot.nodes[0]), "__eq__", fail_on_deep_equality)
+    candidate = EngineeringSnapshot(
+        snapshot.source,
+        snapshot.nodes,
+        snapshot.rows,
+        snapshot.configuration_revision_id,
+        snapshot.safe_content_digest,
+        snapshot.read_sequence,
+        snapshot.generation_id,
+        snapshot.captured_at,
+    )
+
+    assert all(row.node is node for node, row in zip(candidate.nodes, candidate.rows, strict=True))
+
+
 def test_snapshot_rejects_nested_mutable_attribute_values():
     """Arbitrary nested raw-attribute aliases cannot enter a frozen candidate."""
     snapshot = make_snapshot()
