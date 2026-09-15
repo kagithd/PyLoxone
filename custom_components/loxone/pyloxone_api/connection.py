@@ -35,9 +35,9 @@ from .const import (AES_KEY_SIZE, CMD_AUTH_WITH_TOKEN, CMD_ENABLE_UPDATES,
                     CMD_REFRESH_TOKEN_JSON_WEB, CMD_REQUEST_TOKEN,
                     CMD_REQUEST_TOKEN_JSON_WEB, DELAY_CHECK_TOKEN_REFRESH,
                     IV_BYTES, KEEP_ALIVE_PERIOD, LOXAPPPATH, MAX_REFRESH_DELAY,
-                    MAX_WEBSOCKET_MESSAGE_SIZE, RECONNECT_DELAY,
-                    RECONNECT_TRIES, SALT_BYTES, SALT_MAX_AGE_SECONDS,
-                    SALT_MAX_USE_COUNT, TIMEOUT, TOKEN_PERMISSION)
+                    MAX_WEBSOCKET_MESSAGE_SIZE, SALT_BYTES,
+                    SALT_MAX_AGE_SECONDS, SALT_MAX_USE_COUNT, TIMEOUT,
+                    TOKEN_PERMISSION)
 from .exceptions import (LoxoneConnectionClosedOk, LoxoneConnectionError,
                          LoxoneException, LoxoneOutOfServiceException,
                          LoxoneServiceUnAvailableError, LoxoneTokenError)
@@ -823,43 +823,10 @@ class LoxoneConnection(LoxoneBaseConnection):
                 verify_ssl=self.verify_ssl,
                 session=session,
             )
-            api_resp = None
-            for attempt in range(RECONNECT_TRIES):
-                try:
-                    api_resp = await connector.get(CMD_GET_API_KEY)
-                    break  # connection successful
-                except (
-                    LoxoneServiceUnAvailableError,
-                    ConnectionError,
-                    OSError,
-                    TimeoutError,
-                ) as e:
-                    if attempt < RECONNECT_TRIES - 1:
-                        _LOGGER.debug(
-                            f"Connection error (attempt {attempt + 1}/{RECONNECT_TRIES}), retrying in {RECONNECT_DELAY} seconds: {e}"
-                        )
-                        await asyncio.sleep(RECONNECT_DELAY)
-                    else:
-                        _LOGGER.exception("Max connection tries exceeded. Stopping.")
-                        raise
-                except TimeoutError:
-                    if attempt < RECONNECT_TRIES - 1:
-                        _LOGGER.debug(
-                            f"TimeoutError, try again in {RECONNECT_DELAY} seconds..."
-                        )
-                        await asyncio.sleep(RECONNECT_DELAY)
-                    else:
-                        _LOGGER.error("Max tries exceeded. Stopping.")
-                        raise
-                except ConnectionError:
-                    if attempt < RECONNECT_TRIES - 1:
-                        _LOGGER.debug(
-                            f"ConnectionError, try again in {RECONNECT_DELAY} seconds..."
-                        )
-                        await asyncio.sleep(RECONNECT_DELAY)
-                    else:
-                        _LOGGER.error("Max tries exceeded. Stopping.")
-                        raise
+            # Config-entry setup owns retries. Returning one failed attempt lets
+            # Home Assistant apply its normal ConfigEntryNotReady backoff and
+            # keeps manual reloads bounded.
+            api_resp = await connector.get(CMD_GET_API_KEY)
             try:
                 if api_resp:
                     data = await asyncio.wait_for(

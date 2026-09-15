@@ -8,9 +8,40 @@ from types import SimpleNamespace
 import pytest
 
 import custom_components.loxone as integration
+import custom_components.loxone.pyloxone_api.connection as connection_module
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.pyloxone_api.connection import LoxoneConnection, MessageForQueue
 from custom_components.loxone.pyloxone_api.exceptions import LoxoneConnectionError
+
+
+def test_initial_connection_failure_is_delegated_to_home_assistant(monkeypatch):
+    """Config-entry setup must not hide one failure behind an internal retry loop."""
+
+    async def scenario():
+        attempts = 0
+
+        class FailingHttpClient:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def get(self, _endpoint):
+                nonlocal attempts
+                attempts += 1
+                raise ConnectionError("synthetic connection failure")
+
+        async def unexpected_sleep(_delay):
+            raise AssertionError("connection retry must be scheduled by Home Assistant")
+
+        monkeypatch.setattr(connection_module, "LoxoneAsyncHttpClient", FailingHttpClient)
+        monkeypatch.setattr(connection_module.asyncio, "sleep", unexpected_sleep)
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+
+        with pytest.raises(ConnectionError, match="synthetic connection failure"):
+            await connection.open(session=SimpleNamespace(closed=False))
+
+        assert attempts == 1
+
+    asyncio.run(scenario())
 
 
 def test_unload_marks_intent_before_connection_cleanup(monkeypatch):

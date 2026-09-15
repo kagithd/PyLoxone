@@ -13,5 +13,5 @@
     "pycryptodome",
     "httpx"
   ],
-  "version": "0.9.22.21"
+  "version": "0.9.22.22"
 }
