@@ -109,14 +109,14 @@ def test_listener_failure_during_unload_does_not_schedule_reload():
     asyncio.run(scenario())
 
 
-def test_listener_recovery_reloads_only_its_config_entry():
-    """A real listener failure must not invoke the integration-wide reload service."""
+def test_listener_recovery_delegates_cleanup_to_config_entry_reload():
+    """Recovery must not hang on a duplicate close before config-entry unload."""
 
     async def scenario():
         events = []
 
         async def close():
-            events.append("close")
+            raise AssertionError("config-entry unload owns connection cleanup")
 
         async def reload_entry(entry_id):
             events.append(("reload", entry_id))
@@ -133,7 +133,7 @@ def test_listener_recovery_reloads_only_its_config_entry():
 
         await integration._reload_after_listener_failure(hass, entry, coordinator, delay=0)
 
-        assert events == ["close", ("reload", "entry-a")]
+        assert events == [("reload", "entry-a")]
 
     asyncio.run(scenario())
 
@@ -166,7 +166,7 @@ def test_started_listener_is_tracked_for_unload():
 
 @pytest.mark.parametrize("failure", [TimeoutError("connection timed out"), ConnectionError("connection reset")])
 def test_listener_transport_failure_schedules_entry_recovery(failure):
-    """Transport failures are recovered instead of escaping from the task callback."""
+    """Transport recovery runs in the background and cannot hold up HA startup."""
 
     async def scenario():
         async def fail_listener():
@@ -176,17 +176,18 @@ def test_listener_transport_failure_schedules_entry_recovery(failure):
         await asyncio.sleep(0)
         scheduled = []
 
-        def schedule(coro):
-            scheduled.append(coro)
+        def schedule(coro, name):
+            scheduled.append((coro, name))
             coro.close()
 
-        hass = SimpleNamespace(async_create_task=schedule)
+        hass = SimpleNamespace(async_create_background_task=schedule)
         entry = SimpleNamespace(entry_id="entry-a")
         coordinator = SimpleNamespace(_unloading=False)
 
         integration._handle_listening_task_result(hass, entry, coordinator, listener)
 
         assert len(scheduled) == 1
+        assert scheduled[0][1] == "PyLoxone listener recovery"
 
     asyncio.run(scenario())
 

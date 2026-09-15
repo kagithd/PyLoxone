@@ -145,8 +145,7 @@ async def _reload_after_listener_failure(
     coordinator: LoxoneCoordinator,
     delay: float = 1.0,
 ) -> None:
-    """Close the failed connection, then request integration recovery."""
-    await coordinator.api.close()
+    """Request config-entry recovery after a listener failure."""
     await asyncio.sleep(delay)
     if coordinator._unloading:
         return
@@ -190,13 +189,22 @@ def _handle_listening_task_result(
                 "valid_until": "",
             },
         )
-        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+        hass.async_create_background_task(
+            _reload_after_listener_failure(hass, config_entry, coordinator),
+            "PyLoxone listener recovery",
+        )
     except LoxoneOutOfServiceException:
         _LOGGER.debug("Loxone LoxoneOutOfServiceException received. Try to reloading Loxone integration.")
-        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+        hass.async_create_background_task(
+            _reload_after_listener_failure(hass, config_entry, coordinator),
+            "PyLoxone listener recovery",
+        )
     except (LoxoneConnectionError, ConnectionError, TimeoutError, websockets.exceptions.ConnectionClosedError):
         _LOGGER.debug("Loxone connection failed. Trying to reload the config entry.")
-        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+        hass.async_create_background_task(
+            _reload_after_listener_failure(hass, config_entry, coordinator),
+            "PyLoxone listener recovery",
+        )
     except (
         LoxoneConnectionClosedOk,
         websockets.exceptions.ConnectionClosedOK,
@@ -204,7 +212,10 @@ def _handle_listening_task_result(
         _LOGGER.debug(
             "Loxone LoxoneConnectionClosedOk received. Mostly a timeout Problem. Try to reloading Loxone integration."
         )
-        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+        hass.async_create_background_task(
+            _reload_after_listener_failure(hass, config_entry, coordinator),
+            "PyLoxone listener recovery",
+        )
     except asyncio.exceptions.CancelledError as err:
         _LOGGER.error(err)
     except Exception as err:
