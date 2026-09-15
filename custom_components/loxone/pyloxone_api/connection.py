@@ -112,6 +112,7 @@ class LoxoneBaseConnection:
         self.connection: wslib.ClientConnection | None = None
         self._pending_task = []
         self._closed = False
+        self._close_lock = asyncio.Lock()
         self._key_update_event: Optional[asyncio.Event] = None
         self._shutdown_event = asyncio.Event()
         self._reconnect_event: asyncio.Event = asyncio.Event()
@@ -673,6 +674,37 @@ class LoxoneConnection(LoxoneBaseConnection):
             if self._pending_task:
                 await asyncio.gather(*self._pending_task, return_exceptions=True)
 
+    def _discard_pending_messages(self) -> int:
+        """Discard commands that must not run after shutdown begins."""
+        discarded = 0
+        while True:
+            try:
+                self._message_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return discarded
+            self._message_queue.task_done()
+            discarded += 1
+
+    def _discard_secured_messages(self) -> int:
+        """Discard and close secured command coroutines during shutdown."""
+        discarded = 0
+        while True:
+            try:
+                command = self._secured_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return discarded
+            if isinstance(command, asyncio.Future):
+                command.cancel()
+            elif asyncio.iscoroutine(command):
+                command.close()
+            self._secured_queue.task_done()
+            discarded += 1
+
+    def _ensure_command_admission_open(self) -> None:
+        """Reject new commands as soon as connection shutdown starts."""
+        if self._closed or self._shutdown_event.is_set():
+            raise LoxoneConnectionError("Connection is closing")
+
     async def _process_message(self) -> NoReturn:
         """Process queued messages with graceful shutdown."""
         _LOGGER.debug("Message processing task started")
@@ -682,12 +714,8 @@ class LoxoneConnection(LoxoneBaseConnection):
                 try:
                     # Use asyncio.Queue.get() with timeout
                     msg = await self._message_queue.get()
-                    await asyncio.sleep(0)
                     try:
-                        _ = asyncio.create_task(
-                            self._send_text_command(msg.command, encrypted=msg.flag)
-                        )
-                        await asyncio.sleep(0)
+                        await self._send_text_command(msg.command, encrypted=msg.flag)
                     except Exception as e:
                         _LOGGER.error(f"Error sending message: {e}")
                     finally:
@@ -703,31 +731,11 @@ class LoxoneConnection(LoxoneBaseConnection):
                     await asyncio.sleep(0.1)  # Avoid tight loop on errors
 
         except asyncio.CancelledError:
-            _LOGGER.debug(
-                "Message processing task cancelled - processing remaining messages"
-            )
-
-            # Process any remaining messages before shutdown
-            remaining_count = 0
-            while not self._message_queue.empty():
-                try:
-                    msg = self._message_queue.get_nowait()
-                    remaining_count += 1
-                    try:
-                        await self._send_text_command(msg.command, encrypted=msg.flag)
-                    except Exception as e:
-                        _LOGGER.error(f"Error processing final message: {e}")
-                    finally:
-                        self._message_queue.task_done()
-                except asyncio.QueueEmpty:
-                    break
-                except Exception as e:
-                    _LOGGER.error(f"Error draining message queue: {e}")
-
-            if remaining_count > 0:
-                _LOGGER.debug(
-                    f"Processed {remaining_count} remaining messages during shutdown"
-                )
+            discarded = self._discard_pending_messages()
+            discarded_secured = self._discard_secured_messages()
+            _LOGGER.debug("Message processing task cancelled; discarded %s queued command(s)", discarded)
+            if discarded_secured:
+                _LOGGER.debug("Discarded %s secured command(s)", discarded_secured)
 
             raise
         except Exception as e:
@@ -1061,29 +1069,27 @@ class LoxoneConnection(LoxoneBaseConnection):
             raise
 
     async def close(self) -> None:
-        """Gracefully close the connection and drain message queues."""
+        """Serialize connection cleanup and leave interrupted attempts retryable."""
+        async with self._close_lock:
+            await self._close_locked()
+
+    async def _close_locked(self) -> None:
+        """Close connection resources while holding the close lock."""
         if self._closed:
             _LOGGER.debug("Connection already closed")
             return
 
         _LOGGER.debug("Closing connection...")
-        self._closed = True
 
         # Signal shutdown to all tasks
         self._shutdown_event.set()
 
-        # Wait for message queue to drain (with timeout)
-        if self._message_queue:
-            queue_size = self._message_queue.qsize()
-            if queue_size > 0:
-                _LOGGER.debug(f"Waiting for {queue_size} messages to be processed...")
-                try:
-                    await asyncio.wait_for(self._message_queue.join(), timeout=5.0)
-                    _LOGGER.debug("All messages processed")
-                except asyncio.TimeoutError:
-                    _LOGGER.warning(
-                        f"Timeout waiting for message queue to drain ({queue_size} messages remaining)"
-                    )
+        discarded = self._discard_pending_messages()
+        discarded_secured = self._discard_secured_messages()
+        if discarded:
+            _LOGGER.debug("Discarded %s queued command(s) during connection shutdown", discarded)
+        if discarded_secured:
+            _LOGGER.debug("Discarded %s secured command(s) during connection shutdown", discarded_secured)
 
         # Cancel all pending tasks
         if self._pending_task:
@@ -1111,13 +1117,15 @@ class LoxoneConnection(LoxoneBaseConnection):
                 if not self.connection.state == self.connection.state.CLOSED:
                     await asyncio.wait_for(self.connection.close(), timeout=5.0)
                     _LOGGER.debug("Websocket connection closed")
+            except asyncio.CancelledError:
+                raise
             except asyncio.TimeoutError:
                 _LOGGER.warning("Timeout closing websocket connection")
             except Exception as e:
                 _LOGGER.warning(f"Error closing websocket connection: {e}")
-            finally:
-                self.connection = None
+            self.connection = None
 
+        self._closed = True
         _LOGGER.debug("Connection closed successfully.")
 
     async def send_websocket_command(
@@ -1130,6 +1138,7 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         if not device_uuid or not isinstance(device_uuid, str):
             raise ValueError("device_uuid must be a non-empty string")
+        self._ensure_command_admission_open()
 
         # if value is None or not isinstance(value, (str, int, float)):
         #    raise ValueError("value must be a string, int, or float")
@@ -1161,22 +1170,35 @@ class LoxoneConnection(LoxoneBaseConnection):
             raise ValueError("value must be a string, int, or float")
         if not code or not isinstance(code, str):
             raise ValueError("code must be a non-empty string")
+        self._ensure_command_admission_open()
 
         try:
             command = f"{CMD_GET_VISUAL_PASSWD}{self.username}"
             _LOGGER.debug(f"Call send_secured__websocket_command: {command}")
 
+            if self._secured_queue.full() or self._message_queue.full():
+                _LOGGER.error("Queue is full, dropping secured command")
+                raise RuntimeError("Queue is full, cannot send secured command")
+
+            secured_command = self._send_secure(device_uuid, value, code)
             try:
-                # Use put_nowait with QueueFull exception handling
-                self._secured_queue.put_nowait(
-                    self._send_secure(device_uuid, value, code)
-                )
+                self._secured_queue.put_nowait(secured_command)
+            except asyncio.QueueFull:
+                secured_command.close()
+                _LOGGER.error("Secured queue is full, dropping secured command")
+                raise RuntimeError("Queue is full, cannot send secured command") from None
+
+            try:
                 self._message_queue.put_nowait(
                     MessageForQueue(command=command, flag=True)
                 )
             except asyncio.QueueFull:
+                queued_command = self._secured_queue.get_nowait()
+                self._secured_queue.task_done()
+                if asyncio.iscoroutine(queued_command):
+                    queued_command.close()
                 _LOGGER.error("Queue is full, dropping secured command")
-                raise RuntimeError("Queue is full, cannot send secured command")
+                raise RuntimeError("Queue is full, cannot send secured command") from None
         except Exception as e:
             _LOGGER.error(f"Failed to send secured websocket command: {e}")
             raise

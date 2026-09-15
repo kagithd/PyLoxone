@@ -126,6 +126,7 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 _UNDEF: dict = {}
+_UNLOAD_STEP_TIMEOUT = 10.0
 
 # TODO: get version and check for updates https://update.loxone.com/updatecheck.xml?serial=xxxxxxxxx
 
@@ -210,6 +211,38 @@ def _handle_listening_task_result(
         raise err
 
 
+async def _await_shutdown_task(
+    task: asyncio.Task,
+    description: str,
+    *,
+    accept_task_failure: bool = False,
+) -> bool:
+    """Wait a bounded time for one connection shutdown step."""
+    done, _pending = await asyncio.wait({task}, timeout=_UNLOAD_STEP_TIMEOUT)
+    if task not in done:
+        _LOGGER.warning("Timed out waiting for Loxone %s", description)
+        return False
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception as err:
+        log = _LOGGER.debug if accept_task_failure else _LOGGER.warning
+        log("Loxone %s ended with: %s", description, err)
+        return accept_task_failure
+    return True
+
+
+def _consume_shutdown_task_result(task: asyncio.Task) -> None:
+    """Consume a late cleanup result after a bounded unload failed."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
 async def async_unload_entry(hass, config_entry):
     """Completely unloads the Loxone integration and closes all connections."""
     # Get the Miniserver instance from hass.data
@@ -223,21 +256,30 @@ async def async_unload_entry(hass, config_entry):
     if coordinator is not None:
         coordinator._unloading = True
         try:
-            await coordinator.async_cleanup()
-        except Exception as e:
-            _LOGGER.warning("Error closing connection: %s", e)
-
-            # Cancel and await the stored listening task (if any)
-        try:
+            listener_stopped = True
             task = getattr(coordinator, "_listening_task", None)
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception as e:
-                    _LOGGER.debug(f"Error waiting for listening task to finish: {e}")
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                listener_stopped = await _await_shutdown_task(
+                    task,
+                    "listener shutdown",
+                    accept_task_failure=True,
+                )
+
+            cleanup_task = asyncio.create_task(coordinator.async_cleanup())
+            cleanup_task.add_done_callback(_consume_shutdown_task_result)
+            try:
+                cleanup_finished = await _await_shutdown_task(cleanup_task, "connection cleanup")
+            except asyncio.CancelledError:
+                cleanup_task.cancel()
+                raise
+            if not cleanup_finished:
+                cleanup_task.cancel()
+
+            if not listener_stopped or not cleanup_finished:
+                _LOGGER.error("Loxone unload aborted because connection shutdown did not finish")
+                return False
 
             # Remove event listeners (if any still present)
             if hasattr(coordinator, "listeners") and coordinator.listeners:

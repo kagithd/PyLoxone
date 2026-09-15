@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+
 import custom_components.loxone as integration
 from custom_components.loxone.const import DOMAIN
+from custom_components.loxone.pyloxone_api.connection import LoxoneConnection, MessageForQueue
 from custom_components.loxone.pyloxone_api.exceptions import LoxoneConnectionError
 
 
@@ -152,5 +155,231 @@ def test_listener_timeout_schedules_entry_recovery():
         integration._handle_listening_task_result(hass, entry, coordinator, listener)
 
         assert len(scheduled) == 1
+
+    asyncio.run(scenario())
+
+
+def test_unload_is_bounded_when_connection_shutdown_stalls(monkeypatch):
+    """A stuck connection task must not block config-entry reload forever."""
+
+    async def scenario():
+        release = asyncio.Event()
+
+        async def resist_cancellation():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        entry = SimpleNamespace(entry_id="entry-a")
+        listening_task = asyncio.create_task(resist_cancellation())
+        coordinator = SimpleNamespace(
+            config_entry=entry,
+            listeners=[],
+            _listening_task=listening_task,
+            _unloading=False,
+            async_cleanup=resist_cancellation,
+        )
+
+        async def unload_platforms(_entry, _platforms):
+            return True
+
+        async def deactivate(_hass, _entry_id):
+            return None
+
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            services=SimpleNamespace(async_remove=lambda *_args: None),
+            config_entries=SimpleNamespace(async_unload_platforms=unload_platforms),
+        )
+        monkeypatch.setattr(integration, "async_deactivate_engineering_view", deactivate)
+        monkeypatch.setattr(integration, "_UNLOAD_STEP_TIMEOUT", 0.01, raising=False)
+
+        unload_task = asyncio.create_task(integration.async_unload_entry(hass, entry))
+        try:
+            assert await asyncio.wait_for(asyncio.shield(unload_task), timeout=0.1) is False
+            assert hass.data[DOMAIN][entry.entry_id] is coordinator
+            assert not listening_task.done()
+        finally:
+            release.set()
+            await asyncio.wait_for(unload_task, timeout=1)
+
+    asyncio.run(scenario())
+
+
+def test_connection_close_discards_queued_commands():
+    """Shutdown must not execute stale actuator commands or wait for a consumer."""
+
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        await connection._message_queue.put(MessageForQueue("first", True))
+        await connection._message_queue.put(MessageForQueue("second", False))
+        secured_command = asyncio.sleep(0)
+        await connection._secured_queue.put(secured_command)
+
+        try:
+            await asyncio.wait_for(connection.close(), timeout=0.1)
+
+            assert connection._message_queue.empty()
+            assert connection._secured_queue.empty()
+            await asyncio.wait_for(connection._message_queue.join(), timeout=0.1)
+            await asyncio.wait_for(connection._secured_queue.join(), timeout=0.1)
+        finally:
+            secured_command.close()
+
+    asyncio.run(scenario())
+
+
+def test_closed_connection_rejects_new_commands():
+    """No actuator command may enter either queue after shutdown starts."""
+
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        connection._closed = True
+        connection._shutdown_event.set()
+
+        with pytest.raises(LoxoneConnectionError):
+            await connection.send_websocket_command("device", "on")
+        with pytest.raises(LoxoneConnectionError):
+            await connection.send_secured__websocket_command("device", "on", "code")
+
+        assert connection._message_queue.empty()
+        assert connection._secured_queue.empty()
+
+    asyncio.run(scenario())
+
+
+def test_rejected_secured_command_is_rolled_back():
+    """A partially full queue must not retain a command reported as rejected."""
+
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        connection._message_queue = asyncio.Queue(maxsize=1)
+        await connection._message_queue.put(MessageForQueue("occupied", True))
+
+        try:
+            with pytest.raises(RuntimeError):
+                await connection.send_secured__websocket_command("device", "on", "code")
+            assert connection._secured_queue.empty()
+        finally:
+            while not connection._secured_queue.empty():
+                command = connection._secured_queue.get_nowait()
+                command.close()
+                connection._secured_queue.task_done()
+
+    asyncio.run(scenario())
+
+
+def test_connection_close_cancels_in_flight_queue_send():
+    """Closing the worker must also cancel the command it is currently sending."""
+
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        send_started = asyncio.Event()
+        send_cancelled = asyncio.Event()
+        release_send = asyncio.Event()
+
+        async def blocked_send(_command, *, encrypted):
+            send_started.set()
+            try:
+                await release_send.wait()
+            except asyncio.CancelledError:
+                send_cancelled.set()
+                raise
+
+        connection._send_text_command = blocked_send
+        await connection._message_queue.put(MessageForQueue("actuator", True))
+        worker = asyncio.create_task(connection._process_message())
+        connection._pending_task = [worker]
+        await asyncio.wait_for(send_started.wait(), timeout=0.1)
+
+        try:
+            await asyncio.wait_for(connection.close(), timeout=0.1)
+            assert send_cancelled.is_set()
+            await asyncio.wait_for(connection._message_queue.join(), timeout=0.1)
+        finally:
+            release_send.set()
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
+
+
+def test_completed_failed_listener_does_not_block_unload(monkeypatch):
+    """A stopped listener is safe to unload even when it ended with a connection error."""
+
+    async def scenario():
+        async def fail_listener():
+            raise LoxoneConnectionError("connection lost")
+
+        entry = SimpleNamespace(entry_id="entry-a")
+        listening_task = asyncio.create_task(fail_listener())
+        await asyncio.sleep(0)
+        coordinator = SimpleNamespace(
+            config_entry=entry,
+            listeners=[],
+            _listening_task=listening_task,
+            _unloading=False,
+        )
+
+        async def cleanup():
+            return None
+
+        coordinator.async_cleanup = cleanup
+        unloaded = []
+
+        async def unload_platforms(_entry, _platforms):
+            unloaded.append(_entry.entry_id)
+            return True
+
+        async def deactivate(_hass, _entry_id):
+            return None
+
+        hass = SimpleNamespace(
+            data={DOMAIN: {entry.entry_id: coordinator}},
+            services=SimpleNamespace(async_remove=lambda *_args: None),
+            config_entries=SimpleNamespace(async_unload_platforms=unload_platforms),
+        )
+        monkeypatch.setattr(integration, "async_deactivate_engineering_view", deactivate)
+
+        assert await integration.async_unload_entry(hass, entry) is True
+        assert unloaded == [entry.entry_id]
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_connection_close_can_be_retried():
+    """An interrupted close must not claim resources were fully closed."""
+
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        first_attempt_started = asyncio.Event()
+        websocket_closed = []
+        close_attempts = 0
+
+        class OpenState:
+            CLOSED = "closed"
+
+        async def close_websocket():
+            nonlocal close_attempts
+            close_attempts += 1
+            if close_attempts == 1:
+                first_attempt_started.set()
+                await asyncio.Event().wait()
+            websocket_closed.append(True)
+
+        connection.connection = SimpleNamespace(state=OpenState(), close=close_websocket)
+
+        first_close = asyncio.create_task(connection.close())
+        await asyncio.wait_for(first_attempt_started.wait(), timeout=0.1)
+        first_close.cancel()
+        try:
+            await first_close
+        except asyncio.CancelledError:
+            pass
+
+        assert connection._closed is False
+        await asyncio.wait_for(connection.close(), timeout=0.1)
+        assert connection._closed is True
+        assert websocket_closed == [True]
 
     asyncio.run(scenario())
