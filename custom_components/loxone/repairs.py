@@ -594,7 +594,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 ObjectSelectorConfig(
                     multiple=True,
                     fields=fields,
-                    description_field="description",
+                    label_field="description",
                     translation_key="engineering_area_" + step,
                 )
             )

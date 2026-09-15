@@ -299,8 +299,11 @@ def test_step_one_skips_empty_room_groups(monkeypatch):
         assert {marker.schema for marker in form["data_schema"].schema} == {"no_room_devices"}
         rows = _rows(form, "no_room_devices")
         assert len(rows) == 2
-        marker = next(iter(form["data_schema"].schema))
+        marker, selector = next(iter(form["data_schema"].schema.items()))
         assert marker.description == {"suggested_value": rows}
+        object_config = selector.serialize()["selector"]["object"]
+        assert object_config["label_field"] == "description"
+        assert "description_field" not in object_config
 
     asyncio.run(scenario())
 
