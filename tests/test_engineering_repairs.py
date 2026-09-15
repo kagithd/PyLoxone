@@ -289,6 +289,22 @@ def test_step_one_groups_exact_room_identity_not_names(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_step_one_skips_empty_room_groups(monkeypatch):
+    conflicts = [_conflict(room_uuid=None), _conflict(token="b" * 64, room_uuid=None)]
+    harness = _repairs_harness(monkeypatch, {"entry-a": conflicts})
+
+    async def scenario():
+        form = await (await _open(harness)).async_step_init()
+        assert form["step_id"] == "devices"
+        assert {marker.schema for marker in form["data_schema"].schema} == {"no_room_devices"}
+        rows = _rows(form, "no_room_devices")
+        assert len(rows) == 2
+        marker = next(iter(form["data_schema"].schema))
+        assert marker.description == {"suggested_value": rows}
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "rows",
     [

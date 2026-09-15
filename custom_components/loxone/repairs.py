@@ -733,6 +733,9 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                     _publish_conflicts(self.hass, entry_id, conflicts)
                     return self.async_abort(reason="conflict_changed")
                 if user_input is None:
+                    if step == "rooms" and not _room_groups(conflicts):
+                        self._decisions = ()
+                        return self._form("devices", conflicts)
                     return self._form(step, conflicts)
                 if step == "rooms":
                     try:
