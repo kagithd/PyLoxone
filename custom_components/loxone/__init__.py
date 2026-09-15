@@ -138,6 +138,78 @@ async def async_remove_entry(
     async_remove_engineering_area_conflict_issues(hass, config_entry.entry_id)
 
 
+async def _reload_after_listener_failure(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: LoxoneCoordinator,
+    delay: float = 1.0,
+) -> None:
+    """Close the failed connection, then request integration recovery."""
+    await coordinator.api.close()
+    await asyncio.sleep(delay)
+    if coordinator._unloading:
+        return
+    await hass.config_entries.async_reload(config_entry.entry_id)
+
+
+def _start_listening_task(
+    coordinator: LoxoneCoordinator,
+    message_callback,
+    done_callback,
+) -> asyncio.Task:
+    """Start and retain the active listener so unload can cancel it."""
+    task = asyncio.create_task(coordinator.api.start_listening(callback=message_callback))
+    coordinator._listening_task = task
+    task.add_done_callback(done_callback)
+    return task
+
+
+def _handle_listening_task_result(
+    hass: HomeAssistant,
+    config_entry: ConfigEntry,
+    coordinator: LoxoneCoordinator,
+    task: asyncio.Task,
+) -> None:
+    """Translate listener completion into the existing recovery behavior."""
+    if coordinator._unloading:
+        try:
+            task.result()
+        except BaseException:  # The intentional shutdown result is fully consumed.
+            pass
+        return
+    try:
+        task.result()
+    except LoxoneTokenError:
+        _LOGGER.debug("Token is not valid anymore. Delete token and try to reloading Loxone integration.")
+        hass.config_entries.async_update_entry(
+            config_entry,
+            data={
+                "token": "",
+                "hash_alg": "",
+                "valid_until": "",
+            },
+        )
+        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+    except LoxoneOutOfServiceException:
+        _LOGGER.debug("Loxone LoxoneOutOfServiceException received. Try to reloading Loxone integration.")
+        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+    except (LoxoneConnectionError, TimeoutError, websockets.exceptions.ConnectionClosedError):
+        _LOGGER.debug("Loxone connection failed. Trying to reload the config entry.")
+        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+    except (
+        LoxoneConnectionClosedOk,
+        websockets.exceptions.ConnectionClosedOK,
+    ):
+        _LOGGER.debug(
+            "Loxone LoxoneConnectionClosedOk received. Mostly a timeout Problem. Try to reloading Loxone integration."
+        )
+        hass.async_create_task(_reload_after_listener_failure(hass, config_entry, coordinator))
+    except asyncio.exceptions.CancelledError as err:
+        _LOGGER.error(err)
+    except Exception as err:
+        raise err
+
+
 async def async_unload_entry(hass, config_entry):
     """Completely unloads the Loxone integration and closes all connections."""
     # Get the Miniserver instance from hass.data
@@ -149,6 +221,7 @@ async def async_unload_entry(hass, config_entry):
 
     # Connection close
     if coordinator is not None:
+        coordinator._unloading = True
         try:
             await coordinator.async_cleanup()
         except Exception as e:
@@ -426,48 +499,8 @@ async def async_setup_entry(hass, config_entry):
             maintenance.removed_entities,
         )
 
-    async def _reload_after_delay(delay: float = 1.0) -> None:
-        await coordinator.api.close()
-        await asyncio.sleep(delay)
-        await hass.services.async_call("loxone", "reload")
-
     def handle_task_result(task: asyncio.Task) -> None:
-        try:
-            task.result()
-        except LoxoneTokenError:
-            _LOGGER.debug("Token is not valid anymore. Delete token and try to reloading Loxone integration.")
-            # First we delete the invalid token then try to reload
-            hass.config_entries.async_update_entry(
-                config_entry,
-                data={
-                    "token": "",
-                    "hash_alg": "",
-                    "valid_until": "",
-                },
-            )
-            # Loxone-Integration neu laden
-            hass.async_create_task(_reload_after_delay(1.0))
-        except LoxoneOutOfServiceException:
-            _LOGGER.debug("Loxone LoxoneOutOfServiceException received. Try to reloading Loxone integration.")
-            # Loxone-Integration neu laden
-            hass.async_create_task(_reload_after_delay(1.0))
-        except LoxoneConnectionError:
-            _LOGGER.debug("Loxone LoxoneConnectionError received. Try to reloading Loxone integration.")
-            # Loxone-Integration neu laden
-            hass.async_create_task(_reload_after_delay(1.0))
-        except (
-            LoxoneConnectionClosedOk,
-            websockets.exceptions.ConnectionClosedOK,
-        ):
-            _LOGGER.debug(
-                "Loxone LoxoneConnectionClosedOk received. Mostly a timeout Problem. Try to reloading Loxone integration."
-            )
-            # Loxone-Integration neu laden
-            hass.async_create_task(_reload_after_delay(1.0))
-        except asyncio.exceptions.CancelledError as e:
-            _LOGGER.error(e)
-        except Exception as e:
-            raise e
+        _handle_listening_task_result(hass, config_entry, coordinator, task)
 
     async def message_callback(message):
         """Fire message on HomeAssistant Bus."""
@@ -642,8 +675,7 @@ async def async_setup_entry(hass, config_entry):
 
     async def start_event():
         try:
-            listening_task = asyncio.create_task(coordinator.api.start_listening(callback=message_callback))
-            listening_task.add_done_callback(handle_task_result)
+            _start_listening_task(coordinator, message_callback, handle_task_result)
 
         except Exception as e:
             raise e

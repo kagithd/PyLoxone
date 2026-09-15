@@ -126,6 +126,8 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self._engineering_signaled_generation: str | None = None
         self._engineering_published_generation: str | None = None
         self._engineering_published_impact_plan: EngineeringImpactPlan | None = None
+        self._listening_task: asyncio.Task[None] | None = None
+        self._unloading = False
         self.engineering_refresh_stage = "idle"
 
     async def async_config_entry_first_refresh(self) -> None:
