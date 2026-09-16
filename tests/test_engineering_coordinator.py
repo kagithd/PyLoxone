@@ -265,6 +265,31 @@ def test_forced_refresh_and_unchanged_rebind(transaction, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_committed_snapshot_rehomes_proven_control_entities(transaction, monkeypatch):
+    """Omitting the post-registry sync would leave physical device pages empty."""
+    calls = []
+
+    def rehome(hass, entry, lox_config, snapshot):
+        calls.append((hass, entry, lox_config, snapshot))
+        return 0
+
+    monkeypatch.setattr(module, "async_sync_control_entity_devices", rehome, raising=False)
+
+    async def scenario():
+        coordinator = transaction.make()
+        snapshot = await coordinator.async_refresh_engineering_inventory(force=True)
+        assert calls == [
+            (
+                coordinator.hass,
+                coordinator.config_entry,
+                coordinator.miniserver.lox_config.json,
+                snapshot,
+            )
+        ]
+
+    asyncio.run(scenario())
+
+
 def test_refresh_and_cold_drain_retain_room_mapping_and_pending_batch(transaction, monkeypatch):
     """An explicit coordinator state construction must not drop room recovery metadata."""
 
@@ -785,6 +810,16 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     async def prepare_view(_hass):
         pass
 
+    snapshot = object()
+
+    def rehome(_hass, rehome_entry, rehome_config, rehome_snapshot):
+        assert events == ["restore", "forward"]
+        assert rehome_entry is entry
+        assert rehome_config == {}
+        assert rehome_snapshot is snapshot
+        events.append("rehome")
+        return 0
+
     def finish(*args):
         raise Finished
 
@@ -792,6 +827,7 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
         async_config_entry_first_refresh=first_refresh,
         async_restore_engineering_snapshot=restore,
         async_schedule_engineering_refresh=schedule,
+        engineering_snapshot=snapshot,
         miniserver=SimpleNamespace(serial="serial-a", lox_config=SimpleNamespace(json={})),
     )
     hass = SimpleNamespace(data={}, config_entries=SimpleNamespace(async_forward_entry_setups=forward))
@@ -799,8 +835,9 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     monkeypatch.setattr(integration, "LoxoneCoordinator", lambda *args: coordinator)
     monkeypatch.setattr(integration, "async_migrate_version_sensor_unique_id", lambda *args: 0)
     monkeypatch.setattr(integration, "async_prepare_engineering_view", prepare_view)
+    monkeypatch.setattr(integration, "async_sync_control_entity_devices", rehome, raising=False)
     monkeypatch.setattr(integration, "LOXONE_PLATFORMS", ())
     monkeypatch.setattr(integration, "async_warn_about_config_impacts", finish)
     with pytest.raises(Finished):
         asyncio.run(integration.async_setup_entry(hass, entry))
-    assert events == ["restore", "forward", "schedule"]
+    assert events == ["restore", "forward", "rehome", "schedule"]

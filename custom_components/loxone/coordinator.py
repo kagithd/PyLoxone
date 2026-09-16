@@ -24,6 +24,7 @@ from .engineering_capabilities import ExposureStatus, resolve_engineering_capabi
 from .engineering_changes import EngineeringImpactPlan
 from .engineering_config import EngineeringInventory, download_engineering_inventory
 from .engineering_entities import build_engineering_entity_specs, engineering_inventory_updated_signal
+from .device_sync import async_sync_control_entity_devices
 from .engineering_registry import (
     EngineeringRegistryMetadata,
     async_apply_engineering_registry_plan,
@@ -309,6 +310,17 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             await async_run_registry_maintenance(
                 self.hass, self.config_entry, self.miniserver.lox_config.json, bounded_notification=True
             )
+            linked_entities = async_sync_control_entity_devices(
+                self.hass,
+                self.config_entry,
+                self.miniserver.lox_config.json,
+                snapshot,
+            )
+            if linked_entities:
+                _LOGGER.info(
+                    "Linked %s Loxone control entity/entities to physical devices",
+                    linked_entities,
+                )
             if startup:
                 self._signal_engineering_generation(generation)
             persistent_notification.async_dismiss(self.hass, self._engineering_status_notification_id)

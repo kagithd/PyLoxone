@@ -6,11 +6,14 @@ from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.device_sync import (
     async_cleanup_stale_devices,
     async_migrate_version_sensor_unique_id,
+    async_sync_control_entity_devices,
     async_sync_device_areas,
     async_sync_device_names,
+    control_owner_identifiers_from_lox_config,
     device_names_from_lox_config,
     device_rooms_from_lox_config,
 )
+from custom_components.loxone.engineering_topology import NodeKind
 
 
 class FakeDeviceRegistry:
@@ -106,6 +109,143 @@ def test_device_rooms_from_lox_config_resolves_room_uuid_and_name():
         "raw-action": "Wohnzimmer",
         "resolved": "B\u00fcro",
     }
+
+
+def _physical_snapshot(*references: tuple[str, str]):
+    """Build the smallest trusted physical-owner snapshot for this boundary."""
+    return SimpleNamespace(
+        source=SimpleNamespace(entry_id="entry-id"),
+        nodes=tuple(
+            SimpleNamespace(
+                kind=NodeKind.PHYSICAL_DEVICE,
+                sensitive=False,
+                device_identifier=owner_identifier,
+                element=SimpleNamespace(uuid=reference),
+            )
+            for reference, owner_identifier in references
+        )
+    )
+
+
+def test_control_owner_identifiers_follow_explicit_links_through_related_control():
+    """Breaking link traversal would leave a linked meter on a logical device."""
+    owners = control_owner_identifiers_from_lox_config(
+        {
+            "controls": {
+                "switch-control": {
+                    "uuidAction": "switch-action",
+                    "links": ["air-hardware"],
+                },
+                "meter-control": {
+                    "uuidAction": "meter-action",
+                    "links": ["switch-action"],
+                },
+            }
+        },
+        _physical_snapshot(("air-hardware", "provider:air-hardware")),
+    )
+
+    assert owners == {
+        "switch-action": "provider:air-hardware",
+        "meter-action": "provider:air-hardware",
+    }
+
+
+def test_control_owner_identifiers_include_explicitly_linked_nested_controls():
+    """Nested LoxAPP controls must retain the same exact-link safety boundary."""
+    owners = control_owner_identifiers_from_lox_config(
+        {
+            "controls": {
+                "parent-control": {
+                    "uuidAction": "parent-action",
+                    "subControls": {
+                        "switch-control": {
+                            "uuidAction": "switch-action",
+                            "links": ["air-hardware"],
+                        }
+                    },
+                }
+            }
+        },
+        _physical_snapshot(("air-hardware", "provider:air-hardware")),
+    )
+
+    assert owners == {"switch-action": "provider:air-hardware"}
+
+
+def test_control_owner_identifiers_reject_ambiguous_hardware_links():
+    """Removing the ambiguity guard could attach a function to the wrong device."""
+    owners = control_owner_identifiers_from_lox_config(
+        {
+            "controls": {
+                "control": {
+                    "uuidAction": "action",
+                    "links": ["air-one", "air-two"],
+                }
+            }
+        },
+        _physical_snapshot(
+            ("air-one", "provider:air-one"),
+            ("air-two", "provider:air-two"),
+        ),
+    )
+
+    assert owners == {}
+
+
+def test_sync_control_entity_devices_rehomes_all_control_entities_to_verified_hardware(monkeypatch):
+    """A lost registry reassignment would keep the physical device page empty."""
+    physical = SimpleNamespace(
+        id="physical-device",
+        identifiers={(DOMAIN, "provider:air-hardware")},
+        config_entries={"entry-id"},
+    )
+    logical = SimpleNamespace(
+        id="logical-device",
+        identifiers={(DOMAIN, "switch-action")},
+        config_entries={"entry-id"},
+    )
+    device_registry = FakeDeviceRegistry(
+        {
+            (DOMAIN, "provider:air-hardware"): physical,
+            (DOMAIN, "switch-action"): logical,
+        }
+    )
+    entity = SimpleNamespace(
+        entity_id="switch.st_f04",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        device_id="logical-device",
+        area_id="old-area",
+    )
+    entity_registry = FakeEntityRegistry([entity])
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.dr.async_get",
+        lambda hass: device_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_get",
+        lambda hass: entity_registry,
+    )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_device",
+        lambda registry, device_id: [entry for entry in registry.entities if entry.device_id == device_id],
+    )
+
+    moved = async_sync_control_entity_devices(
+        object(),
+        SimpleNamespace(entry_id="entry-id"),
+        {"controls": {"switch": {"uuidAction": "switch-action", "links": ["air-hardware"]}}},
+        _physical_snapshot(("air-hardware", "provider:air-hardware")),
+    )
+
+    assert moved == 1
+    assert entity.device_id == "physical-device"
+    assert entity.area_id is None
+    assert entity_registry.updates == [
+        ("switch.st_f04", {"device_id": "physical-device", "area_id": None})
+    ]
+    assert device_registry.removed == ["logical-device"]
 
 
 def test_sync_updates_integration_name_and_preserves_user_name(monkeypatch):

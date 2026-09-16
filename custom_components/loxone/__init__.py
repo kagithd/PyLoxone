@@ -66,6 +66,7 @@ from .const import (
 from .coordinator import LoxoneCoordinator
 from .device_sync import (
     async_migrate_version_sensor_unique_id,
+    async_sync_control_entity_devices,
     async_sync_device_areas,
     async_sync_device_names,
 )
@@ -516,6 +517,19 @@ async def async_setup_entry(hass, config_entry):
 
     if setup_tasks:
         await asyncio.wait(setup_tasks)
+
+    if snapshot := coordinator.engineering_snapshot:
+        linked_entities = async_sync_control_entity_devices(
+            hass,
+            config_entry,
+            coordinator.miniserver.lox_config.json,
+            snapshot,
+        )
+        if linked_entities:
+            _LOGGER.info(
+                "Linked %s Loxone control entity/entities to physical devices",
+                linked_entities,
+            )
 
     await coordinator.async_schedule_engineering_refresh()
 
