@@ -237,6 +237,38 @@ def test_placement_rows_join_current_snapshot_without_becoming_authority(monkeyp
     asyncio.run(scenario())
 
 
+def test_room_repair_hides_row_position_without_declared_cabinet(monkeypatch):
+    """A bare row/position must not imply a useful physical placement."""
+    from custom_components.loxone.engineering_config import parse_engineering_xml
+    from tests.engineering_fixtures import SYNTHETIC_PARSE_CONTEXT, make_snapshot
+
+    conflict = replace(_conflict(), device_identifier="serial-a:device")
+    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
+    coordinator = harness.hass.data[DOMAIN]["entry-a"]
+    coordinator.miniserver.serial = "serial-a"
+    coordinator.engineering_snapshot = make_snapshot(
+        inventory=parse_engineering_xml(
+            b'<C Type="LoxLIVE" U="ms"><C Type="FutureDevice" U="device" '
+            b'SwitchBoardRow="1" SwitchBoardPos="1" /></C>',
+            **SYNTHETIC_PARSE_CONTEXT,
+        )
+    )
+    harness.module.async_register_engineering_area_conflict_reconciler(
+        harness.hass,
+        coordinator.config_entry,
+        coordinator,
+    )
+
+    async def scenario():
+        flow = await _open(harness)
+        rooms = await flow.async_step_init()
+        description = _rows(rooms, "rooms")[0]["description"]
+        assert "row:" not in description
+        assert "position:" not in description
+
+    asyncio.run(scenario())
+
+
 def test_aggregate_twenty_conflicts_privacy_and_zero(monkeypatch):
     conflicts = [
         replace(_conflict(token=f"{index:064x}"), device_identifier=f"serial-entry-a:device-{index}")

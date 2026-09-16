@@ -498,7 +498,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             node = pending.pop()
             pending.extend(node.children)
             placement = installation_placement_to_dict(node.placement)
-            if placement:
+            if placement and (placement.get("installation") or placement.get("switchboard")):
                 summary = " · ".join(
                     f"{key}: {value}" for key, value in placement.items() if _safe_text(str(value)) is not None
                 )[:200]
