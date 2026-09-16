@@ -202,6 +202,44 @@ def control_owner_identifiers_from_lox_config(
     return resolved
 
 
+def control_entity_owner_identifiers_from_lox_config(
+    lox_config: Mapping[str, Any],
+    snapshot: Any,
+) -> dict[str, str]:
+    """Resolve entity UUIDs to owners from explicit control links and states."""
+    controls = lox_config.get("controls", {})
+    if not isinstance(controls, Mapping):
+        return {}
+    owner_by_action = control_owner_identifiers_from_lox_config(lox_config, snapshot)
+    candidates: dict[str, set[str]] = {}
+
+    def collect(current_controls: Any) -> None:
+        if not isinstance(current_controls, Mapping):
+            return
+        for control_key, control in current_controls.items():
+            if not isinstance(control_key, str) or not isinstance(control, Mapping):
+                continue
+            action = control.get("uuidAction")
+            if not isinstance(action, str) or not action:
+                action = control_key
+            owner = owner_by_action.get(action)
+            if owner is not None:
+                identifiers = {action}
+                states = control.get("states")
+                if isinstance(states, Mapping):
+                    identifiers.update(value for value in states.values() if isinstance(value, str) and value)
+                for identifier in identifiers:
+                    candidates.setdefault(identifier, set()).add(owner)
+            collect(control.get("subControls"))
+
+    collect(controls)
+    return {
+        identifier: next(iter(owners))
+        for identifier, owners in candidates.items()
+        if len(owners) == 1
+    }
+
+
 @callback
 def async_sync_device_names(
     hass: HomeAssistant,
@@ -323,41 +361,47 @@ def async_sync_control_entity_devices(
     """Move proven control entities from logical to physical Loxone devices."""
     if getattr(getattr(snapshot, "source", None), "entry_id", None) != config_entry.entry_id:
         return 0
-    owner_by_action = control_owner_identifiers_from_lox_config(lox_config, snapshot)
-    if not owner_by_action:
+    owner_by_unique_id = control_entity_owner_identifiers_from_lox_config(lox_config, snapshot)
+    if not owner_by_unique_id:
         return 0
 
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
     moved = 0
-    for action, owner_identifier in owner_by_action.items():
+    previous_device_ids: set[str] = set()
+    for entity in er.async_entries_for_config_entry(entity_registry, config_entry.entry_id):
+        owner_identifier = owner_by_unique_id.get(entity.unique_id)
+        if (
+            owner_identifier is None
+            or entity.platform != DOMAIN
+            or entity.config_entry_id != config_entry.entry_id
+        ):
+            continue
         owner = device_registry.async_get_device_by_identifier(
             (DOMAIN, owner_identifier), config_entry.entry_id
         )
-        logical = device_registry.async_get_device_by_identifier(
-            (DOMAIN, action), config_entry.entry_id
-        )
-        if owner is None or logical is None or owner.id == logical.id:
+        if owner is None:
             continue
-
-        for entity in tuple(er.async_entries_for_device(entity_registry, logical.id)):
-            if (
-                entity.config_entry_id != config_entry.entry_id
-                or entity.platform != DOMAIN
-                or entity.device_id != logical.id
-            ):
-                continue
-            changes = {"device_id": owner.id}
-            if entity.area_id is not None:
-                changes["area_id"] = None
+        previous_device_id = entity.device_id
+        changes = {}
+        if previous_device_id != owner.id:
+            changes["device_id"] = owner.id
+            if isinstance(previous_device_id, str) and previous_device_id:
+                previous_device_ids.add(previous_device_id)
+        if entity.area_id is not None:
+            changes["area_id"] = None
+        if changes:
             entity_registry.async_update_entity(entity.entity_id, **changes)
             moved += 1
 
+    for previous_device_id in sorted(previous_device_ids):
+        logical = device_registry.async_get(previous_device_id)
         if (
-            not er.async_entries_for_device(entity_registry, logical.id)
+            logical is not None
+            and not er.async_entries_for_device(entity_registry, previous_device_id)
             and getattr(logical, "config_entries", frozenset()) == {config_entry.entry_id}
         ):
-            device_registry.async_remove_device(logical.id)
+            device_registry.async_remove_device(previous_device_id)
 
     return moved
 

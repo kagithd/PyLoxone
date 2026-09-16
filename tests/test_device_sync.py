@@ -29,6 +29,9 @@ class FakeDeviceRegistry:
         self.lookups.append((identifier, config_entry_id))
         return self.devices.get(identifier)
 
+    def async_get(self, device_id):
+        return next((device for device in self.devices.values() if device.id == device_id), None)
+
     def async_update_device(self, device_id, **changes):
         self.updates.append((device_id, changes))
         device = next(device for device in self.devices.values() if device.id == device_id)
@@ -193,32 +196,55 @@ def test_control_owner_identifiers_reject_ambiguous_hardware_links():
     assert owners == {}
 
 
-def test_sync_control_entity_devices_rehomes_all_control_entities_to_verified_hardware(monkeypatch):
-    """A lost registry reassignment would keep the physical device page empty."""
+def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifiers(monkeypatch):
+    """Controls must migrate even when old device IDs differ from their action UUIDs."""
     physical = SimpleNamespace(
         id="physical-device",
         identifiers={(DOMAIN, "provider:air-hardware")},
         config_entries={"entry-id"},
     )
-    logical = SimpleNamespace(
-        id="logical-device",
-        identifiers={(DOMAIN, "switch-action")},
+    logical_switch = SimpleNamespace(
+        id="logical-switch-device",
+        identifiers={(DOMAIN, "legacy-switch")},
+        config_entries={"entry-id"},
+    )
+    logical_meter = SimpleNamespace(
+        id="logical-meter-device",
+        identifiers={(DOMAIN, "legacy-meter")},
         config_entries={"entry-id"},
     )
     device_registry = FakeDeviceRegistry(
         {
             (DOMAIN, "provider:air-hardware"): physical,
-            (DOMAIN, "switch-action"): logical,
+            (DOMAIN, "legacy-switch"): logical_switch,
+            (DOMAIN, "legacy-meter"): logical_meter,
         }
     )
-    entity = SimpleNamespace(
+    switch = SimpleNamespace(
         entity_id="switch.st_f04",
+        unique_id="switch-action",
         config_entry_id="entry-id",
         platform=DOMAIN,
-        device_id="logical-device",
+        device_id="logical-switch-device",
         area_id="old-area",
     )
-    entity_registry = FakeEntityRegistry([entity])
+    actual = SimpleNamespace(
+        entity_id="sensor.st_f04_actual",
+        unique_id="meter-actual",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        device_id="logical-meter-device",
+        area_id=None,
+    )
+    total = SimpleNamespace(
+        entity_id="sensor.st_f04_total",
+        unique_id="meter-total",
+        config_entry_id="entry-id",
+        platform=DOMAIN,
+        device_id="logical-meter-device",
+        area_id=None,
+    )
+    entity_registry = FakeEntityRegistry([switch, actual, total])
     monkeypatch.setattr(
         "custom_components.loxone.device_sync.dr.async_get",
         lambda hass: device_registry,
@@ -231,21 +257,40 @@ def test_sync_control_entity_devices_rehomes_all_control_entities_to_verified_ha
         "custom_components.loxone.device_sync.er.async_entries_for_device",
         lambda registry, device_id: [entry for entry in registry.entities if entry.device_id == device_id],
     )
+    monkeypatch.setattr(
+        "custom_components.loxone.device_sync.er.async_entries_for_config_entry",
+        lambda registry, entry_id: [entry for entry in registry.entities if entry.config_entry_id == entry_id],
+    )
 
     moved = async_sync_control_entity_devices(
         object(),
         SimpleNamespace(entry_id="entry-id"),
-        {"controls": {"switch": {"uuidAction": "switch-action", "links": ["air-hardware"]}}},
+        {
+            "controls": {
+                "switch": {"uuidAction": "switch-action", "links": ["air-hardware"]},
+                "meter": {
+                    "uuidAction": "meter-action",
+                    "links": ["switch-action"],
+                    "states": {"actual": "meter-actual", "total": "meter-total"},
+                },
+            }
+        },
         _physical_snapshot(("air-hardware", "provider:air-hardware")),
     )
 
-    assert moved == 1
-    assert entity.device_id == "physical-device"
-    assert entity.area_id is None
-    assert entity_registry.updates == [
-        ("switch.st_f04", {"device_id": "physical-device", "area_id": None})
+    assert moved == 3
+    assert [entry.device_id for entry in (switch, actual, total)] == [
+        "physical-device",
+        "physical-device",
+        "physical-device",
     ]
-    assert device_registry.removed == ["logical-device"]
+    assert switch.area_id is None
+    assert entity_registry.updates == [
+        ("switch.st_f04", {"device_id": "physical-device", "area_id": None}),
+        ("sensor.st_f04_actual", {"device_id": "physical-device"}),
+        ("sensor.st_f04_total", {"device_id": "physical-device"}),
+    ]
+    assert set(device_registry.removed) == {"logical-switch-device", "logical-meter-device"}
 
 
 def test_sync_updates_integration_name_and_preserves_user_name(monkeypatch):
