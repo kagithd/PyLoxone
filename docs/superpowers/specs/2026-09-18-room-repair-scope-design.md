@@ -24,14 +24,14 @@ policies, derived solely from validated node role and resolved
 ownership/topology. Product names, display labels, bus names, and entity count
 are never inputs to the policy.
 
-- `room_capable_device`: every resolved external `physical_device`, including
-  extensions and endpoints reached through any bus. It may be synchronized to
-  an HA area even if it currently exposes no HA entity.
+- `room_capable_device`: every resolved external `physical_device` or external
+  `bridge`, including extensions and endpoints reached through any bus. It may
+  be synchronized to an HA area even if it currently exposes no HA entity.
 - `provider_owned`: the Miniserver and its integrated I/O and services. They
   remain attached to the Miniserver and do not receive an independent area.
-- `topology_only`: a bus, bridge, or structural grouping. It remains in the
-  hierarchy and keeps placement metadata, but never creates a room conflict or
-  changes an HA area.
+- `topology_only`: a bus or structural grouping. It remains in the hierarchy
+  and keeps placement metadata, but never creates a room conflict or changes
+  an HA area.
 - `unassigned`: a safe inventory node without enough identity evidence. It
   remains visible but receives no area mutation.
 
@@ -91,8 +91,8 @@ separate frontend and persistence boundary without improving room decisions.
 
 Four behavior tests cover the regression boundary:
 
-1. A topology-only node with a room is excluded from conflicts while a physical
-   extension on the same bus remains eligible.
+1. A topology-only bus node with a room is excluded from conflicts while an
+   external bridge or physical extension on the same bus remains eligible.
 2. A physical device with a unique name match resolves without a repair and
    stores the stable room mapping.
 3. A physical device without a Loxone room allows an explicit device-level HA
@@ -107,8 +107,8 @@ No tests are added for translation wording or framework rendering.
 
 - Bus and structural nodes never appear in a room repair solely because they
   carry a Loxone room.
-- Every resolved external physical device remains room-capable, including an
-  extension installed away from its parent Miniserver.
+- Every resolved external bridge or physical device remains room-capable,
+  including an extension installed away from its parent Miniserver.
 - A device without a Loxone room can receive an explicit HA-only fallback;
   a later Loxone room takes precedence.
 - No classification depends on a device or room name.
