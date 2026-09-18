@@ -620,6 +620,36 @@ def test_replaced_binding_reconciles_new_issue_only_after_old_lock_released(monk
     asyncio.run(scenario())
 
 
+def test_long_area_resolution_does_not_block_repair_sync(monkeypatch):
+    """A slow durable batch must not hold the lock needed to refresh its Repair issue."""
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def resolve(*_args, **_kwargs):
+        entered.set()
+        await release.wait()
+        return EngineeringBatchAreaResolutionResult(0, 1, "pending")
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        resolution = asyncio.create_task(flow.async_step_devices({"devices": _rows(form, "devices")}))
+        await entered.wait()
+        try:
+            await asyncio.wait_for(
+                harness.module.async_sync_engineering_area_conflict_issues(harness.hass, "entry-a"),
+                timeout=0.1,
+            )
+        finally:
+            release.set()
+            await resolution
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("mutation", ["extra", "version_bool", "fingerprint", "id"])
 def test_exact_issue_payload_rejected_without_loading(monkeypatch, mutation):
     harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})

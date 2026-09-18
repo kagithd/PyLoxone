@@ -728,10 +728,10 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         if active is None or not _binding_is_current(self.hass, entry_id, active):
             return self.async_abort(reason="entry_unavailable")
         self._active = active
-        async with active.state.lock:
-            if not _binding_is_current(self.hass, entry_id, active):
-                return self.async_abort(reason="entry_unavailable")
-            try:
+        try:
+            async with active.state.lock:
+                if not _binding_is_current(self.hass, entry_id, active):
+                    return self.async_abort(reason="entry_unavailable")
                 conflicts = await self._load(entry_id, active)
                 if not conflicts or _fingerprint(conflicts) != fingerprint:
                     _publish_conflicts(self.hass, entry_id, conflicts)
@@ -759,12 +759,16 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 if not conflicts or _fingerprint(conflicts) != fingerprint:
                     _publish_conflicts(self.hass, entry_id, conflicts)
                     return self.async_abort(reason="conflict_changed")
-                result = await async_resolve_engineering_area_conflicts(
-                    self.hass,
-                    entry_id,
-                    decisions,
-                    is_current=lambda: _binding_is_current(self.hass, entry_id, active),
-                )
+            # The registry resolver owns its own entry-scoped operation lock.
+            # Do not make native Repairs synchronization wait for potentially
+            # slow durable writes or a queued registry operation.
+            result = await async_resolve_engineering_area_conflicts(
+                self.hass,
+                entry_id,
+                decisions,
+                is_current=lambda: _binding_is_current(self.hass, entry_id, active),
+            )
+            async with active.state.lock:
                 if not _binding_is_current(self.hass, entry_id, active):
                     return self.async_abort(reason="entry_unavailable")
                 remaining = await self._load(entry_id, active)
@@ -777,13 +781,13 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 if result.reason == "area_name_collision":
                     return self._form("rooms", remaining, self._room_input, "area_name_collision")
                 return self.async_abort(reason="resolution_failed")
-            except asyncio.CancelledError:
-                raise
-            except _FlowError as err:
-                reason = str(err) if str(err) in {"entry_unavailable", "repair_unavailable"} else "repair_unavailable"
-                return self.async_abort(reason=reason)
-            except Exception:  # noqa: BLE001 -- no storage errors or private values leave the adapter.
-                return self.async_abort(reason="repair_unavailable")
+        except asyncio.CancelledError:
+            raise
+        except _FlowError as err:
+            reason = str(err) if str(err) in {"entry_unavailable", "repair_unavailable"} else "repair_unavailable"
+            return self.async_abort(reason=reason)
+        except Exception:  # noqa: BLE001 -- no storage errors or private values leave the adapter.
+            return self.async_abort(reason="repair_unavailable")
 
     async def async_step_init(self, user_input: dict[str, Any] | None = None) -> RepairsFlowResult:
         """Discard only HA manager's exact initialization envelope."""
