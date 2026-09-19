@@ -1,4 +1,4 @@
-# Stability review: 0.9.22.34
+# Stability review: 0.9.22.34–0.9.22.35
 
 This fork-only stabilization follows a review of the engineering branch from
 `ab0ab92` through `55f085b`, with the earlier metadata patch and upstream code
@@ -13,7 +13,7 @@ live installation. No upstream publication is part of this release.
 | HA responsiveness | Complete snapshot validation/encoding/decoding repeatedly ran on the HA event loop. | Run CPU-heavy store codecs, migration, candidate roundtrip, sequence validation, metadata derivation and registry-plan validation in the executor; preserve mutation and commit fences. |
 | Device identity | Reassigning an entity could delete its previous physical device even when that hardware remained present. | Retain all snapshot-backed device identifiers during logical-device cleanup. |
 | Startup | Engineering recovery and runtime probes gated ordinary Loxone setup. | Start the normal listener first; restore engineering state in the owned background task. |
-| Transport ownership | The socket returned during initial connection setup was discarded, allowing a second open. This also exists in the compared upstream revision. | Retain the opened socket for the listener and cleanup. |
+| Transport ownership | The socket returned during initial connection setup was discarded, allowing a second open. This also exists in the compared upstream revision. | Prepare configuration without a socket; open and retain transport immediately before listener authentication. |
 | Reload | Cleanup cancellation/timeout could abandon its ownership; a retry created another cleanup operation. | Retain and rejoin the cleanup task. Close transport before waiting for optional metadata work; reject replacement while cleanup is incomplete. |
 | Shutdown subscriptions | Old instances retained HA stop/start listeners across reloads. Old stop callbacks could write stale tokens. | Unsubscribe those callbacks with the owning coordinator. |
 | Channel availability | One failed engineering runtime probe invalidated all successful bindings. | Preserve independently successful bindings. |
@@ -33,6 +33,12 @@ live installation. No upstream publication is part of this release.
   failure is not reported as successful recovery.
 
 ## Verification
+
+Live startup of 0.9.22.34 exposed a timing defect in its socket-ownership fix:
+the retained socket could expire while HA loaded entity platforms. That build
+was not accepted as stable. Version 0.9.22.35 separates configuration preparation
+from transport opening, preserving the standalone API while avoiding an idle
+unauthenticated socket. Two targeted regressions cover both startup phases.
 
 Regression tests first reproduced the blocking startup, discarded socket,
 cross-channel invalidation, quadratic checkpoints, event-loop snapshot codec,

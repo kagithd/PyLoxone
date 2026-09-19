@@ -14,6 +14,48 @@ from custom_components.loxone.pyloxone_api.connection import LoxoneConnection, M
 from custom_components.loxone.pyloxone_api.exceptions import LoxoneConnectionError
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_listener_opens_once_and_immediately_starts_handshake(prepared):
+    """Prepare fresh callers, but reuse HA preparation without idling a socket."""
+    async def scenario():
+        connection = LoxoneConnection("192.0.2.1", "user", "test-password")
+        if prepared:
+            connection._session_key = b"prepared-session"
+        handshaking = asyncio.Event()
+        opens = []
+
+        async def send(_message):
+            handshaking.set()
+            await asyncio.Event().wait()
+
+        socket = SimpleNamespace(send=send)
+
+        async def open_websocket():
+            opens.append(True)
+            return socket
+
+        async def open_connection():
+            assert not prepared, "listener repeated configuration preparation"
+            connection._session_key = b"prepared-session"
+            return await open_websocket()
+
+        connection._open_websocket = open_websocket
+        connection.open = open_connection
+        listener = asyncio.create_task(connection.start_listening())
+        try:
+            await asyncio.wait_for(handshaking.wait(), timeout=0.2)
+            assert connection.connection is socket
+            assert opens == [True]
+        finally:
+            listener.cancel()
+            try:
+                await listener
+            except asyncio.CancelledError:
+                pass
+
+    asyncio.run(scenario())
+
+
 def test_initial_connection_failure_is_delegated_to_home_assistant(monkeypatch):
     """Config-entry setup must not hide one failure behind an internal retry loop."""
 

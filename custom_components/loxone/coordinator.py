@@ -163,7 +163,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             )
         try:
             session = async_get_clientsession(self.hass)
-            self.api.connection = await self.api.open(session)
+            await self.api.prepare(session)
         except Exception:
             # Connection exception strings may contain private endpoint data.
             _LOGGER.error("Could not connect to Loxone Miniserver")  # noqa: TRY400

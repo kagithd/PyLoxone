@@ -147,7 +147,7 @@ class LoxoneBaseConnection:
             raise RuntimeError(f"Failed to generate cryptographic keys: {e}") from e
 
         self._public_key: str = ""
-        self._session_key: bytes
+        self._session_key: bytes = b""
 
         self.miniserver_version: list[int] = []
         self.miniserver_serial: str = ""
@@ -463,8 +463,9 @@ class LoxoneConnection(LoxoneBaseConnection):
 
         if not self.connection:
             _LOGGER.debug("No existing connection found. Opening a new connection.")
-            self.connection = await self.open()
-            # raise exceptions.ConnectionFailure("Connection already exists")
+            self.connection = (
+                await self._open_websocket() if self._session_key else await self.open()
+            )
         else:
             _LOGGER.debug("Using existing connection.")
 
@@ -809,6 +810,12 @@ class LoxoneConnection(LoxoneBaseConnection):
     async def open(
         self, session: aiohttp.ClientSession | None = None
     ) -> LoxoneClientConnection:
+        """Prepare configuration and open a socket for standalone callers."""
+        await self.prepare(session)
+        return await self._open_websocket()
+
+    async def prepare(self, session: aiohttp.ClientSession | None = None) -> None:
+        """Load configuration without leaving an unauthenticated socket idle."""
 
         if self._closed:
             raise RuntimeError("Cannot open a closed connection")
@@ -991,7 +998,11 @@ class LoxoneConnection(LoxoneBaseConnection):
             _LOGGER.error(f"Failed to generate initial salt: {e}")
             raise
 
-        # Establish websocket connection
+    async def _open_websocket(self) -> LoxoneClientConnection:
+        """Open transport immediately before the listener authenticates it."""
+        if self._closed:
+            raise RuntimeError("Cannot open a closed connection")
+
         try:
             params = {"url": self.url}
             if self.scheme == "https":

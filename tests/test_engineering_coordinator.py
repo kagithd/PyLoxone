@@ -843,8 +843,8 @@ def test_core_platform_setup_does_not_wait_for_engineering_recovery(monkeypatch)
     assert events == ["forward", "rehome"]
 
 
-def test_first_refresh_retains_opened_websocket_for_listener(transaction, monkeypatch):
-    """Startup must not leak an unowned socket and open a second connection."""
+def test_first_refresh_prepares_without_opening_an_idle_websocket(transaction, monkeypatch):
+    """Slow HA platform startup must not consume the socket authentication window."""
     async def scenario():
         coordinator = transaction.make()
         coordinator.api = None
@@ -853,15 +853,17 @@ def test_first_refresh_retains_opened_websocket_for_listener(transaction, monkey
         coordinator._port = 80
         coordinator._username = "test-user"
         coordinator._password = "test-password"
-        websocket = object()
-
-        async def open_connection(self, session=None):
+        async def prepare(self, session=None):
             self.structure_file = {"msInfo": {"serialNr": "serial-a"}}
-            return websocket
 
-        monkeypatch.setattr(module.LoxoneConnection, "open", open_connection)
+        async def unexpected_open(self, session=None):
+            raise AssertionError("websocket opened before platform startup")
+
+        monkeypatch.setattr(module.LoxoneConnection, "prepare", prepare, raising=False)
+        monkeypatch.setattr(module.LoxoneConnection, "open", unexpected_open)
         await coordinator.async_config_entry_first_refresh()
-        assert coordinator.api.connection is websocket
+        assert coordinator.api.connection is None
+        assert coordinator.miniserver.serial == "serial-a"
 
     asyncio.run(scenario())
 
