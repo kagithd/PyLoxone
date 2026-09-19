@@ -41,18 +41,15 @@
       "options": {
         "use_existing": "Select existing area",
         "create": "Create new area",
-        "keep_ha": "Keep Home Assistant",
+        "keep_ha": "Keep current Home Assistant area",
         "apply_group": "Apply group choice",
         "clear": "Clear area"
       }
     },
     "engineering_area_rooms": {
       "fields": {
-        "group_key": {
-          "name": "Group key (do not edit)"
-        },
-        "device_key": {
-          "name": "Device key (do not edit)"
+        "row_id": {
+          "name": "Repair row"
         },
         "description": {
           "name": "Description"
@@ -70,11 +67,8 @@
     },
     "engineering_area_devices": {
       "fields": {
-        "group_key": {
-          "name": "Group key (do not edit)"
-        },
-        "device_key": {
-          "name": "Device key (do not edit)"
+        "row_id": {
+          "name": "Repair row"
         },
         "description": {
           "name": "Description"

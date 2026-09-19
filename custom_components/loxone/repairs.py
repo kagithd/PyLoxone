@@ -433,10 +433,6 @@ def _room_groups(conflicts: tuple[EngineeringAreaConflict, ...]) -> dict[str, tu
     }
 
 
-def _device_key(conflict: EngineeringAreaConflict) -> str:
-    return sha256(conflict.token.encode()).hexdigest()
-
-
 def _exact_rows(user_input: Any, field: str, key: str, expected: set[str], allowed: set[str]) -> list[dict[str, Any]]:
     """Treat native object rows as untrusted, including edits to identity fields."""
     if not isinstance(user_input, dict) or set(user_input) != {field}:
@@ -471,6 +467,19 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         self._active: _ActiveBinding | None = None
         self._room_input: dict[str, Any] | None = None
         self._decisions: tuple[EngineeringAreaDecision, ...] | None = None
+        self._room_rows: dict[str, str] = {}
+        self._device_rows: dict[str, str] = {}
+
+    def _bind_rows(self, conflicts: tuple[EngineeringAreaConflict, ...]) -> None:
+        """Bind opaque, flow-local row references to the verified conflict set."""
+        self._room_rows = {
+            f"room-{index}": room_uuid
+            for index, room_uuid in enumerate(_room_groups(conflicts), start=1)
+        }
+        self._device_rows = {
+            f"device-{index}": conflict.token
+            for index, conflict in enumerate(sorted(conflicts, key=lambda item: item.token), start=1)
+        }
 
     def _placement_descriptions(self) -> dict[str, str]:
         """Join only the current validated snapshot, never persisted conflict data."""
@@ -522,10 +531,11 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             return (reference + " · " + placement)[:200] if placement else reference
 
         if step == "rooms":
+            room_refs = {room_uuid: row_id for row_id, room_uuid in self._room_rows.items()}
             row_sets = {
                 "rooms": [
                     {
-                        "group_key": room,
+                        "row_id": room_refs[room],
                         "description": (
                             (_safe_text(members[0].desired_area_name) or "#" + sha256(room.encode()).hexdigest()[:8])
                             + " · "
@@ -537,10 +547,11 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 ]
             }
         else:
+            device_refs = {token: row_id for row_id, token in self._device_rows.items()}
             row_sets = {
                 field: [
                     {
-                        "device_key": _device_key(item),
+                        "row_id": device_refs[item.token],
                         "description": description(item),
                         "action": "apply_group" if item.room_uuid else "keep_ha",
                     }
@@ -554,10 +565,10 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             actions = {
                 "rooms": ["use_existing", "create", "keep_ha"],
                 "devices": ["apply_group", "keep_ha"],
-                "no_room_devices": ["keep_ha", "clear"],
+                "no_room_devices": ["use_existing", "create", "keep_ha", "clear"],
             }[field]
             fields = {
-                "group_key" if step == "rooms" else "device_key": {"required": True, "selector": TextSelector()},
+                "row_id": {"required": True, "selector": TextSelector()},
                 "description": {"selector": TextSelector()},
                 "action": {
                     "required": True,
@@ -569,11 +580,11 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                     ),
                 },
             }
-            if step == "rooms":
+            if step == "rooms" or field == "no_room_devices":
                 fields.update({"area_id": {"selector": AreaSelector()}, "area_name": {"selector": TextSelector()}})
             values = user_input.get(field, rows) if isinstance(user_input, dict) else rows
             if isinstance(values, list):
-                identity = "group_key" if step == "rooms" else "device_key"
+                identity = "row_id"
                 descriptions = {row[identity]: row["description"] for row in rows}
                 values = [
                     {**item, "description": descriptions[item[identity]]}
@@ -611,9 +622,9 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
         rows = _exact_rows(
             user_input,
             "rooms",
-            "group_key",
-            set(groups),
-            {"group_key", "description", "action", "area_id", "area_name"},
+            "row_id",
+            set(self._room_rows),
+            {"row_id", "description", "action", "area_id", "area_name"},
         )
         decisions = []
         names: set[str] = set()
@@ -632,11 +643,13 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             try:
                 decision = normalize_engineering_area_decision(
                     EngineeringAreaDecision(
-                        room_uuid=row["group_key"],
+                        room_uuid=self._room_rows[row["row_id"]],
                         action=action,
-                        area_id=row.get("area_id") or None,
-                        area_name=row.get("area_name") or None,
-                        conflict_tokens=tuple(item.token for item in groups[row["group_key"]]),
+                        area_id=(row.get("area_id") or None) if action == "use_existing" else None,
+                        area_name=(row.get("area_name") or None) if action == "create" else None,
+                        conflict_tokens=tuple(
+                            item.token for item in groups[self._room_rows[row["row_id"]]]
+                        ),
                     )
                 )
             except EngineeringSnapshotError:
@@ -656,9 +669,10 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
     def _validate_devices(
         self, user_input: dict[str, Any], conflicts: tuple[EngineeringAreaConflict, ...]
     ) -> tuple[EngineeringAreaDecision, ...]:
-        by_key = {_device_key(item): item for item in conflicts}
+        by_token = {item.token: item for item in conflicts}
+        by_row = {row_id: by_token[token] for row_id, token in self._device_rows.items()}
         memberships = {
-            field: {key for key, item in by_key.items() if bool(item.room_uuid) == (field == "devices")}
+            field: {row_id for row_id, item in by_row.items() if bool(item.room_uuid) == (field == "devices")}
             for field in ("devices", "no_room_devices")
         }
         memberships = {field: keys for field, keys in memberships.items() if keys}
@@ -670,18 +684,57 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 _exact_rows(
                     {field: user_input[field]},
                     field,
-                    "device_key",
+                    "row_id",
                     keys,
-                    {"device_key", "description", "action"},
+                    {"row_id", "description", "action", "area_id", "area_name"}
+                    if field == "no_room_devices"
+                    else {"row_id", "description", "action"},
                 )
             )
         actions = {}
+        no_room_decisions = []
+        names = {
+            ar.normalize_name(decision.area_name)
+            for decision in self._decisions
+            if decision.action == "create"
+        }
+        areas = ar.async_get(self.hass)
         for row in rows:
-            conflict = by_key[row["device_key"]]
-            allowed = {"apply_group", "keep_ha"} if conflict.room_uuid else {"keep_ha", "clear"}
-            if row["action"] not in allowed:
+            conflict = by_row[row["row_id"]]
+            action = row["action"] or "keep_ha"
+            allowed = {"apply_group", "keep_ha"} if conflict.room_uuid else {
+                "use_existing", "create", "keep_ha", "clear"
+            }
+            if action not in allowed or any(
+                row.get(field) is not None and not isinstance(row[field], str)
+                for field in ("area_id", "area_name")
+            ):
                 raise _FlowError(_INVALID_TARGET)
-            actions[conflict.token] = row["action"]
+            actions[conflict.token] = action
+            if conflict.room_uuid is not None:
+                continue
+            try:
+                decision = normalize_engineering_area_decision(
+                    EngineeringAreaDecision(
+                        room_uuid=None,
+                        action=action,
+                        area_id=(row.get("area_id") or None) if action == "use_existing" else None,
+                        area_name=(row.get("area_name") or None) if action == "create" else None,
+                        conflict_tokens=(conflict.token,),
+                    )
+                )
+            except EngineeringSnapshotError:
+                raise _FlowError(_INVALID_TARGET) from None
+            if decision.action == "use_existing" and areas.async_get_area(decision.area_id) is None:
+                raise _FlowError(_INVALID_TARGET)
+            if decision.action == "create":
+                normalized = ar.normalize_name(decision.area_name)
+                if normalized in names or any(
+                    ar.normalize_name(area.name) == normalized for area in areas.async_list_areas()
+                ):
+                    raise _FlowError(_AREA_COLLISION)
+                names.add(normalized)
+            no_room_decisions.append(decision)
         decisions = [
             replace(
                 decision,
@@ -689,11 +742,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
             )
             for decision in self._decisions
         ]
-        decisions.extend(
-            EngineeringAreaDecision(room_uuid=None, action=actions[item.token], conflict_tokens=(item.token,))
-            for item in sorted(conflicts, key=lambda item: item.token)
-            if item.room_uuid is None
-        )
+        decisions.extend(no_room_decisions)
         return tuple(decisions)
 
     async def _load(self, entry_id: str, active: _ActiveBinding) -> tuple[EngineeringAreaConflict, ...]:
@@ -736,6 +785,7 @@ class EngineeringAreaConflictFixFlow(RepairsFlow):
                 if not conflicts or _fingerprint(conflicts) != fingerprint:
                     _publish_conflicts(self.hass, entry_id, conflicts)
                     return self.async_abort(reason="conflict_changed")
+                self._bind_rows(conflicts)
                 if user_input is None:
                     if step == "rooms" and not _room_groups(conflicts):
                         self._decisions = ()

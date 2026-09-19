@@ -88,18 +88,15 @@
       "options": {
         "use_existing": "Vorhandenen Bereich auswählen",
         "create": "Neuen Bereich anlegen",
-        "keep_ha": "Home Assistant beibehalten",
+        "keep_ha": "Aktuellen Home-Assistant-Bereich beibehalten",
         "apply_group": "Gruppenentscheidung anwenden",
         "clear": "Bereich leeren"
       }
     },
     "engineering_area_rooms": {
       "fields": {
-        "group_key": {
-          "name": "Gruppenschlüssel (nicht ändern)"
-        },
-        "device_key": {
-          "name": "Geräteschlüssel (nicht ändern)"
+        "row_id": {
+          "name": "Reparaturzeile"
         },
         "description": {
           "name": "Beschreibung"
@@ -117,11 +114,8 @@
     },
     "engineering_area_devices": {
       "fields": {
-        "group_key": {
-          "name": "Gruppenschlüssel (nicht ändern)"
-        },
-        "device_key": {
-          "name": "Geräteschlüssel (nicht ändern)"
+        "row_id": {
+          "name": "Reparaturzeile"
         },
         "description": {
           "name": "Beschreibung"

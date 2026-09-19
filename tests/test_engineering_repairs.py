@@ -215,7 +215,7 @@ def test_placement_rows_join_current_snapshot_without_becoming_authority(monkeyp
         issue = next(iter(harness.registry.issues.values()))
         assert "Cabinet" not in repr(issue.data) + repr(issue.translation_placeholders) + repr(conflict)
         coordinator.engineering_snapshot = snapshot("Cabinet B")
-        devices = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        devices = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         description = _rows(devices, "devices")[0]["description"]
         assert "Cabinet B" in description and "Cabinet A" not in description and len(description) <= 200
         assert "Cabinet" not in repr(flow._decisions)
@@ -311,7 +311,7 @@ def test_step_one_groups_exact_room_identity_not_names(monkeypatch):
         form = await (await _open(harness)).async_step_init()
         assert form["step_id"] == "rooms"
         rows = _rows(form, "rooms")
-        assert {row["group_key"] for row in rows} == {"room-a", "room-b"}
+        assert {row["row_id"] for row in rows} == {"room-1", "room-2"}
         assert len(rows) == 2
         marker, selector = next(iter(form["data_schema"].schema.items()))
         assert marker.description == {"suggested_value": rows}
@@ -340,21 +340,45 @@ def test_step_one_skips_empty_room_groups(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_no_room_device_rows_allow_target_selection_without_exposing_ids(monkeypatch):
+    conflict = _conflict(room_uuid=None)
+    harness = _repairs_harness(monkeypatch, {"entry-a": [conflict]})
+
+    async def resolve(_hass, _entry_id, decisions, *, is_current):
+        assert is_current()
+        assert decisions[0].action == "use_existing"
+        assert decisions[0].area_id == "office"
+        harness.current["entry-a"] = []
+        return EngineeringBatchAreaResolutionResult(1, 0, "resolved")
+
+    monkeypatch.setattr(harness.module, "async_resolve_engineering_area_conflicts", resolve)
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_init()
+        row = _rows(form, "no_room_devices")[0]
+        assert row["row_id"] == "device-1"
+        assert conflict.device_identifier not in repr(form)
+        result = await flow.async_step_devices(
+            {"no_room_devices": [{**row, "action": "use_existing", "area_id": "office"}]}
+        )
+        assert result["type"] is data_entry_flow.FlowResultType.CREATE_ENTRY
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     "rows",
     [
         [],
-        [{"group_key": "unknown", "action": "keep_ha"}],
-        [{"group_key": "room-a", "action": "keep_ha"}] * 2,
-        [{"group_key": "room-a", "action": "use_existing"}],
-        [{"group_key": "room-a", "action": "use_existing", "area_id": "missing"}],
-        [{"group_key": "room-a", "action": "use_existing", "area_id": "office", "area_name": "New"}],
-        [{"group_key": "room-a", "action": "create", "area_name": " "}],
-        [{"group_key": "room-a", "action": "create", "area_name": "New", "area_id": "office"}],
-        [{"group_key": "room-a", "action": "keep_ha", "area_name": "New"}],
-        [{"group_key": "room-a", "action": "clear"}],
-        [{"group_key": ["room-a"], "action": "keep_ha"}],
-        [{"group_key": "room-a", "action": "keep_ha", "extra": "untrusted"}],
+        [{"row_id": "unknown", "action": "keep_ha"}],
+        [{"row_id": "room-1", "action": "keep_ha"}] * 2,
+        [{"row_id": "room-1", "action": "use_existing"}],
+        [{"row_id": "room-1", "action": "use_existing", "area_id": "missing"}],
+        [{"row_id": "room-1", "action": "create", "area_name": " "}],
+        [{"row_id": "room-1", "action": "clear"}],
+        [{"row_id": ["room-1"], "action": "keep_ha"}],
+        [{"row_id": "room-1", "action": "keep_ha", "extra": "untrusted"}],
     ],
 )
 def test_step_one_invalid_rows_preserve_input(monkeypatch, rows):
@@ -372,7 +396,7 @@ def test_step_one_invalid_rows_preserve_input(monkeypatch, rows):
 
 def test_create_collision_preserves_input_and_requires_existing_selection(monkeypatch):
     harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
-    rows = [{"group_key": "room-a", "action": "create", "area_name": "  OFFICE  "}]
+    rows = [{"row_id": "room-1", "action": "create", "area_name": "  OFFICE  "}]
 
     async def scenario():
         form = await (await _open(harness)).async_step_rooms({"rooms": rows})
@@ -389,9 +413,24 @@ def test_step_one_blank_default_action_keeps_home_assistant(monkeypatch):
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": ""}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": ""}]})
         assert form["step_id"] == "devices"
         assert flow._decisions[0].action == "keep_ha"
+
+    asyncio.run(scenario())
+
+
+def test_keep_ha_ignores_stale_target_fields(monkeypatch):
+    harness = _repairs_harness(monkeypatch, {"entry-a": [_conflict()]})
+
+    async def scenario():
+        flow = await _open(harness)
+        form = await flow.async_step_rooms(
+            {"rooms": [{"row_id": "room-1", "action": "keep_ha", "area_id": "stale", "area_name": "Stale"}]}
+        )
+        assert form["step_id"] == "devices"
+        assert flow._decisions[0].area_id is None
+        assert flow._decisions[0].area_name is None
 
     asyncio.run(scenario())
 
@@ -420,7 +459,7 @@ def test_mixed_room_overrides_and_no_room_build_exact_batch(monkeypatch):
     async def scenario():
         flow = await _open(harness)
         form = await flow.async_step_rooms(
-            {"rooms": [{"group_key": "room-a", "action": "use_existing", "area_id": "office"}]}
+            {"rooms": [{"row_id": "room-1", "action": "use_existing", "area_id": "office"}]}
         )
         assert form["step_id"] == "devices"
         assert {marker.schema for marker in form["data_schema"].schema} == {"devices", "no_room_devices"}
@@ -429,7 +468,11 @@ def test_mixed_room_overrides_and_no_room_build_exact_batch(monkeypatch):
         assert len(rows) == len(no_room_rows) == 2
         for marker, selector in form["data_schema"].schema.items():
             actions = selector.serialize()["selector"]["object"]["fields"]["action"]["selector"]["select"]["options"]
-            assert actions == (["apply_group", "keep_ha"] if marker.schema == "devices" else ["keep_ha", "clear"])
+            assert actions == (
+                ["apply_group", "keep_ha"]
+                if marker.schema == "devices"
+                else ["use_existing", "create", "keep_ha", "clear"]
+            )
         for row, action in zip(rows + no_room_rows, ("apply_group", "keep_ha", "keep_ha", "clear"), strict=True):
             row["action"] = action
         result = await flow.async_step_devices({"devices": rows, "no_room_devices": no_room_rows})
@@ -445,7 +488,7 @@ def test_device_membership_and_action_validation_preserves_input(monkeypatch, ca
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         rows = _rows(form, "devices")
         no_room_rows = _rows(form, "no_room_devices")
         if case == "missing":
@@ -453,11 +496,11 @@ def test_device_membership_and_action_validation_preserves_input(monkeypatch, ca
         elif case == "duplicate":
             rows.append(rows[0].copy())
         elif case == "unknown":
-            rows[0]["device_key"] = "f" * 64
+            rows[0]["row_id"] = "device-999"
         elif case == "no_room_group":
             no_room_rows[0]["action"] = "apply_group"
         elif case == "cross_list":
-            no_room_rows[0]["device_key"] = rows[0]["device_key"]
+            no_room_rows[0]["row_id"] = rows[0]["row_id"]
         else:
             rows[0]["action"] = "clear"
         form = await flow.async_step_devices({"devices": rows, "no_room_devices": no_room_rows})
@@ -484,7 +527,7 @@ def test_real_manager_completes_only_after_empty_reload(monkeypatch, tmp_path, r
         issue_id = next(iter(ir.async_get(harness.hass).issues))[1]
         form = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_id})
         form = await harness.manager.async_configure(
-            form["flow_id"], {"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}
+            form["flow_id"], {"rooms": [{"row_id": "room-1", "action": "keep_ha"}]}
         )
         result = await harness.manager.async_configure(form["flow_id"], {"devices": _rows(form, "devices")})
         issues = ir.async_get(harness.hass).issues
@@ -517,7 +560,7 @@ def test_real_manager_resolved_result_preserves_original_remaining_conflict(monk
         issue_data = registry.issues[issue_key].data.copy()
         form = await harness.manager.async_init(DOMAIN, data={"issue_id": issue_key[1]})
         form = await harness.manager.async_configure(
-            form["flow_id"], {"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}
+            form["flow_id"], {"rooms": [{"row_id": "room-1", "action": "keep_ha"}]}
         )
         result = await harness.manager.async_configure(form["flow_id"], {"devices": _rows(form, "devices")})
 
@@ -536,7 +579,7 @@ def test_old_flow_resynchronizes_changed_fingerprint_without_deleting_new(monkey
         await flow.async_step_init()
         new = _conflict(token="b" * 64)
         harness.current["entry-a"] = [new]
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         assert form["reason"] == "conflict_changed"
         assert len(harness.registry.issues) == 1
         assert _fingerprint(new) in next(iter(harness.registry.issues))[1]
@@ -566,7 +609,7 @@ def test_flow_rechecks_binding_at_await_and_between_steps(monkeypatch, change):
             return tuple(harness.current["entry-a"])
 
         monkeypatch.setattr(harness.module, "async_load_engineering_area_conflicts", load)
-        result = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        result = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         assert result["reason"] == "entry_unavailable"
         assert len(harness.registry.issues) == 1
 
@@ -611,7 +654,7 @@ def test_replaced_binding_reconciles_new_issue_only_after_old_lock_released(monk
         )
         # A recursive acquisition under the old lock would time out here.
         result = await asyncio.wait_for(
-            flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]}), 1
+            flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]}), 1
         )
         assert result["reason"] == "entry_unavailable"
         assert len(harness.registry.issues) == 1
@@ -635,7 +678,7 @@ def test_long_area_resolution_does_not_block_repair_sync(monkeypatch):
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         resolution = asyncio.create_task(flow.async_step_devices({"devices": _rows(form, "devices")}))
         await entered.wait()
         try:
@@ -683,7 +726,7 @@ def test_bounded_batch_outcomes_do_not_silently_complete(monkeypatch, reason):
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         result = await flow.async_step_devices({"devices": _rows(form, "devices")})
         assert result["type"] is not data_entry_flow.FlowResultType.CREATE_ENTRY
         assert len(harness.registry.issues) == 1
@@ -697,7 +740,7 @@ def test_falsey_target_values_are_not_silently_discarded(monkeypatch, value):
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha", "area_id": value}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha", "area_id": value}]})
         assert form["step_id"] == "rooms" and form["errors"]
 
     asyncio.run(scenario())
@@ -713,7 +756,7 @@ def test_registry_validation_exception_never_becomes_an_error_identifier(monkeyp
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "create", "area_name": "New"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "create", "area_name": "New"}]})
         assert "private-storage-detail" not in repr(form)
 
     asyncio.run(scenario())
@@ -729,7 +772,7 @@ def test_flow_cancellation_propagates_and_preserves_issue(monkeypatch):
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         before = set(harness.registry.issues)
         with pytest.raises(asyncio.CancelledError):
             await flow.async_step_devices({"devices": _rows(form, "devices")})
@@ -757,7 +800,7 @@ def test_batch_success_never_completes_without_verified_final_read(monkeypatch, 
 
     async def scenario():
         flow = await _open(harness)
-        form = await flow.async_step_rooms({"rooms": [{"group_key": "room-a", "action": "keep_ha"}]})
+        form = await flow.async_step_rooms({"rooms": [{"row_id": "room-1", "action": "keep_ha"}]})
         result = await flow.async_step_devices({"devices": _rows(form, "devices")})
         assert result["type"] is data_entry_flow.FlowResultType.ABORT
         assert "private-storage-detail" not in repr(result)
