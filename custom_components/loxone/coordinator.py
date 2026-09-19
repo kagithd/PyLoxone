@@ -448,6 +448,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                         impact_published_generation=state.impact_published_generation,
                         managed_area_ids=state.managed_area_ids,
                         room_area_mappings=state.room_area_mappings,
+                        device_area_fallbacks=state.device_area_fallbacks,
                         room_area_mapping_scope=state.room_area_mapping_scope,
                         pending_area_batch=state.pending_area_batch,
                     )

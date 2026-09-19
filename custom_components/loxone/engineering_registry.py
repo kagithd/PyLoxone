@@ -35,7 +35,7 @@ from .engineering_snapshot import (
     validate_engineering_presentation,
     validate_engineering_snapshot,
 )
-from .engineering_topology import NodeKind, ResolutionStatus
+from .engineering_topology import NodeKind, ResolvedEngineeringNode, ResolutionStatus
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -92,6 +92,7 @@ class EngineeringRegistryMetadata:
     provider_identifier: str | None = None
     room_area_mappings: Mapping[str, str] = field(default_factory=dict)
     entry_id: str | None = None
+    device_area_fallbacks: Mapping[str, str | None] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Detach managed metadata from mutable caller-owned mappings."""
@@ -101,6 +102,11 @@ class EngineeringRegistryMetadata:
             MappingProxyType(dict(sorted(self.managed_area_ids.items()))),
         )
         object.__setattr__(self, "room_area_mappings", MappingProxyType(dict(sorted(self.room_area_mappings.items()))))
+        object.__setattr__(
+            self,
+            "device_area_fallbacks",
+            MappingProxyType(dict(sorted(self.device_area_fallbacks.items()))),
+        )
 
     @classmethod
     def empty(cls) -> EngineeringRegistryMetadata:
@@ -127,6 +133,8 @@ class EngineeringDeviceOperation:
     area_process_token: str | None = None
     room_uuid: str | None = None
     mapped_area_id: str | None = None
+    area_sync_enabled: bool = True
+    area_fallback_authorized: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -640,7 +648,7 @@ def _resolution_desired_area_id(
     desired_area_id = conflict.desired_area_id
     if conflict.desired_area_name is None:
         return True, desired_area_id
-    desired_area = area_registry.async_get_area_by_name(conflict.desired_area_name)
+    desired_area = _unique_area_by_name(area_registry, conflict.desired_area_name)
     if desired_area is None:
         return False, None
     if desired_area_id is not None and desired_area.id != desired_area_id:
@@ -832,6 +840,15 @@ def _batch_area_by_id(area_registry: object, area_id: str | None) -> object | No
     return area_registry.async_get_area(area_id) if area_id is not None else None
 
 
+def _unique_area_by_name(area_registry: object, name: str | None) -> object | None:
+    """Resolve a normalized name only when exactly one existing area matches."""
+    if not name:
+        return None
+    normalized = ar.normalize_name(name)
+    matches = [area for area in area_registry.async_list_areas() if ar.normalize_name(area.name) == normalized]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _batch_validate_targets(hass: HomeAssistant, groups: tuple[EngineeringAreaBatchGroup, ...]) -> str | None:
     """Preflight every selected area before any group may mutate a registry."""
     areas = ar.async_get(hass)
@@ -858,7 +875,7 @@ def _batch_validate_targets(hass: HomeAssistant, groups: tuple[EngineeringAreaBa
     return None
 
 
-def _batch_validate_members(  # noqa: PLR0911 -- independent fail-closed identity fences.
+def _batch_validate_members(  # noqa: PLR0911, PLR0912 -- independent fail-closed identity fences.
     hass: HomeAssistant,
     stored: StoredEngineeringState,
     area_state: _AreaRegistryState,
@@ -893,6 +910,11 @@ def _batch_validate_members(  # noqa: PLR0911 -- independent fail-closed identit
             if replay and member.completed and member.device_identifier not in area_state.conflicts
         }
         if current_tokens | retired != set(decision.conflict_tokens):
+            return "stale_conflict"
+        if any(
+            (node := owners.get(member.device_identifier)) is None or not _area_sync_enabled(node)
+            for member in group.members
+        ):
             return "stale_conflict"
         for member in group.members:
             node = owners.get(member.device_identifier)
@@ -1018,23 +1040,32 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
         replacement = _batch_prepare(stored, area_state, entry_id, decisions)
         obsolete = set()
         snapshot = stored.snapshot
+        owners = {}
         if (
             snapshot is not None
-            and snapshot.generation_id != batch.generation_id
             and (snapshot.source.entry_id, snapshot.source.provider_identifier)
             == (batch.entry_id, batch.provider_identifier)
         ):
-            # Only a newer source-scoped inventory can terminally retire old
-            # members. Missing registry devices or conflict tokens are not proof.
             owners = {
-                node.device_identifier for node in snapshot.nodes if node.element.key in _eligible_device_keys(snapshot)
+                node.device_identifier: node
+                for node in snapshot.nodes
+                if node.element.key in _eligible_device_keys(snapshot)
             }
-            obsolete = {
+            obsolete.update(
                 member.device_identifier
                 for group in batch.groups
                 for member in group.members
-                if member.device_identifier not in owners
-            }
+                if (node := owners.get(member.device_identifier)) is not None
+                and not _area_sync_enabled(node)
+            )
+            if snapshot.generation_id != batch.generation_id:
+                # Only a newer inventory proves that an absent owner is obsolete.
+                obsolete.update(
+                    member.device_identifier
+                    for group in batch.groups
+                    for member in group.members
+                    if member.device_identifier not in owners
+                )
         outstanding = {
             member.device_identifier
             for group in batch.groups
@@ -1229,25 +1260,37 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
                 baseline=None
                 if keep
                 else _ManagedAreaBaseline(member.device_identifier, _batch_target(group), _AREA_PROCESS_TOKEN),
-                release=keep,
+                release=keep and group.decision.room_uuid is not None,
             )
         await _async_store_area_state(hass, entry_id, area_state, is_current=is_current)
         _ensure_resolution_current(is_current)
         if (reason := await checkpoint()) is not None:
             return await withdraw_unverified_mapping(reason)
         mappings = dict(stored.room_area_mappings)
+        fallbacks = dict(stored.device_area_fallbacks)
         selected = any(not _batch_keep(group, member) for member in group.members)
         if selected and group.decision.room_uuid is not None:
             if group.decision.action in {"use_existing", "create"}:
                 mappings[group.decision.room_uuid] = _batch_target(group)
             elif group.decision.action == "clear":
                 mappings.pop(group.decision.room_uuid, None)
+        if group.decision.room_uuid is None:
+            member = group.members[0]
+            if selected and group.decision.action in {"use_existing", "create"}:
+                fallbacks[member.device_identifier] = _batch_target(group)
+            else:
+                fallbacks[member.device_identifier] = None
         managed = dict(stored.managed_area_ids)
         for member in group.members:
             managed.pop(member.device_identifier, None)
             if not _batch_keep(group, member) and _batch_target(group) is not None:
                 managed[member.device_identifier] = _batch_target(group)
-        stored = replace(stored, room_area_mappings=mappings, managed_area_ids=managed)
+        stored = replace(
+            stored,
+            room_area_mappings=mappings,
+            device_area_fallbacks=fallbacks,
+            managed_area_ids=managed,
+        )
         group = replace(group, mapping_committed=True)
         batch = replace(batch, groups=(*batch.groups[:group_index], group, *batch.groups[group_index + 1 :]))
         if (reason := await persist()) is not None:
@@ -1386,12 +1429,22 @@ def _eligible_device_keys(snapshot: EngineeringSnapshot) -> frozenset[str]:
     )
 
 
+def _area_sync_enabled(node: ResolvedEngineeringNode) -> bool:
+    """Return whether one resolved external hardware node may own an HA area."""
+    return (
+        not node.sensitive
+        and node.resolution_status is ResolutionStatus.RESOLVED
+        and node.kind in {NodeKind.BRIDGE, NodeKind.PHYSICAL_DEVICE}
+    )
+
+
 def registry_metadata_from_snapshot(
     snapshot: EngineeringSnapshot,
     *,
     managed_area_ids: Mapping[str, str] | None = None,
     applied_generation: str | None = None,
     room_area_mappings: Mapping[str, str] | None = None,
+    device_area_fallbacks: Mapping[str, str | None] | None = None,
 ) -> EngineeringRegistryMetadata:
     """Derive sanitized active identifiers and rooms from a validated snapshot."""
     validate_engineering_snapshot(snapshot)
@@ -1411,6 +1464,7 @@ def registry_metadata_from_snapshot(
         provider,
         room_area_mappings or {},
         snapshot.source.entry_id,
+        device_area_fallbacks or {},
     )
 
 
@@ -1509,10 +1563,24 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
             if previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
             else None
         )
+        same_source = (
+            previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
+        )
+        explicit_fallback = same_source and identifier in previous.device_area_fallbacks
+        fallback_authorized = (
+            explicit_fallback
+            and _area_sync_enabled(node)
+            and current_area is not None
+            and current_area == previous.device_area_fallbacks[identifier]
+        )
+        if fallback_authorized:
+            baseline = _ManagedAreaBaseline(identifier, current_area, _AREA_PROCESS_TOKEN)
+        if node.element.room_uuid is None and _area_sync_enabled(node):
+            mapped_area_id = previous.device_area_fallbacks.get(identifier) if same_source else None
         desired_area = (
             _batch_area_by_id(area_registry, mapped_area_id)
             if mapped_area_id is not None
-            else area_registry.async_get_area_by_name(node.element.room)
+            else _unique_area_by_name(area_registry, node.element.room)
             if node.element.room
             else None
         )
@@ -1534,7 +1602,9 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
             _ManagedAreaBaseline(identifier, previous_area, None) if previous_area is not None else None
         )
         baseline_area = baseline.area_id if baseline is not None else None
-        released = identifier in area_state.released_identifiers
+        released = identifier in area_state.released_identifiers or (
+            node.element.room_uuid is None and explicit_fallback and mapped_area_id is None
+        )
         allowed, conflict_reason = _area_operation_policy(
             baseline,
             existing_conflict,
@@ -1542,6 +1612,14 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
             released=released,
             intent_replay=intent_replay,
         )
+        if (
+            _area_sync_enabled(node)
+            and node.element.room_uuid is None
+            and not explicit_fallback
+            and not released
+        ):
+            allowed = False
+            conflict_reason = "area_assignment_unverified"
         if (mapped_area_id is not None or node.element.room) and desired_area is None:
             allowed = False
             conflict_reason = "area_assignment_unverified"
@@ -1571,6 +1649,8 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
                 area_process_token=_AREA_PROCESS_TOKEN,
                 room_uuid=node.element.room_uuid,
                 mapped_area_id=mapped_area_id,
+                area_sync_enabled=_area_sync_enabled(node),
+                area_fallback_authorized=fallback_authorized,
             )
         )
 
@@ -1625,11 +1705,17 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
             )
         )
 
+    room_area_mappings = (
+        dict(previous.room_area_mappings)
+        if previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
+        else {}
+    )
     metadata = registry_metadata_from_snapshot(
         snapshot,
         managed_area_ids=previous.managed_area_ids,
         applied_generation=snapshot.generation_id,
-        room_area_mappings=previous.room_area_mappings
+        room_area_mappings=room_area_mappings,
+        device_area_fallbacks=previous.device_area_fallbacks
         if previous.provider_identifier == snapshot.source.provider_identifier and previous.entry_id == entry_id
         else {},
     )
@@ -1648,7 +1734,7 @@ def _desired_area_id(area_registry: object, room: str | None, mapped_area_id: st
     area = (
         _batch_area_by_id(area_registry, mapped_area_id)
         if mapped_area_id is not None
-        else area_registry.async_get_area_by_name(room)
+        else _unique_area_by_name(area_registry, room)
         if room
         else None
     )
@@ -1667,7 +1753,8 @@ def _candidate_area_intents(
     intents: dict[str, _AreaIntent] = {}
     for operation in plan.device_operations:
         if (
-            not operation.area_update_allowed
+            not operation.area_sync_enabled
+            or not operation.area_update_allowed
             or operation.area_process_token != _AREA_PROCESS_TOKEN
             or operation.area_released
             or operation.identifier in prior_state.released_identifiers
@@ -1707,9 +1794,14 @@ def _candidate_area_intents(
         )
         original_state_unchanged = (current is None and operation.expected_area_id is None) or (
             current_area == operation.expected_area_id
-            and (baseline := prior_state.baselines.get(operation.identifier)) is not None
-            and baseline.process_token == _AREA_PROCESS_TOKEN
-            and baseline.area_id == current_area
+            and (
+                operation.area_fallback_authorized
+                or (
+                    (baseline := prior_state.baselines.get(operation.identifier)) is not None
+                    and baseline.process_token == _AREA_PROCESS_TOKEN
+                    and baseline.area_id == current_area
+                )
+            )
         )
         if compatibility_replay or original_state_unchanged:
             intents[operation.identifier] = _AreaIntent(
@@ -1732,6 +1824,8 @@ def _recheck_area_intents(
     operations = {item.identifier: item for item in plan.device_operations}
     for identifier, intent in intents.items():
         operation = operations[identifier]
+        if not operation.area_sync_enabled:
+            continue
         current = device_registry.async_get_device_by_identifier(
             (DOMAIN, identifier),
             operation.entry_id,
@@ -1829,13 +1923,13 @@ def _apply_device_properties(
         desired_area = (
             _batch_area_by_id(area_registry, operation.mapped_area_id)
             if operation.mapped_area_id is not None
-            else area_registry.async_get_area_by_name(operation.room)
+            else _unique_area_by_name(area_registry, operation.room)
             if operation.room
             else None
         )
         desired_area_id = desired_area.id if desired_area is not None else None
         target_resolved = desired_area is not None or not (operation.room or operation.mapped_area_id)
-        if operation.identifier in area_intents and target_resolved:
+        if operation.area_sync_enabled and operation.identifier in area_intents and target_resolved:
             if getattr(device, "area_id", None) != desired_area_id:
                 changes["area_id"] = desired_area_id
             if desired_area_id is not None and operation.identifier in plan.metadata.active_device_identifiers:
@@ -1927,7 +2021,7 @@ def _refresh_area_conflict(
     )
 
 
-def _reconcile_area_state_after_apply(
+def _reconcile_area_state_after_apply(  # noqa: PLR0912, PLR0915 -- explicit area authority state machine.
     plan: EngineeringRegistryPlan,
     state: _AreaRegistryState,
     intents: Mapping[str, _AreaIntent],
@@ -1948,8 +2042,18 @@ def _reconcile_area_state_after_apply(
             conflicts.pop(identifier, None)
             remaining_intents.pop(identifier, None)
             continue
+        if not operation.area_sync_enabled:
+            baselines.pop(identifier, None)
+            conflicts.pop(identifier, None)
+            remaining_intents.pop(identifier, None)
+            continue
         if identifier in released:
             baselines.pop(identifier, None)
+            remaining_intents.pop(identifier, None)
+            continue
+        if operation.area_released:
+            baselines.pop(identifier, None)
+            conflicts.pop(identifier, None)
             remaining_intents.pop(identifier, None)
             continue
         device = device_registry.async_get_device_by_identifier((DOMAIN, identifier), operation.entry_id)
@@ -2180,9 +2284,18 @@ async def async_apply_engineering_registry_plan(
                 if latest.snapshot.generation_id != plan.generation_id:
                     raise EngineeringRegistryError(_STATE_PLAN_MISMATCH)
                 committed_state = latest
+                current_fallbacks = dict(latest.device_area_fallbacks)
+                for node in latest.snapshot.nodes:
+                    if _area_sync_enabled(node) and node.element.room_uuid is not None:
+                        current_fallbacks.pop(node.device_identifier, None)
+                if current_fallbacks != latest.device_area_fallbacks:
+                    committed_state = replace(latest, device_area_fallbacks=current_fallbacks)
                 # A batch may have finished while this caller waited for the
                 # entry lock. Replan against its new mappings and overrides.
-                if plan.metadata.room_area_mappings != latest.room_area_mappings:
+                if (
+                    plan.metadata.room_area_mappings != latest.room_area_mappings
+                    or plan.metadata.device_area_fallbacks != current_fallbacks
+                ):
                     plan = await async_plan_engineering_registry_sync(
                         hass,
                         _plan_entry_id(plan),
@@ -2191,10 +2304,31 @@ async def async_apply_engineering_registry_plan(
                             latest.snapshot,
                             managed_area_ids=latest.managed_area_ids,
                             room_area_mappings=latest.room_area_mappings,
+                            device_area_fallbacks=latest.device_area_fallbacks,
                             applied_generation=latest.registry_applied_generation,
                         ),
                     )
+                plan = replace(plan, metadata=replace(plan.metadata, device_area_fallbacks=current_fallbacks))
         return await _async_apply_engineering_registry_plan(hass, plan, committed_state=committed_state)
+
+
+def _verified_room_mappings(
+    plan: EngineeringRegistryPlan,
+    managed_areas: Mapping[str, str],
+    area_registry: object,
+) -> dict[str, str]:
+    """Establish room identity only after verifying an actual managed assignment."""
+    mappings = dict(plan.metadata.room_area_mappings)
+    for operation in plan.device_operations:
+        if (
+            operation.area_sync_enabled
+            and operation.room_uuid is not None
+            and operation.room_uuid not in mappings
+            and (area := _unique_area_by_name(area_registry, operation.room)) is not None
+            and managed_areas.get(operation.identifier) == area.id
+        ):
+            mappings[operation.room_uuid] = area.id
+    return mappings
 
 
 async def _async_apply_engineering_registry_plan(
@@ -2246,6 +2380,7 @@ async def _async_apply_engineering_registry_plan(
     metadata = replace(
         plan.metadata,
         managed_area_ids=managed_areas,
+        room_area_mappings=_verified_room_mappings(plan, managed_areas, area_registry),
         applied_generation=plan.generation_id,
     )
     result = EngineeringRegistrySyncResult(
@@ -2263,6 +2398,8 @@ async def _async_apply_engineering_registry_plan(
                 committed_state,
                 registry_applied_generation=plan.generation_id,
                 managed_area_ids=managed_areas,
+                room_area_mappings=metadata.room_area_mappings,
+                device_area_fallbacks=plan.metadata.device_area_fallbacks,
             ),
         )
         rechecked_state, rechecked_managed = _reconcile_area_state_after_apply(
@@ -2275,7 +2412,11 @@ async def _async_apply_engineering_registry_plan(
         if rechecked_state != area_state:
             await _async_store_area_state(hass, entry_id, rechecked_state)
             managed_areas = rechecked_managed
-            metadata = replace(metadata, managed_area_ids=managed_areas)
+            metadata = replace(
+                metadata,
+                managed_area_ids=managed_areas,
+                room_area_mappings=_verified_room_mappings(plan, managed_areas, area_registry),
+            )
             result = replace(result, metadata=metadata)
             await async_store_engineering_state(
                 hass,
@@ -2283,6 +2424,8 @@ async def _async_apply_engineering_registry_plan(
                     committed_state,
                     registry_applied_generation=plan.generation_id,
                     managed_area_ids=managed_areas,
+                    room_area_mappings=metadata.room_area_mappings,
+                    device_area_fallbacks=plan.metadata.device_area_fallbacks,
                 ),
             )
     return result

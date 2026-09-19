@@ -223,6 +223,22 @@ def test_room_state_is_detached_scoped_and_integrity_checked():
         stored_state_from_dict(wire, "entry-a")
 
 
+def test_device_area_fallbacks_round_trip_and_require_source_scope():
+    """Device fallbacks are durable and remain provider scoped."""
+    state = StoredEngineeringState(
+        snapshot=make_snapshot(),
+        device_area_fallbacks={"serial-a:device": "area-a"},
+    )
+
+    restored = stored_state_from_dict(stored_state_to_dict(state), "entry-a")
+
+    assert restored.device_area_fallbacks == {"serial-a:device": "area-a"}
+    with pytest.raises(EngineeringSnapshotError):
+        stored_state_to_dict(
+            replace(state, device_area_fallbacks={"foreign:device": "area-a"})
+        )
+
+
 def _rehash(snapshot):
     """Recompute integrity tokens after an intentional semantic mutation."""
     return replace(
@@ -1199,7 +1215,7 @@ def _real_engineering_store(hass, entry_id="entry-a", **kwargs):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("old_version", [1, 2])
+@pytest.mark.parametrize("old_version", [1, 2, 3])
 async def test_real_store_is_atomic_acknowledged_and_migrates_legacy(tmp_path, old_version):
     """Cold HA Store migration preserves old safe hashes and recovery cursors."""
     hass = HomeAssistant(str(tmp_path))
@@ -1219,6 +1235,22 @@ async def test_real_store_is_atomic_acknowledged_and_migrates_legacy(tmp_path, o
             "pending_impact_plan": {"generation_id": snapshot.generation_id, "impacts": []},
             "managed_area_ids": {"serial-a:device": "area-a"},
         }
+    if old_version == 3:
+        from custom_components.loxone import engineering_snapshot as snapshots
+
+        legacy = stored_state_to_dict(
+            StoredEngineeringState(snapshot=snapshot, room_area_mappings={"room-a": "area-a"})
+        )
+        legacy["schema_version"] = 3
+        legacy.pop("device_area_fallbacks")
+        legacy["area_state_digest"] = snapshots._canonical_digest(
+            "safe",
+            {
+                "room_area_mappings": legacy["room_area_mappings"],
+                "room_area_mapping_scope": legacy["room_area_mapping_scope"],
+                "pending_area_batch": legacy["pending_area_batch"],
+            },
+        )
     legacy_store = Store(
         hass,
         old_version,
@@ -1246,6 +1278,9 @@ async def test_real_store_is_atomic_acknowledged_and_migrates_legacy(tmp_path, o
         assert restored.impact_published_generation == snapshot.generation_id
         assert restored.pending_impact_plan.generation_id == snapshot.generation_id
         assert restored.managed_area_ids == {"serial-a:device": "area-a"}
+    if old_version == 3:
+        assert restored.room_area_mappings == {"room-a": "area-a"}
+        assert restored.device_area_fallbacks == {}
 
 
 @pytest.mark.anyio

@@ -57,7 +57,8 @@ if TYPE_CHECKING:
 
     from homeassistant.core import HomeAssistant
 
-ENGINEERING_SNAPSHOT_STORAGE_VERSION = 3
+ENGINEERING_SNAPSHOT_STORAGE_VERSION = 4
+_LEGACY_AREA_STATE_VERSION = 3
 _PREVIOUS_STATE_VERSION = 2
 _MAX_AREA_NAME_LENGTH = 160
 _ROOM_MAPPING_SCOPE_LENGTH = 2
@@ -216,6 +217,7 @@ class StoredEngineeringState:
     impact_published_generation: str | None = None
     managed_area_ids: Mapping[str, str] = field(default_factory=dict)
     room_area_mappings: Mapping[str, str] = field(default_factory=dict)
+    device_area_fallbacks: Mapping[str, str | None] = field(default_factory=dict)
     room_area_mapping_scope: tuple[str, str] | None = None
     pending_area_batch: EngineeringAreaBatchIntent | None = None
 
@@ -227,6 +229,11 @@ class StoredEngineeringState:
             MappingProxyType(dict(sorted(self.managed_area_ids.items()))),
         )
         object.__setattr__(self, "room_area_mappings", MappingProxyType(dict(sorted(self.room_area_mappings.items()))))
+        object.__setattr__(
+            self,
+            "device_area_fallbacks",
+            MappingProxyType(dict(sorted(self.device_area_fallbacks.items()))),
+        )
         scope = self.room_area_mapping_scope
         if scope is None and self.room_area_mappings and self.snapshot is not None:
             scope = (self.snapshot.source.entry_id, self.snapshot.source.provider_identifier)
@@ -1343,7 +1350,13 @@ _STATE_FIELDS = frozenset(
     }
 )
 _AREA_STATE_FIELDS = frozenset(
-    {"room_area_mappings", "room_area_mapping_scope", "pending_area_batch", "area_state_digest"}
+    {
+        "room_area_mappings",
+        "room_area_mapping_scope",
+        "device_area_fallbacks",
+        "pending_area_batch",
+        "area_state_digest",
+    }
 )
 
 
@@ -1365,8 +1378,8 @@ def normalize_engineering_area_decision(decision: EngineeringAreaDecision) -> En
         or not set(keep) <= set(tokens)
     ):
         raise EngineeringSnapshotError("invalid area token membership")
-    if decision.room_uuid is None and (len(tokens) != 1 or keep or decision.action not in {"keep_ha", "clear"}):
-        raise EngineeringSnapshotError("unknown room requires a single keep or clear")
+    if decision.room_uuid is None and (len(tokens) != 1 or keep):
+        raise EngineeringSnapshotError("unknown room requires a single device decision")
     if decision.action == "use_existing":
         _required_identifier(decision.area_id, "selected area ID")
         if decision.area_name is not None:
@@ -1499,6 +1512,7 @@ def _area_state_payload(state: StoredEngineeringState) -> dict[str, Any]:
     return {
         "room_area_mappings": dict(state.room_area_mappings),
         "room_area_mapping_scope": list(state.room_area_mapping_scope) if state.room_area_mapping_scope else None,
+        "device_area_fallbacks": dict(state.device_area_fallbacks),
         "pending_area_batch": _batch_to_dict(state.pending_area_batch) if state.pending_area_batch else None,
     }
 
@@ -1512,6 +1526,7 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
             or state.impact_published_generation is not None
             or state.managed_area_ids
             or state.room_area_mappings
+            or state.device_area_fallbacks
             or state.room_area_mapping_scope is not None
             or state.pending_area_batch is not None
         ):
@@ -1548,6 +1563,10 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
     for room_uuid, area_id in state.room_area_mappings.items():
         _required_identifier(room_uuid, "mapped room UUID")
         _required_identifier(area_id, "mapped area ID")
+    for identifier, area_id in state.device_area_fallbacks.items():
+        _validate_scope(_required_identifier(identifier, "fallback device identifier"), provider)
+        if area_id is not None:
+            _required_identifier(area_id, "fallback area")
     if state.pending_area_batch is not None:
         batch = _batch_from_dict(_batch_to_dict(state.pending_area_batch))
         if (batch.entry_id, batch.provider_identifier) != scope:
@@ -1559,7 +1578,7 @@ def _validate_state(state: StoredEngineeringState, entry_id: str | None = None) 
 
 
 def stored_state_to_dict(state: StoredEngineeringState) -> dict[str, Any]:
-    """Encode a v3 envelope; area-state digest is separate from read generation."""
+    """Encode a v4 envelope; area-state digest is separate from read generation."""
     _validate_state(state)
     return {
         "schema_version": ENGINEERING_SNAPSHOT_STORAGE_VERSION,
@@ -1581,9 +1600,15 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
         _validate_state(state, entry_id)
         return state
     version = value.get("schema_version") if isinstance(value, dict) else None
-    fields = _STATE_FIELDS if version == _PREVIOUS_STATE_VERSION else _STATE_FIELDS | _AREA_STATE_FIELDS
+    fields = (
+        _STATE_FIELDS
+        if version == _PREVIOUS_STATE_VERSION
+        else _STATE_FIELDS | (_AREA_STATE_FIELDS - {"device_area_fallbacks"})
+        if version == _LEGACY_AREA_STATE_VERSION
+        else _STATE_FIELDS | _AREA_STATE_FIELDS
+    )
     data = _require_dict(value, "stored state", required=fields)
-    if data["schema_version"] not in {2, ENGINEERING_SNAPSHOT_STORAGE_VERSION}:
+    if data["schema_version"] not in {2, 3, ENGINEERING_SNAPSHOT_STORAGE_VERSION}:
         raise EngineeringSnapshotError("stored state schema_version is invalid")
     raw_snapshot = data["snapshot"]
     snapshot = None if raw_snapshot is None else snapshot_from_dict(raw_snapshot)
@@ -1610,6 +1635,19 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
     mappings = {
         _required_identifier(room_uuid, "mapped room UUID"): _required_identifier(area_id, "mapped area ID")
         for room_uuid, area_id in mappings.items()
+    }
+    raw_fallbacks = data.get("device_area_fallbacks", {})
+    fallbacks = _require_dict(
+        raw_fallbacks,
+        "device_area_fallbacks",
+        required=frozenset(),
+        allowed=frozenset(raw_fallbacks) if isinstance(raw_fallbacks, dict) else frozenset(),
+    )
+    fallbacks = {
+        _required_identifier(identifier, "fallback device identifier"): (
+            None if area_id is None else _required_identifier(area_id, "fallback area")
+        )
+        for identifier, area_id in fallbacks.items()
     }
     scope = data.get("room_area_mapping_scope")
     if scope is not None:
@@ -1641,6 +1679,7 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
         ),
         managed_area_ids=areas,
         room_area_mappings=mappings,
+        device_area_fallbacks=fallbacks,
         room_area_mapping_scope=scope,
         pending_area_batch=_batch_from_dict(data["pending_area_batch"])
         if data.get("pending_area_batch") is not None
@@ -1651,11 +1690,16 @@ def stored_state_from_dict(value: Any, entry_id: str) -> StoredEngineeringState:
         "safe", _area_state_payload(state)
     ):
         raise EngineeringSnapshotError("area state digest is inconsistent")
+    if version == _LEGACY_AREA_STATE_VERSION:
+        legacy_payload = _area_state_payload(state)
+        legacy_payload.pop("device_area_fallbacks")
+        if data["area_state_digest"] != _canonical_digest("safe", legacy_payload):
+            raise EngineeringSnapshotError("area state digest is inconsistent")
     return state
 
 
 class EngineeringStateStore(Store[dict[str, Any]]):
-    """Versioned Home Assistant store with validating v1/v2-to-v3 migration."""
+    """Versioned Home Assistant store with validating prior-version migration."""
 
     def __init__(
         self,
@@ -1767,7 +1811,7 @@ class EngineeringStateStore(Store[dict[str, Any]]):
         old_data: Any,
     ) -> dict[str, Any]:
         del old_minor_version
-        if old_major_version not in {1, 2}:
+        if old_major_version not in {1, 2, 3}:
             raise NotImplementedError
         entry_id = self.key.removeprefix(f"{ENGINEERING_SNAPSHOT_STORAGE_KEY}.")
         return stored_state_to_dict(stored_state_from_dict(old_data, entry_id))
