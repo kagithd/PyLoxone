@@ -1,4 +1,4 @@
-# Stability review: 0.9.22.34–0.9.22.35
+# Stability review: 0.9.22.34–0.9.22.36
 
 This fork-only stabilization follows a review of the engineering branch from
 `ab0ab92` through `55f085b`, with the earlier metadata patch and upstream code
@@ -11,6 +11,7 @@ live installation. No upstream publication is part of this release.
 | --- | --- | --- |
 | Room repair performance | Eligible-device discovery was recomputed for every node at each batch checkpoint. | Compute the eligible set once per checkpoint. |
 | HA responsiveness | Complete snapshot validation/encoding/decoding repeatedly ran on the HA event loop. | Run CPU-heavy store codecs, migration, candidate roundtrip, sequence validation, metadata derivation and registry-plan validation in the executor; preserve mutation and commit fences. |
+| Repair latency | Each small journal checkpoint rebuilt and revalidated the unchanged inventory. | Retain at most two successfully validated frozen snapshots and their immutable encoded payloads; compare complete input on decode and return fresh mutable output. Envelope, journal, lifecycle and live registry checks remain uncached. |
 | Device identity | Reassigning an entity could delete its previous physical device even when that hardware remained present. | Retain all snapshot-backed device identifiers during logical-device cleanup. |
 | Startup | Engineering recovery and runtime probes gated ordinary Loxone setup. | Start the normal listener first; restore engineering state in the owned background task. |
 | Transport ownership | The socket returned during initial connection setup was discarded, allowing a second open. This also exists in the compared upstream revision. | Prepare configuration without a socket; open and retain transport immediately before listener authentication. |
@@ -39,6 +40,16 @@ the retained socket could expire while HA loaded entity platforms. That build
 was not accepted as stable. Version 0.9.22.35 separates configuration preparation
 from transport opening, preserving the standalone API while avoiding an idle
 unauthenticated socket. Two targeted regressions cover both startup phases.
+
+Version 0.9.22.35 restored normal entity states, but final room persistence did
+not complete within the 60-second acceptance deadline. Profiling identified
+repeated snapshot codec work. Version 0.9.22.36 adds the bounded snapshot-only
+cache; warmed local encode/decode fell from approximately 2.5 seconds to
+40–60 milliseconds for a representative multi-thousand-node private inventory.
+No private inventory is included in the repository. Cache tests cover complete
+input tampering, invalid Python shapes, mutable output isolation, stale envelope
+metadata, bounded eviction and concurrent callers. The full local suite passes
+751 tests; live persistence acceptance is still a separate required check.
 
 Regression tests first reproduced the blocking startup, discarded socket,
 cross-channel invalidation, quadratic checkpoints, event-loop snapshot codec,

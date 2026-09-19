@@ -15,6 +15,7 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import StrEnum
 from ipaddress import ip_address
+from threading import Lock
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
@@ -1055,7 +1056,67 @@ def _validate_row_contract(row: EngineeringInventoryRow) -> None:  # noqa: PLR09
     raise EngineeringSnapshotError("row capability state is unsupported")
 
 
-def validate_engineering_snapshot(  # noqa: PLR0912, PLR0915
+@dataclass(slots=True)
+class _SnapshotCodecEntry:
+    """Successful immutable snapshot work, never live registry or journal state."""
+
+    snapshot: EngineeringSnapshot
+    encoded: str | None = None
+    decoded_key: str | None = None
+
+
+_SNAPSHOT_CODEC_CACHE: list[_SnapshotCodecEntry] = []
+_SNAPSHOT_CODEC_LOCK = Lock()
+
+
+def _remember_snapshot(
+    snapshot: EngineeringSnapshot, *, encoded: str | None = None, decoded_key: str | None = None
+) -> None:
+    with _SNAPSHOT_CODEC_LOCK:
+        index = next((i for i, item in enumerate(_SNAPSHOT_CODEC_CACHE) if item.snapshot is snapshot), None)
+        entry = _SnapshotCodecEntry(snapshot) if index is None else _SNAPSHOT_CODEC_CACHE.pop(index)
+        if encoded is not None:
+            entry.encoded = encoded
+        if decoded_key is not None:
+            entry.decoded_key = decoded_key
+        _SNAPSHOT_CODEC_CACHE.append(entry)
+        del _SNAPSHOT_CODEC_CACHE[:-2]
+
+
+def _snapshot_json_key(value: Any) -> str | None:
+    """Compare every input field without normalizing invalid Python shapes."""
+    pending = [value]
+    containers: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if type(item) in (dict, list):
+            if id(item) in containers:
+                return None
+            containers.add(id(item))
+        if type(item) is dict:
+            if any(type(key) is not str for key in item):
+                return None
+            pending.extend(item.values())
+        elif type(item) is list:
+            pending.extend(item)
+        elif item is not None and type(item) not in (str, int, float, bool):
+            return None
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
+def validate_engineering_snapshot(snapshot: EngineeringSnapshot) -> None:
+    """Validate once per exact frozen snapshot, keeping at most two instances."""
+    with _SNAPSHOT_CODEC_LOCK:
+        if any(entry.snapshot is snapshot for entry in _SNAPSHOT_CODEC_CACHE):
+            return
+    _validate_engineering_snapshot_uncached(snapshot)
+    _remember_snapshot(snapshot)
+
+
+def _validate_engineering_snapshot_uncached(  # noqa: PLR0912, PLR0915
     snapshot: EngineeringSnapshot,
 ) -> None:
     """Reject incomplete, mutable-shaped, or internally inconsistent snapshots."""
@@ -1155,6 +1216,18 @@ _SNAPSHOT_FIELDS = frozenset(
 
 
 def snapshot_to_dict(snapshot: EngineeringSnapshot) -> dict[str, Any]:
+    """Return an independently mutable payload of a validated snapshot."""
+    with _SNAPSHOT_CODEC_LOCK:
+        encoded = next((item.encoded for item in _SNAPSHOT_CODEC_CACHE if item.snapshot is snapshot), None)
+    if encoded is not None:
+        return json.loads(encoded)
+    payload = _snapshot_to_dict_uncached(snapshot)
+    encoded = _snapshot_json_key(payload)
+    _remember_snapshot(snapshot, encoded=encoded)
+    return payload
+
+
+def _snapshot_to_dict_uncached(snapshot: EngineeringSnapshot) -> dict[str, Any]:
     """Serialize exactly the private safe reconstruction allowlist."""
     validate_engineering_snapshot(snapshot)
     safe_nodes = _safe_projection_nodes(snapshot.source, snapshot.nodes)
@@ -1175,6 +1248,21 @@ def snapshot_to_dict(snapshot: EngineeringSnapshot) -> dict[str, Any]:
 
 
 def snapshot_from_dict(value: Any) -> EngineeringSnapshot:
+    """Reuse only a successful decode of identical complete JSON input."""
+    key = _snapshot_json_key(value)
+    if key is not None:
+        with _SNAPSHOT_CODEC_LOCK:
+            cached = next((item.snapshot for item in _SNAPSHOT_CODEC_CACHE if item.decoded_key == key), None)
+        if cached is not None:
+            return cached
+    # Decode the exact detached observation used as the key, not caller-owned
+    # data that another executor thread could change between these operations.
+    snapshot = _snapshot_from_dict_uncached(json.loads(key) if key is not None else value)
+    _remember_snapshot(snapshot, decoded_key=key)
+    return snapshot
+
+
+def _snapshot_from_dict_uncached(value: Any) -> EngineeringSnapshot:
     """Restore an immutable snapshot only after validating all persisted fields."""
     data = _require_dict(value, "snapshot", required=_SNAPSHOT_FIELDS)
     source = _source_from_dict(data["source"])
