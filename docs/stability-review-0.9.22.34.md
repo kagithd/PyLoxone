@@ -65,6 +65,29 @@ responses, successful final persistence, and unchanged actuator states. Unit
 tests are not a substitute for this check. Production logs/configuration are
 private and are not included here.
 
+## Live acceptance of 0.9.22.36
+
+Tested with Home Assistant **2026.9.3** and Miniserver **17.2.8.28**.
+Configuration validation passed; the deployed archive was checksum-verified.
+A full HA backup and the previous integration source were retained privately.
+
+- Native Repairs API: opening the room form took 135 ms; invalid input returned
+  a field validation result in 102 ms instead of hanging.
+- Confirming two existing room groups for three devices completed successfully
+  in 13.3 seconds. Existing device areas were unchanged.
+- During final persistence, 28 parallel HA API probes had no timeout; the
+  slowest response was 951 ms.
+- The durable journal was empty after completion. Room mappings and managed
+  assignments survived an integration reload; no Loxone repair remained.
+- No original device, entity identity, parent link, room assignment or actuator
+  state changed relative to the captured baseline. No test command switched a
+  physical output.
+
+Remaining limitations: cold platform setup can still emit a ten-second startup
+warning, and final persistence is not instantaneous. The native form's wait was
+measured through its API, not by a browser UI test. This acceptance does not
+establish long-duration reliability or certify unrelated HA integrations.
+
 AI-assisted changes were critically re-reviewed with independent code review and
 targeted failing regressions. This release makes no claim of exhaustive proof
 against every possible HA or Miniserver failure.
