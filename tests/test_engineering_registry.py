@@ -295,6 +295,24 @@ def test_batch_group_commit_and_cold_replay(registries, monkeypatch, interruptio
     async def scenario():
         assert hasattr(engineering_registry, "EngineeringAreaDecision")
         case = await _batch_case(registries, monkeypatch)
+        eligible = engineering_registry._eligible_device_keys
+        checkpoint = engineering_registry._batch_validate_members
+        eligibility_reads = 0
+
+        def count_eligible(snapshot):
+            nonlocal eligibility_reads
+            eligibility_reads += 1
+            return eligible(snapshot)
+
+        def bounded_checkpoint(*args, **kwargs):
+            nonlocal eligibility_reads
+            eligibility_reads = 0
+            result = checkpoint(*args, **kwargs)
+            assert eligibility_reads <= 1, "checkpoint recomputes all eligible devices for every node"
+            return result
+
+        monkeypatch.setattr(engineering_registry, "_eligible_device_keys", count_eligible)
+        monkeypatch.setattr(engineering_registry, "_batch_validate_members", bounded_checkpoint)
         assert {item.room_uuid for item in case.conflicts} == {"room-a"}
         decision = engineering_registry.EngineeringAreaDecision(
             "room-a",
@@ -1574,7 +1592,7 @@ class RegistryHarness:
         self.areas = FakeAreaRegistry()
         self.devices = FakeDeviceRegistry(self.areas)
         self.entities = FakeEntityRegistry()
-        self.hass = SimpleNamespace(data={})
+        self.hass = SimpleNamespace(data={}, async_add_executor_job=asyncio.to_thread)
         self.miniserver = self.devices.add("serial-a", "entry-a", name="Miniserver", model="Miniserver")
 
     @property

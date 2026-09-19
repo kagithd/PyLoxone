@@ -245,3 +245,22 @@ def test_resolved_sensitive_collision_never_uses_name_fallback():
     resolved = resolve_engineering_topology(inventory_of(ms, safe, secret), source())
     _result, session = _probe_inventory(resolved, [(404, b""), (404, b"")])
     assert all(not target.endswith("/AI1/state") for target in session.targets)
+
+
+@pytest.mark.parametrize("failed_status", [401, 503])
+def test_rebind_failure_does_not_invalidate_other_channels(failed_status):
+    """One denied/broken channel must not hide another verified numeric value."""
+    from custom_components.loxone.engineering_runtime import async_rebind_engineering_runtime
+    from tests.engineering_fixtures import make_snapshot
+
+    async def scenario():
+        snapshot = make_snapshot()
+        session = _Session([(failed_status, b""), (200, b'<LL Code="200" u1="event" v1="18.5"/>')])
+        client = RuntimeProbeClient(session, "http://test", aiohttp.BasicAuth("x", "y"), False, asyncio.Semaphore(1))
+        result = await async_rebind_engineering_runtime(snapshot.rows, client=client)
+        assert len(result.bindings) == 2
+        assert result.bindings[0].status != "bound"
+        assert result.bindings[1].status == "bound"
+        assert result.bindings[1].numeric_value == 18.5
+
+    asyncio.run(scenario())

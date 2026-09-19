@@ -49,7 +49,7 @@ def test_metadata_adapter_serializes_with_batch_state_and_loads_mappings(monkeyp
     monkeypatch.setattr(entities, "Store", MemoryStore)
 
     async def scenario():
-        hass = SimpleNamespace(data={})
+        hass = SimpleNamespace(data={}, async_add_executor_job=asyncio.to_thread)
         snapshot = make_snapshot()
         state = StoredEngineeringState(snapshot)
         await async_store_engineering_state(hass, state)

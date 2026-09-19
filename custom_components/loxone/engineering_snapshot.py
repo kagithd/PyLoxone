@@ -1814,7 +1814,9 @@ class EngineeringStateStore(Store[dict[str, Any]]):
         if old_major_version not in {1, 2, 3}:
             raise NotImplementedError
         entry_id = self.key.removeprefix(f"{ENGINEERING_SNAPSHOT_STORAGE_KEY}.")
-        return stored_state_to_dict(stored_state_from_dict(old_data, entry_id))
+        return await self.hass.async_add_executor_job(
+            lambda: stored_state_to_dict(stored_state_from_dict(old_data, entry_id))
+        )
 
 
 async def async_load_engineering_state(
@@ -1832,7 +1834,7 @@ async def async_load_engineering_state(
     stored = await store.async_load()
     if stored is None:
         return StoredEngineeringState(snapshot=None)
-    return stored_state_from_dict(stored, entry_id)
+    return await hass.async_add_executor_job(stored_state_from_dict, stored, entry_id)
 
 
 async def async_store_engineering_state(
@@ -1842,11 +1844,12 @@ async def async_store_engineering_state(
     """Atomically save a validated state under its source config entry."""
     if state.snapshot is None:
         raise EngineeringSnapshotError("cannot derive store key from an empty state")
-    _validate_state(state, state.snapshot.source.entry_id)
+    # Encoding includes complete validation. Keep this CPU work off HA's loop.
+    encoded = await hass.async_add_executor_job(stored_state_to_dict, state)
     store: EngineeringStateStore = EngineeringStateStore(
         hass,
         ENGINEERING_SNAPSHOT_STORAGE_VERSION,
         f"{ENGINEERING_SNAPSHOT_STORAGE_KEY}.{state.snapshot.source.entry_id}",
         private=True,
     )
-    await store.async_save_acknowledged(stored_state_to_dict(state))
+    await store.async_save_acknowledged(encoded)

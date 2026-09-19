@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from custom_components.loxone.const import DOMAIN
 from custom_components.loxone.device_sync import (
     async_cleanup_stale_devices,
@@ -196,7 +198,8 @@ def test_control_owner_identifiers_reject_ambiguous_hardware_links():
     assert owners == {}
 
 
-def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifiers(monkeypatch):
+@pytest.mark.parametrize("previous_owner_still_present", [False, True])
+def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifiers(monkeypatch, previous_owner_still_present):
     """Controls must migrate even when old device IDs differ from their action UUIDs."""
     physical = SimpleNamespace(
         id="physical-device",
@@ -262,6 +265,9 @@ def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifie
         lambda registry, entry_id: [entry for entry in registry.entities if entry.config_entry_id == entry_id],
     )
 
+    references = [("air-hardware", "provider:air-hardware")]
+    if previous_owner_still_present:
+        references.append(("previous-hardware", "legacy-switch"))
     moved = async_sync_control_entity_devices(
         object(),
         SimpleNamespace(entry_id="entry-id"),
@@ -275,7 +281,7 @@ def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifie
                 },
             }
         },
-        _physical_snapshot(("air-hardware", "provider:air-hardware")),
+        _physical_snapshot(*references),
     )
 
     assert moved == 3
@@ -290,7 +296,9 @@ def test_sync_control_entity_devices_uses_entity_ids_not_legacy_device_identifie
         ("sensor.st_f04_actual", {"device_id": "physical-device"}),
         ("sensor.st_f04_total", {"device_id": "physical-device"}),
     ]
-    assert set(device_registry.removed) == {"logical-switch-device", "logical-meter-device"}
+    assert set(device_registry.removed) == (
+        {"logical-meter-device"} if previous_owner_still_present else {"logical-switch-device", "logical-meter-device"}
+    )
 
 
 def test_sync_updates_integration_name_and_preserves_user_name(monkeypatch):

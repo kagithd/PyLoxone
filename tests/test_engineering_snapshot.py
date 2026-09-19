@@ -67,6 +67,42 @@ from tests.engineering_fixtures import (
 )
 
 
+@pytest.mark.anyio
+async def test_snapshot_codec_does_not_run_on_home_assistant_event_loop(monkeypatch, tmp_path):
+    """Full topology validation must not stall HA while repairing one room."""
+    import custom_components.loxone.engineering_snapshot as module
+
+    hass = HomeAssistant(str(tmp_path))
+    state = StoredEngineeringState(make_snapshot())
+    wire = stored_state_to_dict(state)
+    loop_thread = threading.get_ident()
+    actual_encode, actual_decode = module.stored_state_to_dict, module.stored_state_from_dict
+
+    def encode(value):
+        assert threading.get_ident() != loop_thread, "snapshot encoding blocks HA's event loop"
+        return actual_encode(value)
+
+    def decode(value, entry_id):
+        assert threading.get_ident() != loop_thread, "snapshot decoding blocks HA's event loop"
+        return actual_decode(value, entry_id)
+
+    class MemoryStore:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def async_load(self):
+            return wire
+
+        async def async_save_acknowledged(self, data):
+            assert data == wire
+
+    monkeypatch.setattr(module, "EngineeringStateStore", MemoryStore)
+    monkeypatch.setattr(module, "stored_state_to_dict", encode)
+    monkeypatch.setattr(module, "stored_state_from_dict", decode)
+    await module.async_store_engineering_state(hass, state)
+    assert actual_encode(await module.async_load_engineering_state(hass, "entry-a")) == wire
+
+
 def test_placement_roundtrip_digest_and_operational_privacy(monkeypatch):
     """Placement must change private integrity, never automation semantics."""
     from custom_components.loxone.engineering_changes import diff_engineering_snapshots
@@ -614,7 +650,7 @@ def test_previous_direct_private_snapshot_shape_is_migrated_without_publication(
 
 
 @pytest.mark.anyio
-async def test_store_uses_private_v2_entry_scoped_envelope(monkeypatch):
+async def test_store_uses_private_v2_entry_scoped_envelope(monkeypatch, tmp_path):
     """Persistence must use the exact private per-entry Home Assistant key."""
     calls: list[tuple[object, int, str, bool]] = []
     payloads: list[dict] = []
@@ -638,7 +674,7 @@ async def test_store_uses_private_v2_entry_scoped_envelope(monkeypatch):
         "custom_components.loxone.engineering_snapshot.EngineeringStateStore",
         FakeStore,
     )
-    hass = object()
+    hass = HomeAssistant(str(tmp_path))
     state = StoredEngineeringState(snapshot=make_snapshot())
 
     await async_store_engineering_state(hass, state)

@@ -891,9 +891,8 @@ def _batch_validate_members(  # noqa: PLR0911, PLR0912 -- independent fail-close
         batch.generation_id,
     ):
         return "snapshot_changed"
-    owners = {
-        node.device_identifier: node for node in snapshot.nodes if node.element.key in _eligible_device_keys(snapshot)
-    }
+    eligible = _eligible_device_keys(snapshot)
+    owners = {node.device_identifier: node for node in snapshot.nodes if node.element.key in eligible}
     for group in batch.groups:
         decision = group.decision
         current_tokens = {
@@ -1046,10 +1045,11 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
             and (snapshot.source.entry_id, snapshot.source.provider_identifier)
             == (batch.entry_id, batch.provider_identifier)
         ):
+            eligible = _eligible_device_keys(snapshot)
             owners = {
                 node.device_identifier: node
                 for node in snapshot.nodes
-                if node.element.key in _eligible_device_keys(snapshot)
+                if node.element.key in eligible
             }
             obsolete.update(
                 member.device_identifier
@@ -1114,10 +1114,11 @@ async def _async_resolve_area_batch(  # noqa: C901, PLR0911, PLR0912, PLR0915 --
             batch.provider_identifier,
         ):
             return result(reason)
+        eligible = _eligible_device_keys(snapshot)
         owners = {
             node.device_identifier: node
             for node in snapshot.nodes
-            if node.element.key in _eligible_device_keys(snapshot)
+            if node.element.key in eligible
         }
         generation_changed = snapshot.generation_id != batch.generation_id
         mappings = dict(stored.room_area_mappings)
@@ -1535,7 +1536,7 @@ async def async_plan_engineering_registry_sync(  # noqa: PLR0915 -- two explicit
     previous: EngineeringRegistryMetadata,
 ) -> EngineeringRegistryPlan:
     """Build a desired registry topology without performing any mutations."""
-    validate_engineering_snapshot(snapshot)
+    await hass.async_add_executor_job(validate_engineering_snapshot, snapshot)
     if snapshot.source.entry_id != entry_id:
         raise EngineeringRegistryError(_SNAPSHOT_ENTRY_MISMATCH)
     device_registry = dr.async_get(hass)

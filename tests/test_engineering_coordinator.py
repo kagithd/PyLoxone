@@ -786,7 +786,7 @@ def test_button_error_does_not_expose_exception(transaction, monkeypatch):
     asyncio.run(scenario())
 
 
-def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
+def test_core_platform_setup_does_not_wait_for_engineering_recovery(monkeypatch):
     import custom_components.loxone as integration
 
     events = []
@@ -798,8 +798,7 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
         pass
 
     async def restore():
-        assert hass.data["loxone"]["entry-a"] is coordinator
-        events.append("restore")
+        raise AssertionError("optional engineering recovery must not gate core startup")
 
     async def forward(entry, platforms):
         events.append("forward")
@@ -813,7 +812,7 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     snapshot = object()
 
     def rehome(_hass, rehome_entry, rehome_config, rehome_snapshot):
-        assert events == ["restore", "forward"]
+        assert events == ["forward"]
         assert rehome_entry is entry
         assert rehome_config == {}
         assert rehome_snapshot is snapshot
@@ -826,6 +825,7 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     coordinator = SimpleNamespace(
         async_config_entry_first_refresh=first_refresh,
         async_restore_engineering_snapshot=restore,
+        async_cleanup=lambda: asyncio.sleep(0),
         async_schedule_engineering_refresh=schedule,
         engineering_snapshot=snapshot,
         miniserver=SimpleNamespace(serial="serial-a", lox_config=SimpleNamespace(json={})),
@@ -840,4 +840,109 @@ def test_setup_restores_before_platforms_and_schedules_after(monkeypatch):
     monkeypatch.setattr(integration, "async_warn_about_config_impacts", finish)
     with pytest.raises(Finished):
         asyncio.run(integration.async_setup_entry(hass, entry))
-    assert events == ["restore", "forward", "rehome", "schedule"]
+    assert events == ["forward", "rehome"]
+
+
+def test_first_refresh_retains_opened_websocket_for_listener(transaction, monkeypatch):
+    """Startup must not leak an unowned socket and open a second connection."""
+    async def scenario():
+        coordinator = transaction.make()
+        coordinator.api = None
+        coordinator.config_entry.data = {}
+        coordinator._host = "192.0.2.1"
+        coordinator._port = 80
+        coordinator._username = "test-user"
+        coordinator._password = "test-password"
+        websocket = object()
+
+        async def open_connection(self, session=None):
+            self.structure_file = {"msInfo": {"serialNr": "serial-a"}}
+            return websocket
+
+        monkeypatch.setattr(module.LoxoneConnection, "open", open_connection)
+        await coordinator.async_config_entry_first_refresh()
+        assert coordinator.api.connection is websocket
+
+    asyncio.run(scenario())
+
+
+def test_cleanup_closes_transport_before_waiting_for_engineering_write(transaction):
+    """A slow atomic metadata write must not keep an old Miniserver socket alive."""
+    async def scenario():
+        coordinator = transaction.make()
+        release = asyncio.Event()
+        write_started = asyncio.Event()
+        transport_closed = asyncio.Event()
+
+        async def finishing_write():
+            write_started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        async def close():
+            transport_closed.set()
+
+        coordinator.api.close = close
+        coordinator._engineering_refresh_task = asyncio.create_task(finishing_write())
+        await write_started.wait()
+        cleanup = asyncio.create_task(coordinator.async_cleanup())
+        try:
+            await asyncio.wait_for(transport_closed.wait(), timeout=0.2)
+            assert not cleanup.done()
+        finally:
+            release.set()
+            await cleanup
+
+    asyncio.run(scenario())
+
+
+def test_setup_unload_does_not_leave_stale_shutdown_token_writers(transaction, monkeypatch):
+    """Repeated reloads must not persist tokens from already-closed instances."""
+    import custom_components.loxone as integration
+    from homeassistant.const import EVENT_HOMEASSISTANT_STOP, EVENT_HOMEASSISTANT_STARTED
+
+    async def scenario():
+        coordinator = transaction.make()
+        hass, entry = coordinator.hass, coordinator.config_entry
+
+        async def noop(*args, **kwargs):
+            pass
+
+        async def listener(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        async def unload_platforms(*args):
+            return True
+
+        coordinator.async_config_entry_first_refresh = noop
+        coordinator.api.start_listening = listener
+        hass.config_entries.async_forward_entry_setups = noop
+        hass.config_entries.async_unload_platforms = unload_platforms
+        monkeypatch.setattr(integration, "LoxoneCoordinator", lambda *args: coordinator)
+        monkeypatch.setattr(integration, "LOXONE_PLATFORMS", ())
+        for name in ("async_prepare_engineering_view", "async_activate_engineering_view", "async_deactivate_engineering_view"):
+            monkeypatch.setattr(integration, name, noop)
+        for name in ("async_migrate_version_sensor_unique_id", "async_sync_device_names", "async_sync_device_areas", "async_warn_about_config_impacts"):
+            monkeypatch.setattr(integration, name, lambda *args: 0)
+
+        async def maintenance(*args, **kwargs):
+            return SimpleNamespace(skipped=True)
+
+        monkeypatch.setattr(integration, "async_run_registry_maintenance", maintenance)
+        baseline = hass.bus.async_listeners()
+        try:
+            assert await integration.async_setup_entry(hass, entry)
+            assert await integration.async_unload_entry(hass, entry)
+            listeners = hass.bus.async_listeners()
+            for event in (EVENT_HOMEASSISTANT_STOP, EVENT_HOMEASSISTANT_STARTED):
+                assert listeners.get(event, 0) == baseline.get(event, 0)
+        finally:
+            if not coordinator._unloading:
+                coordinator._unloading = True
+                if coordinator._listening_task:
+                    coordinator._listening_task.cancel()
+                await coordinator.async_cleanup()
+
+    asyncio.run(scenario())

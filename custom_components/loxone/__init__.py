@@ -279,18 +279,22 @@ async def async_unload_entry(hass, config_entry):
                     accept_task_failure=True,
                 )
 
-            cleanup_task = asyncio.create_task(coordinator.async_cleanup())
-            cleanup_task.add_done_callback(_consume_shutdown_task_result)
-            try:
-                cleanup_finished = await _await_shutdown_task(cleanup_task, "connection cleanup")
-            except asyncio.CancelledError:
-                cleanup_task.cancel()
-                raise
-            if not cleanup_finished:
-                cleanup_task.cancel()
+            cleanup_task = getattr(coordinator, "_cleanup_task", None)
+            if cleanup_task is None or cleanup_task.cancelled() or (
+                cleanup_task.done() and cleanup_task.exception() is not None
+            ):
+                cleanup_task = asyncio.create_task(coordinator.async_cleanup())
+                coordinator._cleanup_task = cleanup_task
+                cleanup_task.add_done_callback(_consume_shutdown_task_result)
+            # Atomic metadata writes may still be settling. Retain ownership so
+            # retry joins this cleanup instead of abandoning it or starting two.
+            cleanup_finished = await _await_shutdown_task(cleanup_task, "connection cleanup")
 
             if not listener_stopped or not cleanup_finished:
-                _LOGGER.error("Loxone unload aborted because connection shutdown did not finish")
+                _LOGGER.error(
+                    "Loxone is stopping but cleanup is still pending. Wait briefly, then reload the integration "
+                    "from Settings > Devices & services. No replacement connection has been started."
+                )
                 return False
 
             # Remove event listeners (if any still present)
@@ -494,15 +498,6 @@ async def async_setup_entry(hass, config_entry):
     )
 
     hass.data.setdefault(DOMAIN, {})[config_entry.entry_id] = coordinator
-    try:
-        await coordinator.async_restore_engineering_snapshot()
-    except asyncio.CancelledError:
-        await coordinator.async_cleanup()
-        raise
-    except Exception as err:
-        await coordinator.async_cleanup()
-        raise ConfigEntryNotReady("Engineering cache reconciliation is pending") from err
-
     migrated_version_sensors = async_migrate_version_sensor_unique_id(hass, config_entry, coordinator.miniserver.serial)
     if migrated_version_sensors:
         _LOGGER.info(
@@ -530,8 +525,6 @@ async def async_setup_entry(hass, config_entry):
                 "Linked %s Loxone control entity/entities to physical devices",
                 linked_entities,
             )
-
-    await coordinator.async_schedule_engineering_refresh()
 
     config_impacts = async_warn_about_config_impacts(hass, config_entry, coordinator.miniserver.lox_config.json)
     if config_impacts:
@@ -794,16 +787,18 @@ async def async_setup_entry(hass, config_entry):
     hass.services.async_register(DOMAIN, "sync_areas", handle_sync_areas_with_loxone)
     hass.services.async_register(DOMAIN, "reload", handle_reload)
 
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_event)
-    hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, loxone_discovered)
-
     # Store listeners for cleanup
     coordinator.listeners = [
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, stop_event),
+        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STARTED, loxone_discovered),
         hass.bus.async_listen(SENDDOMAIN, loxone_send),
         hass.bus.async_listen(SECUREDSENDDOMAIN, loxone_send),
     ]
 
     await start_event()
+
+    # Optional inventory recovery must not gate the ordinary websocket listener.
+    await coordinator.async_schedule_engineering_refresh()
 
     await async_activate_engineering_view(hass, config_entry.entry_id)
 

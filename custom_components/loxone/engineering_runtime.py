@@ -6,7 +6,7 @@ import asyncio
 import json
 import math
 import re
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 from xml.etree import ElementTree as ET
@@ -530,6 +530,4 @@ async def async_rebind_engineering_runtime(
             if row.binding is not None and not row.node.sensitive
         )
     )
-    if any(item.status in {"auth_error", "transport_error", "malformed_response"} for item in bindings):
-        bindings = [replace(item, status="unavailable", numeric_value=None, numeric_states=()) for item in bindings]
     return EngineeringRuntimeInventory(tuple(bindings))

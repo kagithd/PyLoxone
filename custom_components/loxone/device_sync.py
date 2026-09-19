@@ -394,10 +394,12 @@ def async_sync_control_entity_devices(
             entity_registry.async_update_entity(entity.entity_id, **changes)
             moved += 1
 
+    retained_identifiers = {(DOMAIN, node.device_identifier) for node in snapshot.nodes if node.device_identifier}
     for previous_device_id in sorted(previous_device_ids):
         logical = device_registry.async_get(previous_device_id)
         if (
             logical is not None
+            and not retained_identifiers.intersection(logical.identifiers)
             and not er.async_entries_for_device(entity_registry, previous_device_id)
             and getattr(logical, "config_entries", frozenset()) == {config_entry.entry_id}
         ):

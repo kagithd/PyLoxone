@@ -197,12 +197,18 @@ def test_unload_is_bounded_when_connection_shutdown_stalls(monkeypatch):
 
     async def scenario():
         release = asyncio.Event()
+        cleanup_attempts = 0
 
         async def resist_cancellation():
             try:
                 await release.wait()
             except asyncio.CancelledError:
                 await release.wait()
+
+        async def cleanup():
+            nonlocal cleanup_attempts
+            cleanup_attempts += 1
+            await resist_cancellation()
 
         entry = SimpleNamespace(entry_id="entry-a")
         listening_task = asyncio.create_task(resist_cancellation())
@@ -211,7 +217,7 @@ def test_unload_is_bounded_when_connection_shutdown_stalls(monkeypatch):
             listeners=[],
             _listening_task=listening_task,
             _unloading=False,
-            async_cleanup=resist_cancellation,
+            async_cleanup=cleanup,
         )
 
         async def unload_platforms(_entry, _platforms):
@@ -236,6 +242,9 @@ def test_unload_is_bounded_when_connection_shutdown_stalls(monkeypatch):
         finally:
             release.set()
             await asyncio.wait_for(unload_task, timeout=1)
+            await asyncio.sleep(0)
+        assert await integration.async_unload_entry(hass, entry) is True
+        assert cleanup_attempts == 1, "retry started a second cleanup instead of joining the first"
 
     asyncio.run(scenario())
 

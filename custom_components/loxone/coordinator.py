@@ -133,6 +133,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
         self._engineering_published_generation: str | None = None
         self._engineering_published_impact_plan: EngineeringImpactPlan | None = None
         self._listening_task: asyncio.Task[None] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._unloading = False
         self.engineering_refresh_stage = "idle"
 
@@ -162,7 +163,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
             )
         try:
             session = async_get_clientsession(self.hass)
-            await self.api.open(session)
+            self.api.connection = await self.api.open(session)
         except Exception:
             # Connection exception strings may contain private endpoint data.
             _LOGGER.error("Could not connect to Loxone Miniserver")  # noqa: TRY400
@@ -254,11 +255,14 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 or self._engineering_registry_verified_generation != generation
             ):
                 self.engineering_refresh_stage = "registry_apply"
-                metadata = registry_metadata_from_snapshot(
-                    snapshot,
-                    managed_area_ids=state.managed_area_ids,
-                    room_area_mappings=state.room_area_mappings,
-                    applied_generation=state.registry_applied_generation,
+                metadata = await self.hass.async_add_executor_job(
+                    lambda: registry_metadata_from_snapshot(
+                        snapshot,
+                        managed_area_ids=state.managed_area_ids,
+                        room_area_mappings=state.room_area_mappings,
+                        device_area_fallbacks=state.device_area_fallbacks,
+                        applied_generation=state.registry_applied_generation,
+                    )
                 )
                 plan = await async_plan_engineering_registry_sync(
                     self.hass, self.config_entry.entry_id, snapshot, metadata
@@ -397,7 +401,7 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 else row
                 for row in rows
             )
-            sequence = next_engineering_read_sequence(previous)
+            sequence = await self.hass.async_add_executor_job(next_engineering_read_sequence, previous)
             candidate = EngineeringSnapshot(
                 source,
                 resolved.nodes,
@@ -408,16 +412,19 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 engineering_generation_id(source, resolved.nodes, rows, read_sequence=sequence),
                 datetime.now(UTC),
             )
-            candidate = snapshot_from_dict(snapshot_to_dict(candidate))
+            candidate = await self.hass.async_add_executor_job(lambda: snapshot_from_dict(snapshot_to_dict(candidate)))
             state = await async_load_engineering_state(self.hass, self.config_entry.entry_id)
             metadata = (
                 EngineeringRegistryMetadata.empty()
                 if previous is None
-                else registry_metadata_from_snapshot(
-                    previous,
-                    managed_area_ids=state.managed_area_ids,
-                    room_area_mappings=state.room_area_mappings,
-                    applied_generation=state.registry_applied_generation,
+                else await self.hass.async_add_executor_job(
+                    lambda: registry_metadata_from_snapshot(
+                        previous,
+                        managed_area_ids=state.managed_area_ids,
+                        room_area_mappings=state.room_area_mappings,
+                        device_area_fallbacks=state.device_area_fallbacks,
+                        applied_generation=state.registry_applied_generation,
+                    )
                 )
             )
             # Planning and consumer discovery must both finish before commit.
@@ -494,6 +501,19 @@ class LoxoneCoordinator(DataUpdateCoordinator):
     async def _async_debounced_engineering_refresh(self, delay: float) -> None:
         await asyncio.sleep(delay)
         try:
+            if self._unloading:
+                return
+            if self._engineering_registry_verified_generation is None:
+                await self.async_restore_engineering_snapshot()
+                snapshot = self.engineering_snapshot
+                if (
+                    snapshot is not None
+                    and not _engineering_room_identity_incomplete(snapshot)
+                    and snapshot.source.loxapp_last_modified is not None
+                    and snapshot.source.loxapp_last_modified
+                    == extract_loxapp_last_modified(self.miniserver.lox_config.json)
+                ):
+                    return
             await self.async_refresh_engineering_inventory()
         except asyncio.CancelledError:
             raise
@@ -510,6 +530,11 @@ class LoxoneCoordinator(DataUpdateCoordinator):
 
     async def async_cleanup(self):
         """Clean up resources."""
+        if self._engineering_refresh_task is not None:
+            self._engineering_refresh_task.cancel()
+        # Release transport independently of a finishing atomic metadata write.
+        if self.api is not None:
+            await self.api.close()
         async with self._engineering_schedule_lock:
             await self._async_cancel_engineering_refresh()
         if hasattr(self, "listeners"):
@@ -518,7 +543,3 @@ class LoxoneCoordinator(DataUpdateCoordinator):
                 if listener is not None:
                     listener()
             self.listeners = []
-
-        # Close API connection
-        if self.api is not None:
-            await self.api.close()
